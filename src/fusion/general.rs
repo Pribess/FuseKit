@@ -356,8 +356,11 @@ pub fn run(mut fg: FusionGraph, target: &Target, graph: &crate::graph::Graph) ->
     // kernel to apply the same rounded sigmoid internally and bind the
     // pre-sigmoid buffer directly. This is source/signature guarded
     // and keeps CustomKernel opaque unless the input access is
-    // unambiguous.
-    if env_flag("FUSEKIT_CUSTOM_SIGMOID_INPUT_ABSORB") {
+    // unambiguous. Keep an explicit opt-out for bisecting, but make
+    // the guarded semantic rewrite part of the default general pass:
+    // on Qwen3Next GDN it removes 24 Sigmoid dispatches and one
+    // activation round-trip without changing fallback coverage.
+    if std::env::var("FUSEKIT_CUSTOM_SIGMOID_INPUT_ABSORB").as_deref() != Ok("0") {
         while try_custom_kernel_sigmoid_input_absorb(&mut slots) {}
     }
     // Self-SiLU sink: fold `y * sigmoid(y)` into the producer that
