@@ -2261,6 +2261,7 @@ _PATCHED_LOAD_MODULES: set[str] = set()
 _GENERATE_PATCHED = False
 _ENGINE_PATCHED = False
 _OMLX_SCHEDULER_PATCHED = False
+_ENGINE_SKIP_LOGPROBS_CURRENT_STEP = False
 
 
 def _extra_tensor_files_for_model_glob(pathname: Any) -> list[str]:
@@ -2645,33 +2646,56 @@ def _wrap_generation_batch(module) -> None:
         return True
 
     def _is_engine_fast_eligible(self) -> bool:
+        def miss(reason: str) -> bool:
+            if os.environ.get("FUSEKIT_DBG_ENGINE_ELIGIBLE"):
+                print(
+                    "[fusekit-engine-eligible] "
+                    f"miss={reason} "
+                    f"skip_attr={getattr(self, '_fk_skip_logprobs', None)!r} "
+                    f"skip_current={_ENGINE_SKIP_LOGPROBS_CURRENT_STEP!r}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            return False
+
         if _env_flag("FUSEKIT_DISABLE_ENGINE_FAST"):
-            return False
+            return miss("disabled")
         if _engine_style() in ("off", "disabled", "raw"):
-            return False
+            return miss("style_off")
         if not _is_omlx_step_style() and not _env_flag("FUSEKIT_ENABLE_ENGINE_FAST"):
-            return False
+            return miss("style_not_enabled")
         model = getattr(self, "model", None)
         if _model_has_active_mtp(model):
-            return False
+            return miss("mtp_active")
         if len(getattr(self, "uids", []) or []) != 1:
-            return False
+            return miss("uids")
         samplers = getattr(self, "samplers", []) or []
         if any(samplers):
             if len(samplers) != 1 or not _sampler_is_greedy_argmax(
                 samplers[0], missing_is_greedy=False
             ):
-                return False
+                return miss("sampler")
         else:
             sampler = getattr(self, "fallback_sampler", None)
             if not _sampler_is_greedy_argmax(sampler, missing_is_greedy=False):
-                return False
+                return miss("fallback_sampler")
         if any(getattr(self, "logits_processors", []) or []):
-            return False
-        if not getattr(self, "_fk_skip_logprobs", False):
-            return False
+            return miss("logits_processors")
+        if not (
+            getattr(self, "_fk_skip_logprobs", False)
+            or _ENGINE_SKIP_LOGPROBS_CURRENT_STEP
+        ):
+            return miss("logprobs")
         inner = getattr(model, "_fk_original", None)
-        return inner is not None and getattr(inner, "_fk_lm", None) is not None
+        if inner is None:
+            return miss("not_wrapped")
+        if getattr(inner, "_fk_lm", None) is not None:
+            return True
+        if getattr(model, "_fk_native_handle", None) is None:
+            return miss("no_native")
+        if getattr(model, "_fk_dispatch_failed", False):
+            return miss("dispatch_failed")
+        return True
 
     def _engine_direct_head_argmax_enabled(self) -> bool:
         if _env_flag("FUSEKIT_DISABLE_DIRECT_HEAD_ARGMAX"):
@@ -3038,8 +3062,23 @@ def _wrap_generation_batch(module) -> None:
                             "fusekit: engine fallback cannot guarantee KV cache "
                             f"capacity ({reason})"
                         )
+                    direct_head = (
+                        getattr(inner, "_fk_lm", None) is not None
+                        and _engine_direct_head_argmax_enabled(self)
+                    )
+                    if os.environ.get("FUSEKIT_DBG_ENGINE_DIRECT"):
+                        print(
+                            "[fusekit-engine-direct] "
+                            f"enabled={direct_head} "
+                            f"skip_attr={getattr(self, '_fk_skip_logprobs', None)!r} "
+                            f"skip_current={_ENGINE_SKIP_LOGPROBS_CURRENT_STEP!r} "
+                            f"has_fk={getattr(inner, '_fk_lm', None) is not None} "
+                            f"native={getattr(model, '_fk_native_handle', None) is not None}",
+                            file=sys.stderr,
+                            flush=True,
+                        )
                     restore_direct = _direct_head_argmax_scope(
-                        model, _engine_direct_head_argmax_enabled(self)
+                        model, direct_head
                     )
                     try:
                         logits = model(inputs[:, None], cache=self.prompt_cache)
@@ -3161,16 +3200,18 @@ def _wrap_omlx_scheduler(module) -> None:
     each engine step. If any running request needs logprobs, FuseKit's
     GenerationBatch wrapper automatically falls back to mlx-lm's path.
     """
-    global _OMLX_SCHEDULER_PATCHED
+    global _OMLX_SCHEDULER_PATCHED, _ENGINE_SKIP_LOGPROBS_CURRENT_STEP
     _patch_omlx_mtp_sampler_accept_cache(scheduler_module=module)
     if _OMLX_SCHEDULER_PATCHED or not hasattr(module, "Scheduler"):
         return
     original = module.Scheduler.step
 
     def _patched_scheduler_step(self, *args, **kwargs):
+        global _ENGINE_SKIP_LOGPROBS_CURRENT_STEP
         bg = getattr(self, "batch_generator", None)
         gb = getattr(bg, "_generation_batch", None)
         skip_logprobs = False
+        reqs = []
         try:
             reqs = list(getattr(self, "running", {}).values()) + list(
                 getattr(self, "waiting", [])
@@ -3180,6 +3221,19 @@ def _wrap_omlx_scheduler(module) -> None:
             )
         except Exception:
             skip_logprobs = False
+        if os.environ.get("FUSEKIT_DBG_SKIP_LOGPROBS"):
+            try:
+                print(
+                    "[fusekit-skip-logprobs] "
+                    f"reqs={len(reqs)} "
+                    f"running={len(getattr(self, 'running', {}) or {})} "
+                    f"waiting={len(getattr(self, 'waiting', []) or [])} "
+                    f"skip={skip_logprobs}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            except Exception:
+                pass
         mtp_bg = None
         try:
             _patch_omlx_mtp_greedy_detection()
@@ -3188,6 +3242,7 @@ def _wrap_omlx_scheduler(module) -> None:
             mtp_bg._fk_skip_logprobs_current_step = skip_logprobs
         except Exception:
             mtp_bg = None
+        _ENGINE_SKIP_LOGPROBS_CURRENT_STEP = skip_logprobs
         if gb is not None:
             try:
                 gb._fk_skip_logprobs = all(
@@ -3204,6 +3259,10 @@ def _wrap_omlx_scheduler(module) -> None:
                     mtp_bg._fk_skip_logprobs_current_step = False
                 except Exception:
                     pass
+            # oMLX can return from Scheduler.step before the newly-created
+            # GenerationBatch executes its first `_step`. Keep the latest
+            # scheduler decision visible; the next Scheduler.step overwrites it
+            # before a request with logprobs can enter the fast path.
 
     module.Scheduler.step = _patched_scheduler_step
     _OMLX_SCHEDULER_PATCHED = True
