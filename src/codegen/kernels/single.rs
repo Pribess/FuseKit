@@ -1857,18 +1857,32 @@ fn emit_convolution(
     w: &mut MslWriter,
     post_silu: bool,
 ) -> Result<()> {
-    if fusion.inputs.len() != 2 || fusion.outputs.len() != 1 {
-        bail!("Convolution: expected input, weight, output");
+    if fusion.inputs.len() < 2 || fusion.outputs.len() != 1 {
+        bail!("Convolution: expected input(s), weight, output");
     }
-    let x_shape = &fusion.inputs[0].shape;
-    let w_shape = &fusion.inputs[1].shape;
+    let weight_idx = fusion.inputs.len() - 1;
+    let segments = &fusion.inputs[..weight_idx];
+    let w_shape = &fusion.inputs[weight_idx].shape;
     let y_shape = &fusion.outputs[0].shape;
-    if x_shape.len() != 3 || y_shape.len() != 3 || w_shape.len() < 2 {
+    if segments.is_empty()
+        || segments.iter().any(|b| b.shape.len() != 3)
+        || y_shape.len() != 3
+        || w_shape.len() < 2
+    {
         return emit_todo_stub(fusion, meta, w, "Convolution (unsupported rank)");
     }
-    let b = x_shape[0].max(1) as u32;
-    let l_in = x_shape[1].max(1) as u32;
-    let c = x_shape[2].max(1) as u32;
+    let b_i = segments[0].shape[0];
+    let c_i = segments[0].shape[2];
+    let mut l_in_i = 0i32;
+    for segment in segments {
+        if segment.shape[0] != b_i || segment.shape[2] != c_i || segment.shape[1] <= 0 {
+            return emit_todo_stub(fusion, meta, w, "Convolution (bad virtual concat)");
+        }
+        l_in_i += segment.shape[1];
+    }
+    let b = b_i.max(1) as u32;
+    let l_in = l_in_i.max(1) as u32;
+    let c = c_i.max(1) as u32;
     let l_out = y_shape[1].max(1) as u32;
     let k = w_shape[1].max(1) as u32;
     let groups_tail = w_shape.get(2).copied().unwrap_or(1).max(1) as u32;
@@ -1884,13 +1898,21 @@ fn emit_convolution(
             "Convolution (only depthwise Conv1d supported)",
         );
     }
+    if l_out + k - 1 != l_in {
+        return emit_todo_stub(fusion, meta, w, "Convolution (only valid Conv1d supported)");
+    }
     let n = total_elements(y_shape);
-    let summary = if post_silu {
+    let virtual_concat = segments.len() > 1;
+    let summary = if virtual_concat && post_silu {
+        "Concat+depthwise Conv1d(valid)+SiLU"
+    } else if virtual_concat {
+        "Concat+depthwise Conv1d(valid)"
+    } else if post_silu {
         "depthwise Conv1d(valid)+SiLU"
     } else {
         "depthwise Conv1d(valid)"
     };
-    let (t, _) = emit_header(fusion, meta, w, 2, 1, summary);
+    let (t, _) = emit_header(fusion, meta, w, fusion.inputs.len(), 1, summary);
     w.line(format!("constexpr uint B = {b}u;"));
     w.line(format!("constexpr uint L_IN = {l_in}u;"));
     w.line(format!("constexpr uint L_OUT = {l_out}u;"));
@@ -1905,9 +1927,36 @@ fn emit_convolution(
     w.line("float acc = 0.0f;");
     w.line("for (uint kk = 0u; kk < K; ++kk) {");
     w.push_indent();
-    w.line("uint x_idx = (bidx * L_IN + (pos + kk)) * C + ch;");
+    if virtual_concat {
+        w.line("uint src_pos = pos + kk;");
+        w.line("float x_val = 0.0f;");
+        let mut base = 0u32;
+        for (idx, segment) in segments.iter().enumerate() {
+            let len = segment.shape[1].max(1) as u32;
+            let hi = base + len;
+            if idx == 0 {
+                w.line(format!("if (src_pos < {hi}u) {{"));
+            } else if idx == segments.len() - 1 {
+                w.line("else {");
+            } else {
+                w.line(format!("else if (src_pos < {hi}u) {{"));
+            }
+            w.push_indent();
+            w.line(format!("uint local_pos = src_pos - {base}u;"));
+            w.line(format!(
+                "uint x_idx = (bidx * {len}u + local_pos) * C + ch;"
+            ));
+            w.line(format!("x_val = float(in{idx}[x_idx]);"));
+            w.pop_indent();
+            w.line("}");
+            base = hi;
+        }
+    } else {
+        w.line("uint x_idx = (bidx * L_IN + (pos + kk)) * C + ch;");
+        w.line("float x_val = float(in0[x_idx]);");
+    }
     w.line("uint w_idx = ch * K + kk;");
-    w.line("acc += float(in0[x_idx]) * float(in1[w_idx]);");
+    w.line(format!("acc += x_val * float(in{weight_idx}[w_idx]);"));
     w.pop_indent();
     w.line("}");
     if post_silu {

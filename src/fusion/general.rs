@@ -372,6 +372,15 @@ pub fn run(mut fg: FusionGraph, target: &Target, graph: &crate::graph::Graph) ->
     if std::env::var("FUSEKIT_SELF_SILU_ABSORB").as_deref() != Ok("0") {
         while try_self_silu_absorb(&mut slots) {}
     }
+    // Concat→Conv sink: Qwen3Next-style linear attention feeds a
+    // depthwise Conv1d from a short sequence-window Concatenate. Treat
+    // that Concatenate as a virtual input layout for the Conv emitter
+    // instead of materializing the joined tensor. The guard is purely
+    // dataflow/shape based: one concat output, one conv consumer,
+    // sequence-axis concat, and a depthwise 1D convolution.
+    if std::env::var("FUSEKIT_CONCAT_CONV_ABSORB").as_deref() != Ok("0") {
+        while try_concat_convolution_absorb(&mut slots) {}
+    }
     // Gate-sink absorb: fold a downstream `Sigmoid(gate) * x` into the
     // upstream RMSNorm+Heavy fanout when the gate output has no other real
     // consumer. Unlike SwiGLU absorb, this does not serialize two Heavy
@@ -4251,6 +4260,154 @@ fn try_self_silu_absorb(slots: &mut Vec<Option<Fusion>>) -> bool {
             .op_ids
             .extend(consumer_owned.op_ids.iter().copied());
         slots[c_idx] = Some(producer_owned);
+        return true;
+    }
+    false
+}
+
+fn normalized_concat_axis(axis: i32, rank: usize) -> Option<usize> {
+    let axis = if axis < 0 { rank as i32 + axis } else { axis };
+    (axis >= 0).then_some(axis as usize).filter(|&a| a < rank)
+}
+
+fn concat_inputs_match_axis(axis: usize, out_shape: &[i32], inputs: &[FusionBoundary]) -> bool {
+    if inputs.is_empty() || axis >= out_shape.len() {
+        return false;
+    }
+    let mut sum = 0i32;
+    for input in inputs {
+        if input.shape.len() != out_shape.len() {
+            return false;
+        }
+        for (idx, (&in_dim, &out_dim)) in input.shape.iter().zip(out_shape.iter()).enumerate() {
+            if idx == axis {
+                continue;
+            }
+            if in_dim != out_dim {
+                return false;
+            }
+        }
+        sum += input.shape[axis];
+    }
+    sum == out_shape[axis]
+}
+
+fn infer_concat_axis(out_shape: &[i32], inputs: &[FusionBoundary]) -> Option<usize> {
+    (0..out_shape.len()).find(|&axis| concat_inputs_match_axis(axis, out_shape, inputs))
+}
+
+fn conv_accepts_virtual_sequence_concat(
+    concat_inputs: &[FusionBoundary],
+    concat_out: &FusionBoundary,
+    conv: &Fusion,
+) -> bool {
+    if concat_inputs.len() < 2 || conv.inputs.len() != 2 || conv.outputs.len() != 1 {
+        return false;
+    }
+    let y_shape = &conv.outputs[0].shape;
+    let w_shape = &conv.inputs[1].shape;
+    if concat_out.shape.len() != 3 || y_shape.len() != 3 || w_shape.len() < 2 {
+        return false;
+    }
+    let b = concat_out.shape[0];
+    let l_in = concat_out.shape[1];
+    let c = concat_out.shape[2];
+    if b <= 0 || l_in <= 0 || c <= 0 || y_shape[0] != b || y_shape[2] != c {
+        return false;
+    }
+    if w_shape[0] != c || w_shape.get(2).copied().unwrap_or(1) != 1 {
+        return false;
+    }
+    let k = w_shape[1];
+    let l_out = y_shape[1];
+    if k <= 0 || l_out <= 0 || l_out + k - 1 != l_in {
+        return false;
+    }
+    concat_inputs.iter().all(|input| {
+        input.shape.len() == 3 && input.shape[0] == b && input.shape[2] == c && input.shape[1] > 0
+    })
+}
+
+/// Fold a sequence-axis Concatenate into the following depthwise Conv1d.
+///
+/// The emitter keeps the convolution math unchanged and only changes how
+/// each source position is loaded: instead of `concat[pos]`, it maps
+/// `pos` to the original segment buffer and local position. This removes
+/// the concat dispatch plus the joined activation DRAM round-trip while
+/// preserving the same Conv/Conv+SiLU semantic boundary.
+fn try_concat_convolution_absorb(slots: &mut Vec<Option<Fusion>>) -> bool {
+    let mut consumers_of: HashMap<TensorId, Vec<usize>> = HashMap::new();
+    for (idx, slot) in slots.iter().enumerate() {
+        let Some(f) = slot else { continue };
+        for inp in &f.inputs {
+            consumers_of.entry(inp.source).or_default().push(idx);
+        }
+    }
+
+    for p_idx in 0..slots.len() {
+        let producer = match slots[p_idx].as_ref() {
+            Some(f) => f,
+            None => continue,
+        };
+        if !matches!(&producer.kind, FusionKind::Single(name) if name == "Concatenate")
+            || producer.outputs.len() != 1
+        {
+            continue;
+        }
+        let concat_axis = match &producer.attrs {
+            FusionAttrs::Single {
+                op_attrs: Attrs::Concatenate { axis },
+                ..
+            } => normalized_concat_axis(*axis, producer.outputs[0].shape.len())
+                .or_else(|| infer_concat_axis(&producer.outputs[0].shape, &producer.inputs)),
+            _ => infer_concat_axis(&producer.outputs[0].shape, &producer.inputs),
+        };
+        if concat_axis != Some(1)
+            || !concat_inputs_match_axis(1, &producer.outputs[0].shape, &producer.inputs)
+        {
+            continue;
+        }
+        let out_id = producer.outputs[0].source;
+        let consumers = consumers_of.get(&out_id).cloned().unwrap_or_default();
+        if consumers.len() != 1 {
+            continue;
+        }
+        let c_idx = consumers[0];
+        if c_idx == p_idx {
+            continue;
+        }
+        let consumer = match slots[c_idx].as_ref() {
+            Some(f) => f,
+            None => continue,
+        };
+        if !matches!(&consumer.kind, FusionKind::Single(name) if name == "Convolution" || name == "ConvolutionSilu")
+            || consumer.inputs.first().map(|b| b.source) != Some(out_id)
+            || !conv_accepts_virtual_sequence_concat(
+                &producer.inputs,
+                &producer.outputs[0],
+                consumer,
+            )
+        {
+            continue;
+        }
+
+        let producer_owned = slots[p_idx].take().expect("producer present");
+        let consumer_owned = slots[c_idx].take().expect("consumer present");
+        let mut merged_inputs = producer_owned.inputs.clone();
+        merged_inputs.extend(consumer_owned.inputs.iter().skip(1).cloned());
+        let mut merged_op_ids = producer_owned.op_ids.clone();
+        merged_op_ids.extend(consumer_owned.op_ids.iter().copied());
+        let merged = Fusion {
+            id: c_idx as u32,
+            kind: consumer_owned.kind,
+            op_ids: merged_op_ids,
+            inputs: merged_inputs,
+            outputs: consumer_owned.outputs,
+            attrs: consumer_owned.attrs,
+            parallel_axes: consumer_owned.parallel_axes,
+            layer_hint: producer_owned.layer_hint.or(consumer_owned.layer_hint),
+        };
+        slots[c_idx] = Some(merged);
         return true;
     }
     false

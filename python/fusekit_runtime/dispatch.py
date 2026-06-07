@@ -553,6 +553,29 @@ class Dispatcher:
                         and shape0[1] <= 8
                     ):
                         self._arrays_cache_scratch[(ins[0]["scratch_id"], li)] = 0
+            elif (
+                ("fusekit_op_convolution_" in k or "fusekit_op_convolutionsilu_" in k)
+                and li is not None
+            ):
+                ins = [b for b in t.get("inputs", []) if b.get("role") == "scratch"]
+                if len(ins) >= 2:
+                    shape0 = tuple(ins[0].get("shape", []))
+                    shape1 = tuple(ins[1].get("shape", []))
+                    # The general fusion pass may absorb the sequence-axis
+                    # Concatenate feeding a stateful linear-attention Conv1d.
+                    # Preserve the semantic binding that the removed
+                    # Concatenate used to expose: the first short segment is
+                    # the recurrent ArraysCache[0] window, not an ordinary
+                    # runtime scratch buffer. This is shape/dataflow guarded
+                    # and does not depend on a model name.
+                    if (
+                        len(shape0) == 3
+                        and len(shape1) == 3
+                        and shape0[0] == shape1[0] == 1
+                        and shape0[-1] == shape1[-1]
+                        and 0 < shape0[1] <= 8
+                    ):
+                        self._arrays_cache_scratch[(ins[0]["scratch_id"], li)] = 0
             elif len(outs) == 1:
                 out_shapes = [tuple(b.get("shape", []))
                               for b in t["outputs"] if b["role"] == "scratch"]
