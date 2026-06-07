@@ -1,0 +1,25 @@
+[package]
+name = "fusekit_runtime_native"
+version = "0.0.1"
+edition = "2021"
+description = "Rust dispatcher backing the fusekit_runtime Python package"
+license = "MIT OR Apache-2.0"
+
+[lib]
+# `extension-module` Python extension — produces a .dylib that's loaded
+# by CPython via dlopen. The `_` prefix in the Python module name is
+# the standard convention for C-extension siblings of a Python package.
+name = "_fusekit_runtime_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.22", features = ["extension-module", "abi3-py311"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+metal = "0.29"
+objc = "0.2"
+
+# abi3-py311 = build for Python 3.11+ stable ABI. Single .so works
+# across 3.11/3.12/3.13 without rebuild. Matches what oMLX ships
+# (cpython-3.11) and stays forward-compatible.

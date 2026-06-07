@@ -1,0 +1,18 @@
+/target
+**/*.rs.bk
+*.bak
+__pycache__/
+*.pyc
+*.metallib
+*.air
+.DS_Store
+
+# Local benchmark/profiling artifacts.
+.artifacts/
+.pycache-check/
+trace_runs/
+crash
+crash[0-9]*
+carsh[0-9]*
+mlx-community__*.dot
+mlx-community__*.html
