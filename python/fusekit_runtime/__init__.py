@@ -57,7 +57,12 @@ def _mlx_generate_kwargs_are_greedy(kw: dict[str, Any]) -> bool:
     decision at the runtime call boundary; the model graph itself does
     not encode sampling policy.
     """
-    return kw.get("sampler") is None and not kw.get("logits_processors")
+    if kw.get("logits_processors"):
+        return False
+    sampler = kw.get("sampler")
+    if sampler is None:
+        return True
+    return _sampler_is_greedy_argmax(sampler, missing_is_greedy=False)
 
 
 def _sampler_temperature(sampler: Any) -> float | None:
@@ -123,6 +128,7 @@ _OMLX_MTP_SAMPLER_ACCEPT_CACHE_PATCHED = False
 _OMLX_MTPLX_CONTRACT_PATCHED_CLASSES: set[type] = set()
 _OMLX_MTP_STATS_PRINTER_REGISTERED = False
 _OMLX_MTP_FASTPATH_STATS: dict[str, int] = {}
+_SAMPLE_UTILS_PATCHED = False
 
 
 def _mtp_fastpath_stat(name: str, delta: int = 1) -> None:
@@ -165,6 +171,45 @@ def _register_mtp_fastpath_stats_printer() -> None:
 
     atexit.register(_dump)
     _OMLX_MTP_STATS_PRINTER_REGISTERED = True
+
+
+def _wrap_sample_utils(module) -> None:
+    """Tag mlx-lm sampler callables with their semantic parameters.
+
+    `mlx_lm.sample_utils.make_sampler(temp=0)` returns an anonymous
+    argmax lambda with no attributes, so the runtime cannot distinguish
+    it from an arbitrary custom sampler. Attaching the construction
+    parameters lets FuseKit safely keep the direct-head argmax fast path
+    for semantic-greedy sampling while still rejecting non-greedy
+    temperature/top-k/top-p samplers.
+    """
+    global _SAMPLE_UTILS_PATCHED
+    if _SAMPLE_UTILS_PATCHED or not hasattr(module, "make_sampler"):
+        return
+    original_make_sampler = module.make_sampler
+
+    def _patched_make_sampler(*args, **kwargs):
+        sampler = original_make_sampler(*args, **kwargs)
+        temp = kwargs.get("temp", args[0] if len(args) > 0 else 0.0)
+        top_p = kwargs.get("top_p", args[1] if len(args) > 1 else 0.0)
+        min_p = kwargs.get("min_p", args[2] if len(args) > 2 else 0.0)
+        min_keep = kwargs.get("min_tokens_to_keep", args[3] if len(args) > 3 else 1)
+        top_k = kwargs.get("top_k", args[4] if len(args) > 4 else 0)
+        try:
+            sampler.temp = float(temp)
+            sampler.temperature = float(temp)
+            sampler.top_p = float(top_p)
+            sampler.min_p = float(min_p)
+            sampler.min_tokens_to_keep = int(min_keep)
+            sampler.top_k = int(top_k)
+            sampler._fk_mlx_lm_sampler = True
+        except Exception:
+            pass
+        return sampler
+
+    _patched_make_sampler._fk_original = original_make_sampler
+    module.make_sampler = _patched_make_sampler
+    _SAMPLE_UTILS_PATCHED = True
 
 
 def _register_dispatch_stats_printer(wrapper: Any) -> None:
@@ -2255,6 +2300,7 @@ def _task_graph_has_stateful_mtp(task_graph: dict) -> bool:
 _TOP_LOAD_MODULE = "mlx_lm"
 _TARGET_MODULE = "mlx_lm.utils"
 _GENERATE_MODULE = "mlx_lm.generate"
+_SAMPLE_UTILS_MODULE = "mlx_lm.sample_utils"
 _OMLX_SCHEDULER_MODULE = "omlx.scheduler"
 _PATCHED = False
 _PATCHED_LOAD_MODULES: set[str] = set()
@@ -3579,8 +3625,15 @@ class _PatchingLoader(importlib.abc.Loader):
         elif module.__name__ == _TARGET_MODULE:
             _wrap_load(module)
         elif module.__name__ == _GENERATE_MODULE:
+            sample_utils = sys.modules.get(_SAMPLE_UTILS_MODULE)
+            if sample_utils is not None:
+                _wrap_sample_utils(sample_utils)
+                if hasattr(sample_utils, "make_sampler"):
+                    module.make_sampler = sample_utils.make_sampler
             _wrap_generate_step(module)
             _wrap_generation_batch(module)
+        elif module.__name__ == _SAMPLE_UTILS_MODULE:
+            _wrap_sample_utils(module)
         elif module.__name__ == _OMLX_SCHEDULER_MODULE:
             _wrap_omlx_scheduler(module)
 
@@ -3595,6 +3648,7 @@ class _FusekitMetaPathFinder(importlib.abc.MetaPathFinder):
             _TOP_LOAD_MODULE,
             _TARGET_MODULE,
             _GENERATE_MODULE,
+            _SAMPLE_UTILS_MODULE,
             _OMLX_SCHEDULER_MODULE,
         ):
             return None
@@ -3627,8 +3681,13 @@ def install_hook() -> None:
     existing = sys.modules.get(_TARGET_MODULE)
     if existing is not None:
         _wrap_load(existing)
+    existing_sample_utils = sys.modules.get(_SAMPLE_UTILS_MODULE)
+    if existing_sample_utils is not None:
+        _wrap_sample_utils(existing_sample_utils)
     existing_gen = sys.modules.get(_GENERATE_MODULE)
     if existing_gen is not None:
+        if existing_sample_utils is not None and hasattr(existing_sample_utils, "make_sampler"):
+            existing_gen.make_sampler = existing_sample_utils.make_sampler
         _wrap_generate_step(existing_gen)
         _wrap_generation_batch(existing_gen)
     existing_scheduler = sys.modules.get(_OMLX_SCHEDULER_MODULE)

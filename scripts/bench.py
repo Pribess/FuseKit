@@ -15,6 +15,7 @@ import time
 import mlx.core as mx
 from mlx_lm import load
 from mlx_lm.generate import stream_generate
+from mlx_lm.sample_utils import make_sampler
 
 
 def main() -> int:
@@ -29,6 +30,9 @@ def main() -> int:
     parser.add_argument("--max-kv-size", type=int, default=None)
     parser.add_argument("--kv-bits", type=int, choices=(4, 8), default=None)
     parser.add_argument("--kv-group-size", type=int, default=64)
+    parser.add_argument("--temperature", type=float, default=None)
+    parser.add_argument("--top-p", type=float, default=0.0)
+    parser.add_argument("--top-k", type=int, default=0)
     parser.add_argument("--dump-tokens", action="store_true")
     parser.add_argument(
         "--status-every",
@@ -66,6 +70,20 @@ def main() -> int:
         tokens = []
         last_status_tokens = 0
         last_status_s = started
+        sampler = None
+        if args.temperature is not None:
+            sampler = make_sampler(
+                args.temperature,
+                top_p=args.top_p,
+                top_k=args.top_k,
+            )
+            try:
+                sampler.temp = args.temperature
+                sampler.temperature = args.temperature
+                sampler.top_p = args.top_p
+                sampler.top_k = args.top_k
+            except Exception:
+                pass
         for last in stream_generate(
             model,
             tokenizer,
@@ -74,6 +92,7 @@ def main() -> int:
             max_kv_size=args.max_kv_size,
             kv_bits=args.kv_bits,
             kv_group_size=args.kv_group_size,
+            sampler=sampler,
         ):
             tokens.append(int(last.token))
             generated_now = int(last.generation_tokens)
