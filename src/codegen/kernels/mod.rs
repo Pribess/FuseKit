@@ -696,12 +696,12 @@ pub fn linear_residual_qmv_fast_cols_per_simdgroup(
             && out_dim >= 512
         {
             // Large-reduction residual qMV (MLP down-proj) repeatedly
-            // reads the same activation row for adjacent output rows.
-            // On M5, the previous 8-col tile saved activation reads but
-            // cost more in register pressure on q4 down-proj. The 4-col
-            // tile matches MLX's qMV balance while keeping the fused
-            // residual add and avoids the MTP-oriented multi-row path.
-            4
+            // streams enough q4 weight that column fanout becomes register
+            // pressure before it saves meaningful activation bandwidth. M5
+            // profiles on 4B-class q4 down-proj favored one output column
+            // per simdgroup; smaller residual projections keep the generic
+            // policy below.
+            1
         } else if matches!(crate::target::current_chip(), crate::target::ChipModel::M5)
             && bits == 8
             && active_rows <= 1

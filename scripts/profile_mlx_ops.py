@@ -292,6 +292,9 @@ def main() -> int:
     parser.add_argument("--prefill-step-size", type=int, default=2048)
     parser.add_argument("--top", type=int, default=32)
     parser.add_argument("--include-modules", action="store_true")
+    parser.add_argument("--kv-bits", type=int, choices=(4, 8), default=None)
+    parser.add_argument("--kv-group-size", type=int, default=64)
+    parser.add_argument("--quantized-kv-start", type=int, default=0)
     args = parser.parse_args()
 
     print(
@@ -305,6 +308,7 @@ def main() -> int:
     install_wrappers(args.include_modules)
 
     from mlx_lm import load
+    from mlx_lm.generate import maybe_quantize_kv_cache
     from mlx_lm.models.cache import make_prompt_cache
 
     model, tokenizer = load(str(model_path(args.model)))
@@ -315,6 +319,13 @@ def main() -> int:
     prompt = encode_prompt(tokenizer, args.prompt)
     prompt_cache = make_prompt_cache(model)
     token = prefill(model, prompt, prompt_cache, args.prefill_step_size)
+    maybe_quantize_kv_cache(
+        prompt_cache,
+        quantized_kv_start=args.quantized_kv_start,
+        kv_group_size=args.kv_group_size,
+        kv_bits=args.kv_bits,
+    )
+    mx.eval(*cache_state(prompt_cache))
 
     for _ in range(args.warmup):
         token = decode_one(model, token, prompt_cache)
