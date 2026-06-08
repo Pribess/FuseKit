@@ -40,14 +40,6 @@ def _dispatch_enabled() -> bool:
     return True
 
 
-def _generate_fast_enabled() -> bool:
-    if _env_flag("FUSEKIT_DISABLE_FAST") or _env_flag("FUSEKIT_DISABLE_GENERATE_FAST"):
-        return False
-    if "FUSEKIT_ENABLE_FAST" in os.environ:
-        return _env_flag("FUSEKIT_ENABLE_FAST")
-    return True
-
-
 def _mlx_generate_kwargs_are_greedy(kw: dict[str, Any]) -> bool:
     """True only when mlx-lm's public generate_step contract is argmax.
 
@@ -2567,8 +2559,8 @@ def _prime_tokenizer_cache(tokenizer) -> None:
 def _wrap_generate_step(module) -> None:
     """Monkey-patch `mlx_lm.generate.generate_step` so the fusekit
     fast-path is used when (a) the model has a populated `_fk_lm`
-    state with an in-ICB argmax, and (b) the caller didn't pass a
-    custom sampler (default = greedy → matches our argmax).
+    state with an in-ICB argmax, and (b) generation is semantically
+    greedy (default sampler or temp=0 sampler, no logits processors).
 
     Defensive: inspects the signature; if it doesn't match the
     expected `(prompt, model, *, ..., sampler=None, prompt_cache=None,
@@ -2611,11 +2603,6 @@ def _wrap_generate_step(module) -> None:
         # 3. Caller did not supply a prompt_cache. The fast path mutates
         #    cache state during bootstrap; when fusekit has to fall back,
         #    we need to be able to rebuild a fresh cache through _orig.
-        if not _generate_fast_enabled():
-            if os.environ.get("FUSEKIT_TRACE_GENSTEP"):
-                print("[gen] fastpath disabled", file=sys.stderr)
-            yield from _orig(prompt, model, **kw)
-            return
         if not _mlx_generate_kwargs_are_greedy(kw):
             yield from _orig(prompt, model, **kw)
             return
