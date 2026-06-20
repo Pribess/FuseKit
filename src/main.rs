@@ -17,7 +17,6 @@ mod runtime_payload;
 mod target;
 mod task;
 mod ui;
-mod weight_repack;
 
 #[derive(Parser)]
 #[command(name = "fusekit")]

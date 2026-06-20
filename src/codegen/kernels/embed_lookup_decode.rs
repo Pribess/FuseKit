@@ -30,7 +30,12 @@ pub fn emit(
     let hidden = meta.hidden_size;
     let t = crate::codegen::kernels::act_ty(meta);
     let fn_name = function_name(fusion);
-    let active_m = crate::target::current_chip().active_m(8).max(1);
+    let active_m = std::env::var("FUSEKIT_ACTIVE_M")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or_else(|| crate::target::current_chip().active_m(1))
+        .max(1);
     let quant = meta
         .quant_bits
         .zip(meta.quant_group_size)

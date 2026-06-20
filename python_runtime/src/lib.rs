@@ -814,6 +814,62 @@ fn execute_icb_range(handle: usize, icb_id: usize, start: usize, count: usize) -
     Ok(gpu_end - gpu_start)
 }
 
+/// Execute an ICB one indirect command at a time and return GPU time
+/// per command. This is a profiling primitive, not the normal fast
+/// path: each command is submitted as its own command buffer so we can
+/// read `GPUStartTime/GPUEndTime` per generated kernel while still
+/// using the exact encoded ICB command and residency set that the
+/// runtime normally uses.
+#[pyfunction]
+#[pyo3(signature = (handle, icb_id, count=None))]
+fn profile_icb_commands(handle: usize, icb_id: usize, count: Option<usize>) -> PyResult<Vec<f64>> {
+    let v = DISPATCHERS.lock().unwrap();
+    let d = v
+        .get(handle)
+        .ok_or_else(|| value_err(format!("invalid handle: {handle}")))?;
+    let entry = d
+        .icbs
+        .get(icb_id)
+        .ok_or_else(|| value_err(format!("invalid icb id: {icb_id}")))?;
+    let n = count.unwrap_or(entry.n_commands as usize);
+    if n == 0 || n as u64 > entry.n_commands {
+        return Err(value_err(format!(
+            "invalid ICB profile count={n} commands={commands}",
+            commands = entry.n_commands
+        )));
+    }
+
+    let icb_ref: &metal::IndirectCommandBufferRef = &entry.icb;
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let cmd = d.queue.new_command_buffer_with_unretained_references();
+        let enc = cmd.new_compute_command_encoder();
+        enc.use_resources(
+            &entry.resident_refs,
+            MTLResourceUsage::Read | MTLResourceUsage::Write,
+        );
+        let range = NSRange {
+            location: i as u64,
+            length: 1,
+        };
+        unsafe {
+            let _: () = objc::msg_send![
+                enc,
+                executeCommandsInBuffer: icb_ref
+                withRange: range
+            ];
+        }
+        enc.end_encoding();
+        cmd.commit();
+        cmd.wait_until_completed();
+
+        let gpu_start: f64 = unsafe { objc::msg_send![cmd, GPUStartTime] };
+        let gpu_end: f64 = unsafe { objc::msg_send![cmd, GPUEndTime] };
+        out.push(gpu_end - gpu_start);
+    }
+    Ok(out)
+}
+
 /// Per-step uniform fanout. Writes `token_id` into the global token
 /// uniform and each `(offset, capacity, kv_len)` triple into the
 /// per-layer offset/capacity/kv_len uniforms in a single C call,
@@ -919,6 +975,42 @@ fn step_decode_shared_state(
         }
     }
     submit_icb_async(handle, icb_id)
+}
+
+/// Synchronous form of `step_decode_shared_state` for direct `model(...)`
+/// calls. The oMLX engine fast path can overlap async submit with scheduler
+/// work, but the generic dispatcher immediately exposes logits/argmax views,
+/// so it needs the old execute-and-wait semantics while still avoiding the
+/// Python-side uniform/barrier fanout.
+#[pyfunction]
+#[allow(clippy::too_many_arguments)]
+fn step_decode_shared_state_sync(
+    handle: usize,
+    icb_id: usize,
+    token_id_ptr: usize,
+    token: u32,
+    offset_ptr: usize,
+    offset: u32,
+    capacity_ptr: usize,
+    capacity: u32,
+    kv_len_ptr: usize,
+    kv_len: u32,
+    step_counter_ptr: usize,
+    hist_counter_ptr: usize,
+    barrier_counter_ptrs: Vec<usize>,
+) -> PyResult<f64> {
+    unsafe {
+        std::ptr::write(token_id_ptr as *mut u32, token);
+        std::ptr::write(offset_ptr as *mut u32, offset);
+        std::ptr::write(capacity_ptr as *mut u32, capacity);
+        std::ptr::write(kv_len_ptr as *mut u32, kv_len);
+        std::ptr::write(step_counter_ptr as *mut u32, offset);
+        std::ptr::write(hist_counter_ptr as *mut u32, 0u32);
+        for ptr in &barrier_counter_ptrs {
+            std::ptr::write(*ptr as *mut u32, 0u32);
+        }
+    }
+    execute_icb(handle, icb_id)
 }
 
 /// Decode a contiguous chunk of `count` tokens entirely native-side.
@@ -1872,8 +1964,10 @@ fn _fusekit_runtime_native(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(decode_chunk_gpu_chain_reset_barriers, m)?)?;
     m.add_function(wrap_pyfunction!(execute_icb, m)?)?;
     m.add_function(wrap_pyfunction!(execute_icb_range, m)?)?;
+    m.add_function(wrap_pyfunction!(profile_icb_commands, m)?)?;
     m.add_function(wrap_pyfunction!(submit_icb_async, m)?)?;
     m.add_function(wrap_pyfunction!(step_decode_shared_state, m)?)?;
+    m.add_function(wrap_pyfunction!(step_decode_shared_state_sync, m)?)?;
     m.add_function(wrap_pyfunction!(wait_pending_icb, m)?)?;
     m.add_function(wrap_pyfunction!(array_data_ptrs, m)?)?;
     m.add_function(wrap_pyfunction!(version, m)?)?;

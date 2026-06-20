@@ -55,7 +55,35 @@ pub const FLASH_DEC_CHUNK: u32 = 128;
 pub const FLASH_DEC_MAX_CHUNKS: u32 = 32;
 
 pub fn flash_decoding_enabled() -> bool {
-    std::env::var_os("FUSEKIT_SDPA_FLASH_DECODING").is_some()
+    flash_decoding_enabled_for(u32::MAX, u32::MAX, u32::MAX, u32::MAX, u32::MAX)
+}
+
+pub fn flash_decoding_enabled_for(
+    n_heads: u32,
+    _n_kv_heads: u32,
+    qk_dim: u32,
+    v_dim: u32,
+    active_m: u32,
+) -> bool {
+    if std::env::var("FUSEKIT_SDPA_LEGACY").as_deref() == Ok("1")
+        || std::env::var("FUSEKIT_DISABLE_SDPA_FLASH_DECODING").as_deref() == Ok("1")
+    {
+        return false;
+    }
+    if std::env::var("FUSEKIT_FORCE_SDPA_FLASH_DECODING").as_deref() == Ok("1") {
+        return true;
+    }
+
+    // Flash-decoding splits one decode head across KV chunks and then
+    // merges global partials with an atomic counter. That wins when
+    // there are too few head TGs to fill the GPU, but the fixed
+    // partial/counter roundtrip is too expensive for small Qwen2-style
+    // decode heads (M=1, <=16 heads, 64-wide Q/K/V). In that shape the
+    // legacy one-TG-per-head path is faster at L512 while using much
+    // less scratch bandwidth. This is semantic/shape-based, not a
+    // model-name special case.
+    let small_decode_head = active_m == 1 && n_heads <= 16 && qk_dim <= 64 && v_dim <= 64;
+    !small_decode_head
 }
 
 pub fn emit(
@@ -112,7 +140,7 @@ pub fn emit(
         .get(0..)
         .filter(|s| !s.is_empty())
         .map(|s| crate::target::current_chip().active_tokens_for_shape(s))
-        .unwrap_or_else(|| crate::target::current_chip().active_m(8))
+        .unwrap_or_else(|| crate::target::current_chip().active_m_for_unshaped(8))
         .max(1);
     let direct_scaled_q = (scale - 1.0).abs() < f32::EPSILON && !inputless_semantic_decode;
     let q_head_major = inputless_semantic_decode
@@ -136,7 +164,7 @@ pub fn emit(
     // the grid is `n_heads × MAX_CHUNKS` and `gid` decomposes into
     // `head_id × MAX_CHUNKS + chunk_id`. The single-TG-per-head emits
     // keep their existing `head_id = gid` convention.
-    let flash_decoding = flash_decoding_enabled();
+    let flash_decoding = flash_decoding_enabled_for(n_heads, n_kv_heads, qk_dim, v_dim, active_m);
     // Bake layer_idx so each layer's SDPA kernel indexes into the
     // shared global partials/counter buffers at its own offset. Allows
     // ONE global buffer instead of n_layers per-layer scratches.
@@ -217,15 +245,11 @@ pub fn emit(
     w.line("uint sgs_per_tg = tg_size / 32u;");
     w.blank();
 
-    // Default: legacy two-pass (full kv_len in SMEM, 16 KB cap @ 2 TGs/SM).
-    // Opt-in: FUSEKIT_SDPA_FLASH=1 → block-streamed online softmax.
-    // Both correctly match mlx-lm bit-for-bit; the flash path's SMEM
-    // win (16 KB → 0.4 KB) doesn't translate to speed by itself because
-    // single-head-per-TG only launches `n_heads × 1` TGs total (14 on
-    // 0.5B Qwen). FUSEKIT_SDPA_FLASH_DECODING=1 takes the additional
-    // step of splitting the KV axis across TGs, raising launch count
-    // to `n_heads × ceil(kv_len/KV_CHUNK)` and closing the parallelism
-    // starvation at long context.
+    // Default: flash-decoding. It splits each query head's KV axis
+    // across chunks, raising launch count to
+    // `n_heads × ceil(kv_len/KV_CHUNK)` and avoiding the legacy
+    // `MAX_KV_LEN` scores buffer in threadgroup memory. Set
+    // FUSEKIT_SDPA_LEGACY=1 to restore the old two-pass path for A/B.
     if flash_decoding {
         emit_flash_decoding(w, t);
     } else {
@@ -346,7 +370,7 @@ fn emit_flash_decoding(w: &mut MslWriter, t: &str) {
     w.push_indent();
     w.line("uint kv = block + tid;");
     w.line(format!(
-        "device const {t}* q_row = Q + ((Q_HEAD_MAJOR ? (head_id_real * OUT_SEQ + query_row) : ((query_row * N_HEADS + head_id_real) * Q_SEQ)) * QK_DIM);"
+        "device const {t}* q_row = Q + ((Q_HEAD_MAJOR ? (head_id_real * Q_SEQ + query_row) : (query_row * N_HEADS + head_id_real)) * QK_DIM);"
     ));
     w.line(format!(
         "device const {t}* k_row = K + (kv_head * capacity + kv) * QK_DIM;"
@@ -550,7 +574,7 @@ fn emit_flash_online(w: &mut MslWriter, t: &str) {
     w.push_indent();
     w.line("uint kv = block + tid;");
     w.line(format!(
-        "device const {t}* q_row = Q + ((Q_HEAD_MAJOR ? (head_id_real * OUT_SEQ + query_row) : ((query_row * N_HEADS + head_id_real) * Q_SEQ)) * QK_DIM);"
+        "device const {t}* q_row = Q + ((Q_HEAD_MAJOR ? (head_id_real * Q_SEQ + query_row) : (query_row * N_HEADS + head_id_real)) * QK_DIM);"
     ));
     w.line(format!(
         "device const {t}* k_row = K + (kv_head * capacity + kv) * QK_DIM;"
@@ -684,7 +708,7 @@ fn emit_legacy_two_pass(w: &mut MslWriter, t: &str) {
     w.line("for (uint kv = tid; kv < kv_len_eff; kv += tg_size) {");
     w.push_indent();
     w.line(format!(
-        "device const {t}4* q_row4 = (device const {t}4*)(Q + ((Q_HEAD_MAJOR ? (head_id_real * OUT_SEQ + query_row) : ((query_row * N_HEADS + head_id_real) * Q_SEQ)) * QK_DIM));"
+        "device const {t}4* q_row4 = (device const {t}4*)(Q + ((Q_HEAD_MAJOR ? (head_id_real * Q_SEQ + query_row) : (query_row * N_HEADS + head_id_real)) * QK_DIM));"
     ));
     w.line(format!(
         "device const {t}4* k_row4 = (device const {t}4*)(K + (kv_head * capacity + kv) * QK_DIM);"

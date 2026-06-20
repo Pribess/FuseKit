@@ -184,6 +184,22 @@ impl ChipModel {
         }
     }
 
+    /// Active token rows for semantic kernels whose trace inputs/outputs
+    /// are replaced by runtime bindings and therefore have no local shape.
+    /// In prefill/MTP variant codegen the active M is the variant contract,
+    /// not an arbitrary fallback trace length, so do not clamp the env value
+    /// to `fallback_trace_m`.
+    pub fn active_m_for_unshaped(self, fallback_trace_m: u32) -> u32 {
+        if let Some(n) = std::env::var("FUSEKIT_ACTIVE_M")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .filter(|&n| n >= 1)
+        {
+            return n;
+        }
+        self.active_m(fallback_trace_m)
+    }
+
     /// For tensor shapes captured as `[B, S, suffix...]`, return the
     /// active S rows. Rank-2 matmul operands use their explicit M
     /// dimension instead of a batch/sequence prefix.
@@ -255,13 +271,15 @@ impl ChipModel {
     }
 
     /// Dense bf16/fp16 GEMV coalescing policy. Ordinary decode emits
-    /// one active token row, but large hidden dimensions still benefit
-    /// from computing two output columns per simdgroup because the
-    /// activation vector load is reused across adjacent weight rows.
+    /// one active token row; computing multiple output columns per
+    /// simdgroup can reuse activation loads, but also increases register
+    /// pressure and can reduce occupancy.
     /// Keep the legacy `FUSEKIT_GEMV_ROWS` override for sweeps, while
-    /// making M5 shape-aware: small 0.5B-class hidden dims measured
-    /// slower at 2 columns, 4B-class dense chains measured faster.
-    pub fn dense_gemv_rows_per_simdgroup(self, k_dim: u32, out_dim: u32) -> u32 {
+    /// making M5 shape-aware. Current M5 late-token profiling shows
+    /// large bf16 decode wins at one output column per simdgroup: the
+    /// extra register pressure from multi-column coalescing costs more
+    /// than the activation-load reuse once the chain is already fused.
+    pub fn dense_gemv_rows_per_simdgroup(self, _k_dim: u32, _out_dim: u32) -> u32 {
         let env = std::env::var("FUSEKIT_DENSE_GEMV_ROWS")
             .ok()
             .and_then(|s| s.trim().parse::<u32>().ok())
@@ -277,7 +295,6 @@ impl ChipModel {
         }
         match self {
             ChipModel::M3 | ChipModel::M4 => 2,
-            ChipModel::M5 if k_dim >= 2048 && out_dim >= 2048 => 2,
             ChipModel::M1 | ChipModel::M2 | ChipModel::M5 | ChipModel::Unknown => 1,
         }
     }

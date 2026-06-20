@@ -58,6 +58,41 @@ def model_cache_state(cache):
     return [c.state for c in cache]
 
 
+def resolve_core(model):
+    for path in (
+        ("model",),
+        ("language_model", "model"),
+        ("text_model", "model"),
+        ("language_model",),
+        ("text_model",),
+    ):
+        cur = model
+        ok = True
+        for name in path:
+            cur = getattr(cur, name, None)
+            if cur is None:
+                ok = False
+                break
+        if ok and all(hasattr(cur, name) for name in ("layers", "embed_tokens", "norm")):
+            return cur
+    raise AttributeError(f"could not resolve transformer core for {type(model).__name__}")
+
+
+def final_lm_head(model, core, h):
+    if getattr(getattr(model, "args", None), "tie_word_embeddings", False) or getattr(
+        getattr(getattr(model, "language_model", None), "args", None),
+        "tie_word_embeddings",
+        False,
+    ):
+        return core.embed_tokens.as_linear(h)
+    head = getattr(model, "lm_head", None) or getattr(
+        getattr(model, "language_model", None), "lm_head", None
+    )
+    if head is None:
+        return core.embed_tokens.as_linear(h)
+    return head(h)
+
+
 def prefill(model, prompt: mx.array, prompt_cache, prefill_step_size: int) -> mx.array:
     with mx.stream(generation_stream):
         while prompt.size > 1:
@@ -261,6 +296,32 @@ def qwen2_decode_one_block(model, input_tokens: mx.array, prompt_cache, prof: Pr
     return sampled
 
 
+def generic_decode_one_block(model, input_tokens: mx.array, prompt_cache, prof: Profiler):
+    core = resolve_core(model)
+    h = prof.time("embed", lambda: core.embed_tokens(input_tokens[None]))
+    try:
+        mask = create_attention_mask(h, prompt_cache[0])
+    except TypeError:
+        mask = prompt_cache[0].make_mask(h.shape[1])
+
+    for layer_idx, (layer, c) in enumerate(zip(core.layers, prompt_cache)):
+        layer_name = type(layer).__name__.lower()
+        h = prof.time(
+            f"layer.{layer_idx:02d}.{layer_name}",
+            lambda layer=layer, c=c, h=h: layer(h, mask, c),
+        )
+
+    h = prof.time("final.rmsnorm", lambda core=core, h=h: core.norm(h))
+    logits = prof.time("final.lm_head", lambda: final_lm_head(model, core, h))
+    logits = prof.time("sample.slice_last", lambda logits=logits: logits[:, -1, :])
+    logprobs = prof.time(
+        "sample.logsumexp",
+        lambda logits=logits: logits - mx.logsumexp(logits, keepdims=True),
+    )
+    sampled = prof.time("sample.argmax", lambda logprobs=logprobs: mx.argmax(logprobs, axis=-1))
+    return sampled
+
+
 def print_summary(prof: Profiler) -> None:
     total_s = sum(stat.total_s for stat in prof.stats.values())
     print(
@@ -291,7 +352,7 @@ def main() -> int:
     parser.add_argument("--tokens", type=int, default=32)
     parser.add_argument("--warmup", type=int, default=4)
     parser.add_argument("--prefill-step-size", type=int, default=2048)
-    parser.add_argument("--mode", choices=("block", "grouped", "fine"), default="block")
+    parser.add_argument("--mode", choices=("block", "grouped", "fine", "generic-block"), default="block")
     args = parser.parse_args()
 
     print(
@@ -316,6 +377,8 @@ def main() -> int:
                 y = qwen2_decode_one(model, y, prompt_cache, prof)
             elif args.mode == "grouped":
                 y = qwen2_decode_one_grouped(model, y, prompt_cache, prof)
+            elif args.mode == "generic-block":
+                y = generic_decode_one_block(model, y, prompt_cache, prof)
             else:
                 y = qwen2_decode_one_block(model, y, prompt_cache, prof)
             mx.eval(y)
@@ -328,6 +391,8 @@ def main() -> int:
                 y = qwen2_decode_one(model, y, prompt_cache, prof)
             elif args.mode == "grouped":
                 y = qwen2_decode_one_grouped(model, y, prompt_cache, prof)
+            elif args.mode == "generic-block":
+                y = generic_decode_one_block(model, y, prompt_cache, prof)
             else:
                 y = qwen2_decode_one_block(model, y, prompt_cache, prof)
             mx.eval(y)

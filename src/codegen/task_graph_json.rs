@@ -550,6 +550,8 @@ pub fn build(
                 FusionKind::FusedChain
                     | FusionKind::QmvFanout
                     | FusionKind::QmvSwiglu
+                    | FusionKind::RoutedQmvSwiglu
+                    | FusionKind::RoutedQmvReduce
                     | FusionKind::SdpaDecode
                     | FusionKind::EmbedLookupDecode
             )
@@ -730,6 +732,15 @@ fn analyze_decode_capabilities(
     let decode_task_ids: BTreeSet<u32> = decode_pipeline.iter().copied().collect();
     let task_by_fusion: BTreeMap<usize, u32> =
         tg.tasks.iter().map(|t| (t.fusion as usize, t.id)).collect();
+    let mut producer_task_by_tensor: BTreeMap<crate::graph::TensorId, u32> = BTreeMap::new();
+    for (fusion_idx, fusion) in fg.fusions.iter().enumerate() {
+        let Some(&task_id) = task_by_fusion.get(&fusion_idx) else {
+            continue;
+        };
+        for output in &fusion.outputs {
+            producer_task_by_tensor.insert(output.source, task_id);
+        }
+    }
     let semantic_sdpa_trace_deps = semantic_sdpa_trace_dependency_closure(fg, tg);
     let mut reasons: Vec<JsonCapabilityReason> = Vec::new();
 
@@ -760,6 +771,7 @@ fn analyze_decode_capabilities(
                 | "Transpose"
                 | "Slice"
                 | "Matmul"
+                | "ScaledDotProductAttention"
                 | "Softmax"
                 | "ArgPartition"
                 | "Argpartition"
@@ -806,6 +818,9 @@ fn analyze_decode_capabilities(
             FusionKind::SdpaDecode => {
                 sdpa_layers.insert(layer);
             }
+            FusionKind::Single(ref name) if name == "ScaledDotProductAttention" => {
+                sdpa_layers.insert(layer);
+            }
             FusionKind::RopeKvCacheStoreDecode => {
                 kv_store_layers.insert(layer);
             }
@@ -845,8 +860,34 @@ fn analyze_decode_capabilities(
         };
         let fusion = &fg.fusions[task.fusion as usize];
         let consumer_layer = layer_index(fusion);
+        let overridden_input_slots: BTreeSet<usize> = extra_bindings_for(fusion, &fg.meta)
+            .into_iter()
+            .filter_map(|eb| {
+                let slot = eb.slot as usize;
+                (slot < fusion.inputs.len()).then_some(slot)
+            })
+            .collect();
         for &dep_task_id in &task.deps {
             if decode_task_ids.contains(&dep_task_id) {
+                continue;
+            }
+            let mut only_overridden_inputs = false;
+            if !overridden_input_slots.is_empty() {
+                let mut seen_dep_input = false;
+                only_overridden_inputs = true;
+                for (slot, input) in fusion.inputs.iter().enumerate() {
+                    if producer_task_by_tensor.get(&input.source) != Some(&dep_task_id) {
+                        continue;
+                    }
+                    seen_dep_input = true;
+                    if !overridden_input_slots.contains(&slot) {
+                        only_overridden_inputs = false;
+                        break;
+                    }
+                }
+                only_overridden_inputs &= seen_dep_input;
+            }
+            if only_overridden_inputs {
                 continue;
             }
             if matches!(fusion.kind, FusionKind::SdpaDecode)
@@ -1055,6 +1096,8 @@ fn semantic_decode_boundary_task(kind: &crate::fusion::ir::FusionKind) -> bool {
             | FusionKind::FusedChain
             | FusionKind::QmvFanout
             | FusionKind::QmvSwiglu
+            | FusionKind::RoutedQmvSwiglu
+            | FusionKind::RoutedQmvReduce
             | FusionKind::LayerBlock
             | FusionKind::LinearResidual
             | FusionKind::RmsNormGateUpSwiglu
@@ -1155,9 +1198,20 @@ fn semantic_sdpa_trace_dependency_closure(
     fg: &FusionGraph,
     tg: &TaskGraph,
 ) -> std::collections::BTreeSet<u32> {
+    use crate::fusion::ir::FusionKind;
     use std::collections::{BTreeSet, HashMap, VecDeque};
 
     if std::env::var("FUSEKIT_ROUNDTRIP_PRUNE").as_deref() == Ok("0") {
+        return BTreeSet::new();
+    }
+    let has_semantic_attention_replacement = fg.fusions.iter().any(|fusion| {
+        matches!(fusion.kind, FusionKind::SdpaDecode | FusionKind::LayerBlock)
+            || matches!(
+                &fusion.kind,
+                FusionKind::Single(name) if name == "ScaledDotProductAttention"
+            )
+    });
+    if !has_semantic_attention_replacement {
         return BTreeSet::new();
     }
 
@@ -1333,6 +1387,8 @@ fn build_decode_pipeline(
             FusionKind::FusedChain => Some(99),
             FusionKind::QmvFanout => Some(99),
             FusionKind::QmvSwiglu => Some(99),
+            FusionKind::RoutedQmvSwiglu => Some(99),
+            FusionKind::RoutedQmvReduce => Some(99),
             FusionKind::Single(name)
                 if matches!(
                     name.as_str(),
@@ -1717,6 +1773,10 @@ fn build_decode_pipeline(
         let producer_by_scratch: std::collections::HashMap<u32, u32> = tg
             .tasks
             .iter()
+            .filter(|task| {
+                let fusion = &fg.fusions[task.fusion as usize];
+                !is_aliased_noop_view(fusion)
+            })
             .flat_map(|task| {
                 let fusion = &fg.fusions[task.fusion as usize];
                 fusion.outputs.iter().filter_map(move |bd| {
@@ -1745,8 +1805,9 @@ fn build_decode_pipeline(
                 continue;
             };
             let mut deps: std::collections::BTreeSet<u32> = task.deps.iter().copied().collect();
+            let overridden_input_slots = extra_bound_input_slots(fusion, &fg.meta);
             for (input_idx, input) in fusion.inputs.iter().enumerate() {
-                if matches!(fusion.kind, FusionKind::SdpaDecode) && input_idx > 0 {
+                if overridden_input_slots.contains(&input_idx) {
                     continue;
                 }
                 if let Some(dep) = producer_by_tensor.get(&input.source).copied() {
@@ -1785,9 +1846,7 @@ fn build_decode_pipeline(
                 if is_decode_embed_preamble(dep_fusion) {
                     continue;
                 }
-                let Some(dep_tag) = layer_index(dep_fusion) else {
-                    continue;
-                };
+                let dep_tag = layer_index(dep_fusion).unwrap_or(consumer_tag);
                 if dep_tag != consumer_tag {
                     continue;
                 }
@@ -2491,13 +2550,166 @@ fn build_binding(
             });
         JsonBinding::External {
             tensor_id: bd.source,
-            source_path,
             scalar,
+            source_path,
             role_name: bd.role.to_string(),
             shape: bd.shape.clone(),
             dtype,
         }
     }
+}
+
+fn fused_chain_quant_weight_source(fusion: &crate::fusion::ir::Fusion) -> Option<TensorId> {
+    use crate::fusion::ir::{ChainOperand, FusionAttrs};
+    let FusionAttrs::FusedChain { steps, .. } = &fusion.attrs else {
+        return None;
+    };
+    let step = steps.first()?;
+    if step.op_name != "QuantizedMatmul" || step.inputs.len() != 4 {
+        return None;
+    }
+    let ChainOperand::External { buffer_index } = step.inputs[1] else {
+        return None;
+    };
+    fusion.inputs.get(buffer_index as usize).map(|b| b.source)
+}
+
+fn fused_chain_swiglu_absorb_weight_sources(
+    fusion: &crate::fusion::ir::Fusion,
+) -> Option<(TensorId, TensorId)> {
+    use crate::fusion::ir::{ChainOperand, FusionAttrs};
+    let FusionAttrs::FusedChain { steps, .. } = &fusion.attrs else {
+        return None;
+    };
+    if steps.len() != 6
+        || fusion.outputs.len() != 1
+        || steps[0].op_name != "RMSNorm"
+        || steps[1].op_name != "QuantizedMatmul"
+        || steps[2].op_name != "QuantizedMatmul"
+        || steps[3].op_name != "Sigmoid"
+        || steps[4].op_name != "Multiply"
+        || steps[5].op_name != "Multiply"
+    {
+        return None;
+    }
+    let crate::graph::Attrs::Quantized {
+        bits: gate_bits,
+        group_size: gate_group,
+    } = steps[1].op_attrs
+    else {
+        return None;
+    };
+    let crate::graph::Attrs::Quantized {
+        bits: up_bits,
+        group_size: up_group,
+    } = steps[2].op_attrs
+    else {
+        return None;
+    };
+    if gate_bits != up_bits
+        || gate_group != up_group
+        || gate_group != 64
+        || !matches!(gate_bits, 4 | 8)
+    {
+        return None;
+    }
+    let out_dim = *steps[1].output_shape.last()? as u32;
+    let chip_rows = crate::target::current_chip().gemv_rows_per_simdgroup();
+    let rows_per_sg = if chip_rows > 1 && out_dim >= chip_rows && out_dim % chip_rows == 0 {
+        chip_rows
+    } else {
+        1
+    };
+    if rows_per_sg > 1 {
+        return None;
+    }
+    let ChainOperand::External {
+        buffer_index: gate_buf,
+    } = steps[1].inputs.get(1).copied()?
+    else {
+        return None;
+    };
+    let ChainOperand::External {
+        buffer_index: up_buf,
+    } = steps[2].inputs.get(1).copied()?
+    else {
+        return None;
+    };
+    let gate = fusion.inputs.get(gate_buf as usize)?.source;
+    let up = fusion.inputs.get(up_buf as usize)?.source;
+    Some((gate, up))
+}
+
+fn fused_chain_reduction_fanout_weight_sources(
+    fusion: &crate::fusion::ir::Fusion,
+) -> Option<Vec<TensorId>> {
+    use crate::fusion::category::{categorize_name, OpCategory};
+    use crate::fusion::ir::{ChainOperand, FusionAttrs};
+    let FusionAttrs::FusedChain { steps, .. } = &fusion.attrs else {
+        return None;
+    };
+    let head = steps.first()?;
+    if steps.len() < 3 || head.op_name != "RMSNorm" {
+        return None;
+    }
+    let head_shape = &head.output_shape;
+    let hidden = *head_shape.last()? as u32;
+    let active_rows = crate::target::current_chip()
+        .active_rows_before_last(head_shape)
+        .max(1) as u32;
+    let mut weights = Vec::new();
+    let mut best_rows = u32::MAX;
+    let mut out_dims = Vec::new();
+    for step in steps.iter().skip(1) {
+        if categorize_name(&step.op_name) != OpCategory::Heavy {
+            return None;
+        }
+        if step.op_name != "QuantizedMatmul" || !(step.inputs.len() == 4 || step.inputs.len() == 5)
+        {
+            return None;
+        }
+        match step.inputs.first() {
+            Some(ChainOperand::Register { step_index: 0 }) => {}
+            _ => return None,
+        }
+        let crate::graph::Attrs::Quantized { bits, group_size } = step.op_attrs else {
+            return None;
+        };
+        if group_size != 64 || !matches!(bits, 4 | 8) {
+            return None;
+        }
+        let out_dim = *step.output_shape.last()? as u32;
+        out_dims.push(out_dim);
+        if active_rows > 1 && crate::codegen::kernels::mtp_token_m_reduction_fanout_enabled() {
+            best_rows = best_rows.min(crate::target::current_chip().qgemm_m_rows_per_simdgroup(
+                active_rows,
+                bits,
+                hidden,
+                out_dim,
+            ));
+        }
+        let ChainOperand::External { buffer_index } = step.inputs.get(1).copied()? else {
+            return None;
+        };
+        weights.push(fusion.inputs.get(buffer_index as usize)?.source);
+    }
+    let chip_rows = crate::target::current_chip().gemv_rows_per_simdgroup();
+    let rows_per_sg = if chip_rows > 1
+        && out_dims
+            .iter()
+            .all(|&d| d >= chip_rows && d % chip_rows == 0)
+    {
+        chip_rows
+    } else {
+        1
+    };
+    let token_m = active_rows > 1
+        && crate::codegen::kernels::mtp_token_m_reduction_fanout_enabled()
+        && best_rows > 1;
+    if weights.len() < 2 || (!token_m && rows_per_sg > 1) {
+        return None;
+    }
+    Some(weights)
 }
 
 fn dtype_label(d: Dtype) -> &'static str {

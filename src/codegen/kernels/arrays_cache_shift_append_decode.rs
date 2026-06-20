@@ -36,7 +36,7 @@ pub fn emit(
         .inputs
         .first()
         .map(|b| crate::target::current_chip().active_tokens_for_shape(&b.shape))
-        .unwrap_or_else(|| crate::target::current_chip().active_m(8))
+        .unwrap_or_else(|| crate::target::current_chip().active_m_for_unshaped(8))
         .max(1)
         .min(state_len.max(1));
     w.line(format!(

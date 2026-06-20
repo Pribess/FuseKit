@@ -120,6 +120,8 @@ pub fn estimate_register_pressure(kind: &FusionKind, _meta: &ModelMeta) -> u32 {
         // the planner safe.
         FusionKind::FusedChain | FusionKind::QmvFanout => 32,
         FusionKind::QmvSwiglu => 40,
+        FusionKind::RoutedQmvSwiglu => 56,
+        FusionKind::RoutedQmvReduce => 40,
         // LayerBlock: dominated by SDPA piece + the QKV/down quant
         // GEMV inner loops. Use the SDPA bound (composer barriers
         // enforce serialization between pieces, so worst-case live set
@@ -156,6 +158,8 @@ pub fn estimate_smem_bytes(kind: &FusionKind, meta: &ModelMeta) -> usize {
         | FusionKind::AttnOutResidual
         | FusionKind::QmvFanout
         | FusionKind::QmvSwiglu
+        | FusionKind::RoutedQmvSwiglu
+        | FusionKind::RoutedQmvReduce
         | FusionKind::RopeQDecode
         | FusionKind::RopeKvCacheStoreDecode
         | FusionKind::KvCacheStoreDecode

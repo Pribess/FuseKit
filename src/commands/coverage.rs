@@ -317,7 +317,11 @@ fn node_fill(fusion: &Fusion, kernel: &str) -> &'static str {
     } else {
         match fusion.kind {
             FusionKind::Single(_) => "#fef3c7",
-            FusionKind::FusedChain | FusionKind::QmvFanout | FusionKind::QmvSwiglu => "#dcfce7",
+            FusionKind::FusedChain
+            | FusionKind::QmvFanout
+            | FusionKind::QmvSwiglu
+            | FusionKind::RoutedQmvSwiglu
+            | FusionKind::RoutedQmvReduce => "#dcfce7",
             _ => "#dbeafe",
         }
     }

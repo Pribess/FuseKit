@@ -94,6 +94,7 @@ pub fn emit(
 
         // ── Heavy ─────────────────────────────────────────────────
         "Matmul" => emit_matmul(fusion, meta, w),
+        "ScaledDotProductAttention" => emit_scaled_dot_product_attention_prefill(fusion, meta, w),
         "Softmax" => emit_softmax(fusion, &op_attrs, meta, w),
         "Arange" => emit_arange(fusion, &op_attrs, meta, w),
         "Full" => emit_full(fusion, meta, w),
@@ -147,6 +148,111 @@ pub fn function_name(fusion: &Fusion) -> String {
     format!("fusekit_op_{kind}_f{}", fusion.id)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SdpaPrefillPlan {
+    BlockNax,
+    FlashGqa,
+    Online,
+    OnlineVector,
+    Materialized,
+}
+
+pub fn sdpa_prefill_flash_tiling(meta: &ModelMeta) -> (u32, u32, u32, u32) {
+    let n_heads = meta.num_attention_heads.max(1);
+    let n_kv_heads = meta.num_key_value_heads.max(1);
+    let heads_per_kv = (n_heads / n_kv_heads).max(1);
+    let max_sgs = crate::target::current_chip()
+        .budgets()
+        .max_simdgroups_per_tg
+        .clamp(1, 8) as u32;
+    let q_heads_per_tg = heads_per_kv.min(4).min(max_sgs).max(1);
+    // Keep one query row per threadgroup by default. A row-blocked variant
+    // amortizes K/V tile loads across multiple rows, but profiling on M5
+    // showed the larger 256-thread TG increasing SDPA GPU time for long
+    // prefill because barrier/occupancy cost exceeded the saved loads.
+    let q_rows_per_tg = 1;
+    let q_head_blocks = heads_per_kv.div_ceil(q_heads_per_tg).max(1);
+    let flash_sgs = q_heads_per_tg.saturating_mul(q_rows_per_tg).max(1);
+    (q_heads_per_tg, q_rows_per_tg, q_head_blocks, flash_sgs)
+}
+
+fn sdpa_prefill_dims(fusion: &Fusion, meta: &ModelMeta) -> Option<(u32, u32, u32, u32, u32)> {
+    let out_shape = fusion
+        .outputs
+        .first()
+        .map(|b| b.shape.as_slice())
+        .unwrap_or(&[]);
+    if out_shape.len() < 4 {
+        return None;
+    }
+    let out_seq = out_shape[out_shape.len() - 2].max(1) as u32;
+    let active_m = crate::target::current_chip().active_m(out_seq).max(1);
+    let n_heads = meta.num_attention_heads.max(1);
+    let n_kv_heads = meta.num_key_value_heads.max(1);
+    let head_dim = meta.head_dim.max(1);
+    let heads_per_kv = (n_heads / n_kv_heads).max(1);
+    Some((active_m, n_heads, n_kv_heads, head_dim, heads_per_kv))
+}
+
+pub fn sdpa_prefill_plan(fusion: &Fusion, meta: &ModelMeta) -> SdpaPrefillPlan {
+    let Some((active_m, _n_heads, _n_kv_heads, head_dim, heads_per_kv)) =
+        sdpa_prefill_dims(fusion, meta)
+    else {
+        return SdpaPrefillPlan::Materialized;
+    };
+    let forced = std::env::var("FUSEKIT_SDPA_PREFILL_MODE")
+        .unwrap_or_else(|_| "auto".to_string())
+        .to_ascii_lowercase();
+    if forced == "materialized" || forced == "scores" || forced == "gemm" {
+        return SdpaPrefillPlan::Materialized;
+    }
+    if forced == "online" {
+        return SdpaPrefillPlan::Online;
+    }
+    if forced == "vector" || forced == "mlx-vector" {
+        return SdpaPrefillPlan::OnlineVector;
+    }
+    let can_block_nax = active_m >= 512
+        && matches!(head_dim, 64 | 128)
+        && std::env::var("FUSEKIT_DISABLE_SDPA_PREFILL_BLOCK_NAX").as_deref() != Ok("1");
+    if forced == "block" || forced == "blocknax" || forced == "nax" {
+        return if can_block_nax {
+            SdpaPrefillPlan::BlockNax
+        } else {
+            SdpaPrefillPlan::Materialized
+        };
+    }
+    let can_flash = active_m > 1
+        && head_dim <= 128
+        && heads_per_kv >= 2
+        && std::env::var("FUSEKIT_DISABLE_SDPA_PREFILL_FLASH").as_deref() != Ok("1");
+    if forced == "flash" {
+        return if can_flash {
+            SdpaPrefillPlan::FlashGqa
+        } else {
+            SdpaPrefillPlan::Online
+        };
+    }
+    if active_m > 1 && head_dim <= 128 {
+        if can_block_nax {
+            SdpaPrefillPlan::BlockNax
+        } else if can_flash && active_m <= 256 {
+            SdpaPrefillPlan::FlashGqa
+        } else if std::env::var("FUSEKIT_DISABLE_SDPA_PREFILL_ONLINE")
+            .ok()
+            .as_deref()
+            != Some("1")
+            && active_m < 512
+        {
+            SdpaPrefillPlan::Online
+        } else {
+            SdpaPrefillPlan::Materialized
+        }
+    } else {
+        SdpaPrefillPlan::Materialized
+    }
+}
+
 fn emit_custom_kernel(op_attrs: &crate::graph::Attrs, w: &mut MslWriter) -> Result<()> {
     let (name, source) = match op_attrs {
         crate::graph::Attrs::CustomKernel { name, source, .. } => (name.clone(), source.clone()),
@@ -158,7 +264,9 @@ fn emit_custom_kernel(op_attrs: &crate::graph::Attrs, w: &mut MslWriter) -> Resu
     // metal compile sees it the same as a hand-written kernel of
     // ours. Dedup is handled at the codegen level by `function_name`
     // returning `name`.
-    if name.contains("gated_delta_step") && crate::target::current_chip().active_m(8) > 1 {
+    if name.contains("gated_delta_step")
+        && crate::target::current_chip().active_m_for_unshaped(8) > 1
+    {
         w.line(add_gated_delta_mid_state_output(&source)?);
     } else {
         w.line(source);
@@ -583,6 +691,11 @@ fn emit_quantized_matmul(
     meta: &ModelMeta,
     w: &mut MslWriter,
 ) -> Result<()> {
+    if crate::codegen::kernels::qmm_prefill_nax_preferred(fusion)
+        && emit_quantized_matmul_nax(fusion, op_attrs, meta, w)?
+    {
+        return Ok(());
+    }
     if emit_quantized_matmul_mlx_qmmt(fusion, meta, w)? {
         return Ok(());
     }
@@ -648,9 +761,11 @@ fn emit_quantized_matmul_mlx_qmmt(
     } else {
         "false"
     };
+    let (bm, bk, bn) =
+        crate::codegen::kernels::qmm_mlx_qmmt_tile(k_dim, out_dim, active_rows, bits);
     w.line(format!(
-        "// Fusion #{}: Single(QuantizedMatmul MLX qmm_t) — MLX qmm_t-compatible",
-        fusion.id
+        "// Fusion #{}: Single(QuantizedMatmul MLX qmm_t M={} K={} N={} bits={} gs={} tile={}x{}x{}) — MLX qmm_t-compatible",
+        fusion.id, active_rows, k_dim, out_dim, bits, group_size, bm, bk, bn
     ));
     w.line(format!("kernel void {fn_name}("));
     w.push_indent();
@@ -671,10 +786,14 @@ fn emit_quantized_matmul_mlx_qmmt(
     w.writeln(format_args!("constexpr int K = {k_dim};"));
     w.writeln(format_args!("constexpr int N = {out_dim};"));
     w.writeln(format_args!("constexpr int M = {active_rows};"));
-    w.line(format!("threadgroup {t} Xs[32 * (32 + 16 / sizeof({t}))];"));
-    w.line(format!("threadgroup {t} Ws[32 * (32 + 16 / sizeof({t}))];"));
+    w.line(format!(
+        "threadgroup {t} Xs[{bm} * ({bk} + 16 / sizeof({t}))];"
+    ));
+    w.line(format!(
+        "threadgroup {t} Ws[{bk} * ({bn} + 16 / sizeof({t}))];"
+    ));
     w.writeln(format_args!(
-        "fusekit_qmm_t_impl<{t}, {group_size}, {bits}, {aligned_n}, 32, 32, 32>("
+        "fusekit_qmm_t_impl<{t}, {group_size}, {bits}, {aligned_n}, {bm}, {bk}, {bn}>("
     ));
     w.push_indent();
     w.line("in1, in2, in3, in0, out0, Xs, Ws, K, N, M, K, tgid, tid, simd_gid, simd_lid);");
@@ -984,9 +1103,9 @@ fn emit_quantized_matmul_nax(
     w.writeln(format_args!("constexpr int K = {k_dim};"));
     w.writeln(format_args!("constexpr int N = {out_dim};"));
     w.writeln(format_args!("constexpr int M = {active_rows};"));
-    w.line(format!("threadgroup {t} Ws[64 * (32 + 16 / sizeof({t}))];"));
+    w.line(format!("threadgroup {t} Ws[64 * (64 + 16 / sizeof({t}))];"));
     w.writeln(format_args!(
-        "fusekit_qmm_t_nax_tgp_impl<{t}, {group_size}, {bits}, {aligned_n}, 64, 32, 64, {wm}, {wn}>("
+        "fusekit_qmm_t_nax_tgp_impl<{t}, {group_size}, {bits}, {aligned_n}, 64, 64, 64, {wm}, {wn}>("
     ));
     w.push_indent();
     w.line("in1, in2, in3, in0, out0, Ws, K, N, M, tgid, tid, simd_gid, simd_lid);");
@@ -1000,6 +1119,624 @@ fn emit_quantized_matmul_nax(
     w.line("#endif");
     emit_close(w);
     Ok(true)
+}
+
+fn emit_scaled_dot_product_attention_prefill(
+    fusion: &Fusion,
+    meta: &ModelMeta,
+    w: &mut MslWriter,
+) -> Result<()> {
+    let scale = match &fusion.attrs {
+        FusionAttrs::Single {
+            op_attrs: crate::graph::Attrs::ScaledDotProductAttention { scale },
+            ..
+        } => *scale,
+        _ => (meta.head_dim as f32).powf(-0.5),
+    };
+    let out_shape = fusion
+        .outputs
+        .first()
+        .map(|b| b.shape.as_slice())
+        .unwrap_or(&[]);
+    if out_shape.len() < 4 {
+        return emit_todo_stub(fusion, meta, w, "ScaledDotProductAttention (rank)");
+    }
+    let out_seq = out_shape[out_shape.len() - 2].max(1) as u32;
+    let active_m = crate::target::current_chip().active_m(out_seq).max(1);
+    let n_heads = meta.num_attention_heads.max(1);
+    let n_kv_heads = meta.num_key_value_heads.max(1);
+    let head_dim = meta.head_dim.max(1);
+    let heads_per_kv = (n_heads / n_kv_heads).max(1);
+    let scale = if scale.abs() < f32::EPSILON {
+        1.0f32 / (head_dim as f32).sqrt()
+    } else {
+        scale
+    };
+    let fallback = crate::codegen::kernels::act_ty(meta);
+    let t = fusion
+        .outputs
+        .first()
+        .map(|b| msl_ty(b.dtype, fallback))
+        .unwrap_or(fallback);
+    let fn_name = function_name(fusion);
+    let plan = sdpa_prefill_plan(fusion, meta);
+    if matches!(plan, SdpaPrefillPlan::BlockNax) {
+        w.line(format!(
+            "// Fusion #{}: Single(ScaledDotProductAttention block-NAX prefill, active_m={}, n_heads={}, n_kv={}, heads_per_kv={}, head_dim={}, scale={})",
+            fusion.id, active_m, n_heads, n_kv_heads, heads_per_kv, head_dim, scale
+        ));
+        w.line(format!("kernel void {fn_name}("));
+        w.push_indent();
+        w.line(format!("device const {t} *Q        [[buffer(0)]],"));
+        w.line(format!("device const {t} *K        [[buffer(1)]],"));
+        w.line(format!("device const {t} *V        [[buffer(2)]],"));
+        w.line("constant uint       &kv_len   [[buffer(3)]],");
+        w.line("constant uint       &capacity [[buffer(4)]],");
+        w.line(format!("device {t}       *out      [[buffer(5)]],"));
+        w.line("uint tid       [[thread_position_in_threadgroup]],");
+        w.line("uint tg_size   [[threads_per_threadgroup]],");
+        w.line("uint gid       [[threadgroup_position_in_grid]]");
+        w.pop_indent();
+        w.line(") {");
+        w.push_indent();
+        w.line("(void)tg_size;");
+        w.line("uint simd_lane = tid & 31u;");
+        w.line("uint simd_id = tid >> 5u;");
+        w.line("#if FUSEKIT_HAVE_MLX_NAX");
+        w.push_indent();
+        w.writeln(format_args!(
+            "fusekit_sdpa_prefill_nax_impl<{t}, {active_m}, {n_heads}, {n_kv_heads}, {head_dim}, {heads_per_kv}, 32, 32, 1, 2>(Q, K, V, kv_len, capacity, out, gid, simd_id, simd_lane, {scale:e}f);"
+        ));
+        w.pop_indent();
+        w.line("#else");
+        w.push_indent();
+        w.line("(void)Q; (void)K; (void)V; (void)kv_len; (void)capacity; (void)out; (void)gid; (void)simd_id; (void)simd_lane;");
+        w.pop_indent();
+        w.line("#endif");
+        emit_close(w);
+        return Ok(());
+    }
+    if matches!(plan, SdpaPrefillPlan::FlashGqa) {
+        let d_per_lane = ((head_dim as u32).saturating_add(31) / 32).max(1);
+        let kv_tile = if head_dim <= 64 { 32u32 } else { 16u32 };
+        let (q_heads_per_tg, q_rows_per_tg, q_head_blocks, flash_sgs) =
+            sdpa_prefill_flash_tiling(meta);
+        w.line(format!(
+            "// Fusion #{}: Single(ScaledDotProductAttention GQA tiled flash prefill, active_m={}, n_heads={}, n_kv={}, heads_per_kv={}, q_rows_per_tg={}, q_heads_per_tg={}, head_dim={}, kv_tile={}, scale={})",
+            fusion.id, active_m, n_heads, n_kv_heads, heads_per_kv, q_rows_per_tg, q_heads_per_tg, head_dim, kv_tile, scale
+        ));
+        w.line(format!("kernel void {fn_name}("));
+        w.push_indent();
+        w.line(format!("device const {t} *Q        [[buffer(0)]],"));
+        w.line(format!("device const {t} *K        [[buffer(1)]],"));
+        w.line(format!("device const {t} *V        [[buffer(2)]],"));
+        w.line("constant uint       &kv_len   [[buffer(3)]],");
+        w.line("constant uint       &capacity [[buffer(4)]],");
+        w.line(format!("device {t}       *out      [[buffer(5)]],"));
+        w.line("uint tid       [[thread_position_in_threadgroup]],");
+        w.line("uint tg_size   [[threads_per_threadgroup]],");
+        w.line("uint gid       [[threadgroup_position_in_grid]]");
+        w.pop_indent();
+        w.line(") {");
+        w.push_indent();
+        w.writeln(format_args!("constexpr uint OUT_SEQ        = {active_m}u;"));
+        w.writeln(format_args!("constexpr uint N_HEADS        = {n_heads}u;"));
+        w.writeln(format_args!(
+            "constexpr uint N_KV_HEADS     = {n_kv_heads}u;"
+        ));
+        w.writeln(format_args!("constexpr uint HEAD_DIM       = {head_dim}u;"));
+        w.writeln(format_args!(
+            "constexpr uint HEADS_PER_KV   = {heads_per_kv}u;"
+        ));
+        w.writeln(format_args!(
+            "constexpr uint Q_HEADS_PER_TG = {q_heads_per_tg}u;"
+        ));
+        w.writeln(format_args!(
+            "constexpr uint Q_HEAD_BLOCKS  = {q_head_blocks}u;"
+        ));
+        w.writeln(format_args!(
+            "constexpr uint Q_ROWS_PER_TG = {q_rows_per_tg}u;"
+        ));
+        w.writeln(format_args!("constexpr uint FLASH_SGS     = {flash_sgs}u;"));
+        w.writeln(format_args!(
+            "constexpr uint D_PER_LANE     = {d_per_lane}u;"
+        ));
+        w.writeln(format_args!("constexpr uint KV_TILE        = {kv_tile}u;"));
+        w.writeln(format_args!("constexpr float SCALE         = {scale:e}f;"));
+        w.line("constexpr uint MAX_KV_LEN     = 4096u;");
+        w.line("threadgroup float k_tile[KV_TILE * HEAD_DIM];");
+        w.line("threadgroup float v_tile[KV_TILE * HEAD_DIM];");
+        w.line("uint simd_lane = tid & 31u;");
+        w.line("uint simd_id = tid >> 5u;");
+        w.line("uint row_block = gid / (N_KV_HEADS * Q_HEAD_BLOCKS);");
+        w.line("uint rem = gid - row_block * (N_KV_HEADS * Q_HEAD_BLOCKS);");
+        w.line("uint kv_head = rem / Q_HEAD_BLOCKS;");
+        w.line("uint q_head_block = rem - kv_head * Q_HEAD_BLOCKS;");
+        w.line("uint local_q_row = simd_id / Q_HEADS_PER_TG;");
+        w.line("uint local_q_slot = simd_id - local_q_row * Q_HEADS_PER_TG;");
+        w.line("uint row = row_block * Q_ROWS_PER_TG + local_q_row;");
+        w.line("uint local_q_head = q_head_block * Q_HEADS_PER_TG + local_q_slot;");
+        w.line("uint head_id = kv_head * HEADS_PER_KV + local_q_head;");
+        w.line("bool active = simd_id < FLASH_SGS && row < OUT_SEQ && local_q_row < Q_ROWS_PER_TG && local_q_head < HEADS_PER_KV && head_id < N_HEADS;");
+        w.line("uint kv_len_eff = min(kv_len + row, MAX_KV_LEN);");
+        w.line("uint block_last_row = min(row_block * Q_ROWS_PER_TG + Q_ROWS_PER_TG - 1u, OUT_SEQ - 1u);");
+        w.line("uint kv_len_block = min(kv_len + block_last_row, MAX_KV_LEN);");
+        w.line("float q_vals[4];");
+        w.line("float acc[4];");
+        w.line("uint dims[4];");
+        w.line("for (uint i = 0u; i < 4u; ++i) {");
+        w.push_indent();
+        w.line("dims[i] = simd_lane + i * 32u;");
+        w.line("float qv = 0.0f;");
+        w.line("if (active && i < D_PER_LANE && dims[i] < HEAD_DIM) {");
+        w.push_indent();
+        w.line(format!(
+            "qv = float(Q[(row * N_HEADS + head_id) * HEAD_DIM + dims[i]]);"
+        ));
+        w.pop_indent();
+        w.line("}");
+        w.line("q_vals[i] = qv;");
+        w.line("acc[i] = 0.0f;");
+        w.pop_indent();
+        w.line("}");
+        w.line("float m = -INFINITY;");
+        w.line("float l = 0.0f;");
+        w.line("for (uint tile_start = 0u; tile_start < kv_len_block; tile_start += KV_TILE) {");
+        w.push_indent();
+        w.line("uint tile_count = min(KV_TILE, kv_len_block - tile_start);");
+        w.line("uint tile_elems = tile_count * HEAD_DIM;");
+        w.line("for (uint idx = tid; idx < tile_elems; idx += tg_size) {");
+        w.push_indent();
+        w.line("uint kv_local = idx / HEAD_DIM;");
+        w.line("uint d = idx - kv_local * HEAD_DIM;");
+        w.line("uint kv = tile_start + kv_local;");
+        w.line(format!(
+            "device const {t}* k_row = K + (kv_head * capacity + kv) * HEAD_DIM;"
+        ));
+        w.line(format!(
+            "device const {t}* v_row = V + (kv_head * capacity + kv) * HEAD_DIM;"
+        ));
+        w.line("k_tile[idx] = float(k_row[d]);");
+        w.line("v_tile[idx] = float(v_row[d]);");
+        w.pop_indent();
+        w.line("}");
+        w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
+        w.line("if (active) {");
+        w.push_indent();
+        w.line("for (uint kk = 0u; kk < tile_count; ++kk) {");
+        w.push_indent();
+        w.line("uint kv_cur = tile_start + kk;");
+        w.line("if (kv_cur >= kv_len_eff) continue;");
+        w.line("float dot_part = 0.0f;");
+        w.line("for (uint i = 0u; i < 4u; ++i) {");
+        w.push_indent();
+        w.line("if (i < D_PER_LANE && dims[i] < HEAD_DIM) {");
+        w.push_indent();
+        w.line("dot_part += q_vals[i] * k_tile[kk * HEAD_DIM + dims[i]];");
+        w.pop_indent();
+        w.line("}");
+        w.pop_indent();
+        w.line("}");
+        w.line("float score = simd_sum(dot_part) * SCALE;");
+        w.line("float alpha_src = 0.0f;");
+        w.line("float beta_src = 0.0f;");
+        w.line("float new_m_src = m;");
+        w.line("if (simd_lane == 0u) {");
+        w.push_indent();
+        w.line("new_m_src = max(m, score);");
+        w.line("alpha_src = exp(m - new_m_src);");
+        w.line("beta_src = exp(score - new_m_src);");
+        w.pop_indent();
+        w.line("}");
+        w.line("float alpha = simd_broadcast(alpha_src, 0u);");
+        w.line("float beta = simd_broadcast(beta_src, 0u);");
+        w.line("m = simd_broadcast(new_m_src, 0u);");
+        w.line("for (uint i = 0u; i < 4u; ++i) {");
+        w.push_indent();
+        w.line("if (i < D_PER_LANE && dims[i] < HEAD_DIM) {");
+        w.push_indent();
+        w.line("acc[i] = acc[i] * alpha + beta * v_tile[kk * HEAD_DIM + dims[i]];");
+        w.pop_indent();
+        w.line("}");
+        w.pop_indent();
+        w.line("}");
+        w.line("l = l * alpha + beta;");
+        w.pop_indent();
+        w.line("}");
+        w.pop_indent();
+        w.line("}");
+        w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
+        w.pop_indent();
+        w.line("}");
+        w.line("if (active) {");
+        w.push_indent();
+        w.line("float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;");
+        w.line("for (uint i = 0u; i < 4u; ++i) {");
+        w.push_indent();
+        w.line("if (i < D_PER_LANE && dims[i] < HEAD_DIM) {");
+        w.push_indent();
+        w.line(format!(
+            "out[(head_id * OUT_SEQ + row) * HEAD_DIM + dims[i]] = {t}(acc[i] * inv_l);"
+        ));
+        w.pop_indent();
+        w.line("}");
+        w.pop_indent();
+        w.line("}");
+        w.pop_indent();
+        w.line("}");
+        emit_close(w);
+        return Ok(());
+    }
+    if matches!(plan, SdpaPrefillPlan::OnlineVector) && head_dim <= 128 {
+        let d_per_lane = ((head_dim as u32).saturating_add(31) / 32).max(1);
+        w.line(format!(
+            "// Fusion #{}: Single(ScaledDotProductAttention online prefill, active_m={}, n_heads={}, n_kv={}, head_dim={}, scale={})",
+            fusion.id, active_m, n_heads, n_kv_heads, head_dim, scale
+        ));
+        w.line(format!("kernel void {fn_name}("));
+        w.push_indent();
+        w.line(format!("device const {t} *Q        [[buffer(0)]],"));
+        w.line(format!("device const {t} *K        [[buffer(1)]],"));
+        w.line(format!("device const {t} *V        [[buffer(2)]],"));
+        w.line("constant uint       &kv_len   [[buffer(3)]],");
+        w.line("constant uint       &capacity [[buffer(4)]],");
+        w.line(format!("device {t}       *out      [[buffer(5)]],"));
+        w.line("uint tid       [[thread_position_in_threadgroup]],");
+        w.line("uint tg_size   [[threads_per_threadgroup]],");
+        w.line("uint gid       [[threadgroup_position_in_grid]]");
+        w.pop_indent();
+        w.line(") {");
+        w.push_indent();
+        w.writeln(format_args!("constexpr uint OUT_SEQ      = {active_m}u;"));
+        w.writeln(format_args!("constexpr uint N_HEADS      = {n_heads}u;"));
+        w.writeln(format_args!("constexpr uint N_KV_HEADS   = {n_kv_heads}u;"));
+        w.writeln(format_args!("constexpr uint HEAD_DIM     = {head_dim}u;"));
+        w.writeln(format_args!(
+            "constexpr uint HEADS_PER_KV = {heads_per_kv}u;"
+        ));
+        w.writeln(format_args!("constexpr uint D_PER_LANE   = {d_per_lane}u;"));
+        w.writeln(format_args!("constexpr float SCALE       = {scale:e}f;"));
+        w.line("constexpr uint MAX_KV_LEN   = 4096u;");
+        w.line("constexpr uint SDPA_SGS     = 32u;");
+        w.line("constexpr uint SDPA_BD      = 32u;");
+        w.line("threadgroup float partial_out[SDPA_SGS * SDPA_BD];");
+        w.line("threadgroup float partial_max[SDPA_SGS];");
+        w.line("threadgroup float partial_sum[SDPA_SGS];");
+        w.line("uint simd_lane = tid & 31u;");
+        w.line("uint simd_id = tid >> 5u;");
+        w.line("if (simd_id >= SDPA_SGS) return;");
+        w.line("uint query_head = gid;");
+        w.line("uint query_row = query_head / N_HEADS;");
+        w.line("uint head_id = query_head - query_row * N_HEADS;");
+        w.line("if (query_row >= OUT_SEQ) return;");
+        w.line("uint kv_head = head_id / HEADS_PER_KV;");
+        w.line("uint kv_len_eff = min(kv_len + query_row, MAX_KV_LEN);");
+        w.line(format!(
+            "device const {t}* q_row = Q + (query_row * N_HEADS + head_id) * HEAD_DIM;"
+        ));
+        w.line("float q_vals[4];");
+        w.line("float acc[4];");
+        w.line("uint dims[4];");
+        w.line("for (uint i = 0u; i < 4u; ++i) {");
+        w.push_indent();
+        w.line("dims[i] = simd_lane * D_PER_LANE + i;");
+        w.line(
+            "q_vals[i] = (i < D_PER_LANE && dims[i] < HEAD_DIM) ? float(q_row[dims[i]]) : 0.0f;",
+        );
+        w.line("acc[i] = 0.0f;");
+        w.pop_indent();
+        w.line("}");
+        w.line("float m = -INFINITY;");
+        w.line("float l = 0.0f;");
+        w.line("for (uint kv = simd_id; kv < kv_len_eff; kv += SDPA_SGS) {");
+        w.push_indent();
+        w.line(format!(
+            "device const {t}* k_row = K + (kv_head * capacity + kv) * HEAD_DIM;"
+        ));
+        w.line(format!(
+            "device const {t}* v_row = V + (kv_head * capacity + kv) * HEAD_DIM;"
+        ));
+        w.line("float dot_part = 0.0f;");
+        w.line("for (uint i = 0u; i < 4u; ++i) {");
+        w.push_indent();
+        w.line("if (i < D_PER_LANE && dims[i] < HEAD_DIM) {");
+        w.push_indent();
+        w.line("dot_part += q_vals[i] * float(k_row[dims[i]]);");
+        w.pop_indent();
+        w.line("}");
+        w.pop_indent();
+        w.line("}");
+        w.line("float score = simd_sum(dot_part) * SCALE;");
+        w.line("float new_m = max(m, score);");
+        w.line("float alpha = fast::exp(m - new_m);");
+        w.line("float beta = fast::exp(score - new_m);");
+        w.line("m = new_m;");
+        w.line("for (uint i = 0u; i < 4u; ++i) {");
+        w.push_indent();
+        w.line("if (i < D_PER_LANE && dims[i] < HEAD_DIM) {");
+        w.push_indent();
+        w.line("acc[i] = acc[i] * alpha + beta * float(v_row[dims[i]]);");
+        w.pop_indent();
+        w.line("}");
+        w.pop_indent();
+        w.line("}");
+        w.line("l = l * alpha + beta;");
+        w.pop_indent();
+        w.line("}");
+        w.line("if (simd_lane == 0u) {");
+        w.push_indent();
+        w.line("partial_max[simd_id] = m;");
+        w.line("partial_sum[simd_id] = l;");
+        w.pop_indent();
+        w.line("}");
+        w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
+        w.line("float lane_m = partial_max[simd_lane];");
+        w.line("float global_m = simd_max(lane_m);");
+        w.line("float merge_factor = (lane_m == -INFINITY || global_m == -INFINITY) ? 0.0f : fast::exp(lane_m - global_m);");
+        w.line("float total_l = simd_sum(partial_sum[simd_lane] * merge_factor);");
+        w.line("for (uint i = 0u; i < 4u; ++i) {");
+        w.push_indent();
+        w.line("if (i < D_PER_LANE) {");
+        w.push_indent();
+        w.line(
+            "partial_out[simd_lane * SDPA_BD + simd_id] = (dims[i] < HEAD_DIM) ? acc[i] : 0.0f;",
+        );
+        w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
+        w.line(
+            "float merged = simd_sum(partial_out[simd_id * SDPA_BD + simd_lane] * merge_factor);",
+        );
+        w.line("float normed = (total_l > 0.0f) ? (merged / total_l) : 0.0f;");
+        w.line("if (simd_lane == 0u) {");
+        w.push_indent();
+        w.line("uint out_d = simd_id * D_PER_LANE + i;");
+        w.line("if (out_d < HEAD_DIM) {");
+        w.push_indent();
+        w.line(format!(
+            "out[(head_id * OUT_SEQ + query_row) * HEAD_DIM + out_d] = {t}(normed);"
+        ));
+        w.pop_indent();
+        w.line("}");
+        w.pop_indent();
+        w.line("}");
+        w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
+        w.pop_indent();
+        w.line("}");
+        w.pop_indent();
+        w.line("}");
+        emit_close(w);
+        return Ok(());
+    }
+    if matches!(plan, SdpaPrefillPlan::Online) && head_dim <= 128 {
+        let d_per_lane = ((head_dim as u32).saturating_add(31) / 32).max(1);
+        w.line(format!(
+            "// Fusion #{}: Single(ScaledDotProductAttention online prefill, active_m={}, n_heads={}, n_kv={}, head_dim={}, scale={})",
+            fusion.id, active_m, n_heads, n_kv_heads, head_dim, scale
+        ));
+        w.line(format!("kernel void {fn_name}("));
+        w.push_indent();
+        w.line(format!("device const {t} *Q        [[buffer(0)]],"));
+        w.line(format!("device const {t} *K        [[buffer(1)]],"));
+        w.line(format!("device const {t} *V        [[buffer(2)]],"));
+        w.line("constant uint       &kv_len   [[buffer(3)]],");
+        w.line("constant uint       &capacity [[buffer(4)]],");
+        w.line(format!("device {t}       *out      [[buffer(5)]],"));
+        w.line("uint tid       [[thread_position_in_threadgroup]],");
+        w.line("uint tg_size   [[threads_per_threadgroup]],");
+        w.line("uint gid       [[threadgroup_position_in_grid]]");
+        w.pop_indent();
+        w.line(") {");
+        w.push_indent();
+        w.writeln(format_args!("constexpr uint OUT_SEQ      = {active_m}u;"));
+        w.writeln(format_args!("constexpr uint N_HEADS      = {n_heads}u;"));
+        w.writeln(format_args!("constexpr uint N_KV_HEADS   = {n_kv_heads}u;"));
+        w.writeln(format_args!("constexpr uint HEAD_DIM     = {head_dim}u;"));
+        w.writeln(format_args!(
+            "constexpr uint HEADS_PER_KV = {heads_per_kv}u;"
+        ));
+        w.writeln(format_args!("constexpr uint D_PER_LANE   = {d_per_lane}u;"));
+        w.writeln(format_args!("constexpr float SCALE       = {scale:e}f;"));
+        w.line("constexpr uint MAX_KV_LEN   = 4096u;");
+        w.line("uint simd_lane = tid & 31u;");
+        w.line("uint simd_id = tid >> 5u;");
+        w.line("if (simd_id != 0u) return;");
+        w.line("uint query_head = gid;");
+        w.line("uint query_row = query_head / N_HEADS;");
+        w.line("uint head_id = query_head - query_row * N_HEADS;");
+        w.line("if (query_row >= OUT_SEQ) return;");
+        w.line("uint kv_head = head_id / HEADS_PER_KV;");
+        w.line("uint kv_len_eff = min(kv_len + query_row, MAX_KV_LEN);");
+        w.line(format!(
+            "device const {t}* q_row = Q + (query_row * N_HEADS + head_id) * HEAD_DIM;"
+        ));
+        w.line("float q_vals[4];");
+        w.line("float acc[4];");
+        w.line("uint dims[4];");
+        w.line("for (uint i = 0u; i < 4u; ++i) {");
+        w.push_indent();
+        w.line("dims[i] = simd_lane + i * 32u;");
+        w.line(
+            "q_vals[i] = (i < D_PER_LANE && dims[i] < HEAD_DIM) ? float(q_row[dims[i]]) : 0.0f;",
+        );
+        w.line("acc[i] = 0.0f;");
+        w.pop_indent();
+        w.line("}");
+        w.line("float m = -INFINITY;");
+        w.line("float l = 0.0f;");
+        w.line("for (uint kv = 0u; kv < kv_len_eff; ++kv) {");
+        w.push_indent();
+        w.line(format!(
+            "device const {t}* k_row = K + (kv_head * capacity + kv) * HEAD_DIM;"
+        ));
+        w.line(format!(
+            "device const {t}* v_row = V + (kv_head * capacity + kv) * HEAD_DIM;"
+        ));
+        w.line("float dot_part = 0.0f;");
+        w.line("for (uint i = 0u; i < 4u; ++i) {");
+        w.push_indent();
+        w.line("if (i < D_PER_LANE && dims[i] < HEAD_DIM) {");
+        w.push_indent();
+        w.line("dot_part += q_vals[i] * float(k_row[dims[i]]);");
+        w.pop_indent();
+        w.line("}");
+        w.pop_indent();
+        w.line("}");
+        w.line("float score = simd_sum(dot_part) * SCALE;");
+        w.line("float alpha_src = 0.0f;");
+        w.line("float beta_src = 0.0f;");
+        w.line("float new_m_src = m;");
+        w.line("if (simd_lane == 0u) {");
+        w.push_indent();
+        w.line("new_m_src = max(m, score);");
+        w.line("alpha_src = exp(m - new_m_src);");
+        w.line("beta_src = exp(score - new_m_src);");
+        w.pop_indent();
+        w.line("}");
+        w.line("float alpha = simd_broadcast(alpha_src, 0u);");
+        w.line("float beta = simd_broadcast(beta_src, 0u);");
+        w.line("m = simd_broadcast(new_m_src, 0u);");
+        w.line("for (uint i = 0u; i < 4u; ++i) {");
+        w.push_indent();
+        w.line("if (i < D_PER_LANE && dims[i] < HEAD_DIM) {");
+        w.push_indent();
+        w.line("acc[i] = acc[i] * alpha + beta * float(v_row[dims[i]]);");
+        w.pop_indent();
+        w.line("}");
+        w.pop_indent();
+        w.line("}");
+        w.line("l = l * alpha + beta;");
+        w.pop_indent();
+        w.line("}");
+        w.line("float inv_l = (l > 0.0f) ? (1.0f / l) : 0.0f;");
+        w.line("for (uint i = 0u; i < 4u; ++i) {");
+        w.push_indent();
+        w.line("if (i < D_PER_LANE && dims[i] < HEAD_DIM) {");
+        w.push_indent();
+        w.line(format!(
+            "out[(head_id * OUT_SEQ + query_row) * HEAD_DIM + dims[i]] = {t}(acc[i] * inv_l);"
+        ));
+        w.pop_indent();
+        w.line("}");
+        w.pop_indent();
+        w.line("}");
+        emit_close(w);
+        return Ok(());
+    }
+    w.line(format!(
+        "// Fusion #{}: Single(ScaledDotProductAttention materialized-score prefill, active_m={}, n_heads={}, n_kv={}, head_dim={}, scale={})",
+        fusion.id, active_m, n_heads, n_kv_heads, head_dim, scale
+    ));
+    w.line(format!("kernel void {fn_name}("));
+    w.push_indent();
+    w.line(format!("device const {t} *Q        [[buffer(0)]],"));
+    w.line(format!("device const {t} *K        [[buffer(1)]],"));
+    w.line(format!("device const {t} *V        [[buffer(2)]],"));
+    w.line("constant uint       &kv_len   [[buffer(3)]],");
+    w.line("constant uint       &capacity [[buffer(4)]],");
+    w.line(format!("device {t}       *out      [[buffer(5)]],"));
+    w.line("uint tid       [[thread_position_in_threadgroup]],");
+    w.line("uint tg_size   [[threads_per_threadgroup]],");
+    w.line("uint gid       [[threadgroup_position_in_grid]]");
+    w.pop_indent();
+    w.line(") {");
+    w.push_indent();
+    w.writeln(format_args!("constexpr uint OUT_SEQ      = {active_m}u;"));
+    w.writeln(format_args!("constexpr uint N_HEADS      = {n_heads}u;"));
+    w.writeln(format_args!("constexpr uint N_KV_HEADS   = {n_kv_heads}u;"));
+    w.writeln(format_args!("constexpr uint HEAD_DIM     = {head_dim}u;"));
+    w.writeln(format_args!(
+        "constexpr uint HEADS_PER_KV = {heads_per_kv}u;"
+    ));
+    w.writeln(format_args!("constexpr float SCALE       = {scale:e}f;"));
+    w.line("constexpr uint MAX_KV_LEN   = 4096u;");
+    w.line("uint query_head = gid;");
+    w.line("uint query_row = query_head / N_HEADS;");
+    w.line("uint head_id = query_head - query_row * N_HEADS;");
+    w.line("if (query_row >= OUT_SEQ) return;");
+    w.line("uint kv_head = head_id / HEADS_PER_KV;");
+    w.line("uint kv_len_eff = kv_len + query_row;");
+    w.line("kv_len_eff = min(kv_len_eff, MAX_KV_LEN);");
+    w.line("threadgroup float scores[4096];");
+    w.line("threadgroup float reduce_buf[32];");
+    w.line("uint simd_lane = tid % 32u;");
+    w.line("uint simd_id = tid / 32u;");
+    w.blank();
+    w.line("// Stage 1: scores[kv] = Q[row, head] dot K[kv_head, kv].");
+    w.line("for (uint kv = tid; kv < kv_len_eff; kv += tg_size) {");
+    w.push_indent();
+    w.line(format!(
+        "device const {t}* q_row = Q + (query_row * N_HEADS + head_id) * HEAD_DIM;"
+    ));
+    w.line(format!(
+        "device const {t}* k_row = K + (kv_head * capacity + kv) * HEAD_DIM;"
+    ));
+    w.line("float dot = 0.0f;");
+    w.line("for (uint d = 0u; d < HEAD_DIM; ++d) {");
+    w.push_indent();
+    w.line("dot += float(q_row[d]) * float(k_row[d]);");
+    w.pop_indent();
+    w.line("}");
+    w.line("scores[kv] = dot * SCALE;");
+    w.pop_indent();
+    w.line("}");
+    w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
+    w.blank();
+    w.line("float t_max = -INFINITY;");
+    w.line("for (uint kv = tid; kv < kv_len_eff; kv += tg_size) {");
+    w.push_indent();
+    w.line("t_max = max(t_max, scores[kv]);");
+    w.pop_indent();
+    w.line("}");
+    w.line("t_max = simd_max(t_max);");
+    w.line("if (simd_lane == 0u) reduce_buf[simd_id] = t_max;");
+    w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
+    w.line("if (simd_id == 0u) {");
+    w.push_indent();
+    w.line("float v = (tid < tg_size / 32u) ? reduce_buf[tid] : -INFINITY;");
+    w.line("v = simd_max(v);");
+    w.line("if (simd_lane == 0u) reduce_buf[0] = v;");
+    w.pop_indent();
+    w.line("}");
+    w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
+    w.line("float global_max = reduce_buf[0];");
+    w.line("float t_sum = 0.0f;");
+    w.line("for (uint kv = tid; kv < kv_len_eff; kv += tg_size) {");
+    w.push_indent();
+    w.line("scores[kv] = exp(scores[kv] - global_max);");
+    w.line("t_sum += scores[kv];");
+    w.pop_indent();
+    w.line("}");
+    w.line("t_sum = simd_sum(t_sum);");
+    w.line("if (simd_lane == 0u) reduce_buf[simd_id] = t_sum;");
+    w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
+    w.line("if (simd_id == 0u) {");
+    w.push_indent();
+    w.line("float v = (tid < tg_size / 32u) ? reduce_buf[tid] : 0.0f;");
+    w.line("v = simd_sum(v);");
+    w.line("if (simd_lane == 0u) reduce_buf[0] = v;");
+    w.pop_indent();
+    w.line("}");
+    w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
+    w.line("float inv_sum = 1.0f / reduce_buf[0];");
+    w.blank();
+    w.line("// Output layout matches mlx SDPA: [B, H, M, D].");
+    w.line("for (uint d = tid; d < HEAD_DIM; d += tg_size) {");
+    w.push_indent();
+    w.line("float acc = 0.0f;");
+    w.line("for (uint kv = 0u; kv < kv_len_eff; ++kv) {");
+    w.push_indent();
+    w.line(format!(
+        "device const {t}* v_row = V + (kv_head * capacity + kv) * HEAD_DIM;"
+    ));
+    w.line("acc += (scores[kv] * inv_sum) * float(v_row[d]);");
+    w.pop_indent();
+    w.line("}");
+    w.line(format!(
+        "out[(head_id * OUT_SEQ + query_row) * HEAD_DIM + d] = {t}(acc);"
+    ));
+    w.pop_indent();
+    w.line("}");
+    emit_close(w);
+    Ok(())
 }
 
 fn emit_softmax(

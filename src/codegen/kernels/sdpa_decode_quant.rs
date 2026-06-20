@@ -100,7 +100,7 @@ pub fn emit(
         .get(0..)
         .filter(|s| !s.is_empty())
         .map(|s| crate::target::current_chip().active_tokens_for_shape(s))
-        .unwrap_or_else(|| crate::target::current_chip().active_m(8))
+        .unwrap_or_else(|| crate::target::current_chip().active_m_for_unshaped(8))
         .max(1);
     let q_head_major = inputless_semantic_decode
         || direct_scaled_q
@@ -111,7 +111,9 @@ pub fn emit(
         1
     };
     let out_seq = active_m;
-    let flash_decoding = super::sdpa_decode::flash_decoding_enabled();
+    let flash_decoding = super::sdpa_decode::flash_decoding_enabled_for(
+        n_heads, n_kv_heads, qk_dim, v_dim, active_m,
+    );
     let layer_idx = fusion
         .layer_hint
         .and_then(|t| match t {
@@ -629,7 +631,9 @@ fn emit_flash_decoding(w: &mut MslWriter, t: &str, bits: u32) {
     w.push_indent();
     w.line("uint d_base = tid * EL_PER_INT;");
     for i in 0..lanes {
-        w.writeln(format_args!("partials[partial_base + 2u + d_base + {i}u] = o{i};"));
+        w.writeln(format_args!(
+            "partials[partial_base + 2u + d_base + {i}u] = o{i};"
+        ));
     }
     w.pop_indent();
     w.line("}");
@@ -640,7 +644,9 @@ fn emit_flash_decoding(w: &mut MslWriter, t: &str, bits: u32) {
     w.line("if (tid == 0u) {");
     w.push_indent();
     w.line("uint counter_idx = LAYER_IDX * COUNTER_STRIDE_PER_LAYER + query_head_flat;");
-    w.line("uint prev = atomic_fetch_add_explicit(&counter[counter_idx], 1u, memory_order_relaxed);");
+    w.line(
+        "uint prev = atomic_fetch_add_explicit(&counter[counter_idx], 1u, memory_order_relaxed);",
+    );
     w.line("prev_count_smem[0] = prev;");
     w.pop_indent();
     w.line("}");
@@ -683,14 +689,18 @@ fn emit_flash_decoding(w: &mut MslWriter, t: &str, bits: u32) {
     }
     w.line("final_l = final_l * alpha_c + l_c * beta_c;");
     for i in 0..lanes {
-        w.writeln(format_args!("final_o{i} = final_o{i} * alpha_c + o_c{i} * beta_c;"));
+        w.writeln(format_args!(
+            "final_o{i} = final_o{i} * alpha_c + o_c{i} * beta_c;"
+        ));
     }
     w.line("final_m = m_new;");
     w.pop_indent();
     w.line("}");
     w.line("uint out_base = (query_row * N_HEADS + head_id_real) * V_DIM + d_base;");
     for i in 0..lanes {
-        w.writeln(format_args!("out[out_base + {i}u] = {t}(final_o{i} / final_l);"));
+        w.writeln(format_args!(
+            "out[out_base + {i}u] = {t}(final_o{i} / final_l);"
+        ));
     }
     w.pop_indent();
     w.line("}");

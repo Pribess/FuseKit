@@ -71,7 +71,9 @@ pub fn emit(
     w.push_indent();
     w.line("uint k = tg_argmax[row_base + i * 2u + 0u];");
     w.line("uint v = tg_argmax[row_base + i * 2u + 1u];");
-    w.line("if (k > local_key) { local_key = k; local_idx = v; }");
+    w.line(
+        "if (k > local_key || (k == local_key && v < local_idx)) { local_key = k; local_idx = v; }",
+    );
     w.pop_indent();
     w.line("}");
     w.blank();

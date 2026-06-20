@@ -26,11 +26,22 @@ use crate::paths;
 /// `RawRecord` shape the JSON path produced so [`lower`] doesn't have
 /// to know which capture method ran.
 pub fn capture(model_dir: &Path) -> Result<RawGraph> {
+    capture_with_seq(model_dir, 8)
+}
+
+pub fn capture_with_seq(model_dir: &Path, seq_len: u32) -> Result<RawGraph> {
     use pyo3::prelude::*;
     use pyo3::types::{
         PyAnyMethods, PyCFunction, PyDict, PyDictMethods, PyList, PyListMethods, PyTuple,
     };
     use std::sync::{Arc, Mutex};
+
+    // Capture must always see raw mlx-lm. During `patch` we may emit
+    // the base artifact before capturing larger prefill variants; the
+    // installed .pth hook would otherwise wrap the model and pollute
+    // the exported graph.
+    let old_disable_hook = std::env::var_os("FUSEKIT_DISABLE_HOOK");
+    std::env::set_var("FUSEKIT_DISABLE_HOOK", "1");
 
     // The bundled cpython-3.11 was built with `/install/...` as its
     // placeholder install prefix. PYTHONHOME has to be steered at the
@@ -78,7 +89,7 @@ pub fn capture(model_dir: &Path) -> Result<RawGraph> {
         let int32 = mx.getattr("int32").map_err(map_pyerr)?;
         let kwargs = PyDict::new_bound(py);
         kwargs.set_item("dtype", int32).map_err(map_pyerr)?;
-        let shape = (1i64, 8i64);
+        let shape = (1i64, seq_len.max(1) as i64);
         let dummy = mx
             .getattr("zeros")
             .map_err(map_pyerr)?
@@ -198,8 +209,12 @@ pub fn capture(model_dir: &Path) -> Result<RawGraph> {
             model_dir: model_dir_str.clone(),
             config_summary: serde_json::Value::Null,
         })
-    })?;
-    Ok(raw)
+    });
+    match old_disable_hook {
+        Some(value) => std::env::set_var("FUSEKIT_DISABLE_HOOK", value),
+        None => std::env::remove_var("FUSEKIT_DISABLE_HOOK"),
+    }
+    raw
 }
 
 fn extract_scalar_value(arr: &pyo3::Bound<'_, pyo3::PyAny>) -> Option<ScalarValue> {

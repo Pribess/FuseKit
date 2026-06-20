@@ -46,6 +46,69 @@ fn round_vec4_to_act_expr(t: &str, expr: &str) -> String {
     }
 }
 
+fn chain_norm_smem_ty(t: &str) -> &str {
+    let _ = t;
+    "float"
+}
+
+fn chain_norm_smem_ty_for_quant_bits(t: &str, bits: u32) -> &str {
+    if bits != 8 {
+        return chain_norm_smem_ty(t);
+    }
+    match t {
+        "bfloat" | "half" => t,
+        _ => "float",
+    }
+}
+
+fn chain_norm_vec_store_expr_for(norm_ty: &str, expr: &str) -> String {
+    match norm_ty {
+        "bfloat" => format!("bfloat4({expr})"),
+        "half" => format!("half4({expr})"),
+        _ => expr.to_string(),
+    }
+}
+
+fn chain_norm_vec_store_expr(t: &str, expr: &str) -> String {
+    chain_norm_vec_store_expr_for(chain_norm_smem_ty(t), expr)
+}
+
+fn chain_norm_scalar_store_expr_for(norm_ty: &str, expr: &str) -> String {
+    match norm_ty {
+        "bfloat" => format!("bfloat({expr})"),
+        "half" => format!("half({expr})"),
+        _ => expr.to_string(),
+    }
+}
+
+fn chain_norm_scalar_store_expr(t: &str, expr: &str) -> String {
+    chain_norm_scalar_store_expr_for(chain_norm_smem_ty(t), expr)
+}
+
+fn chain_norm_vec_store_rounded_expr_for(norm_ty: &str, t: &str, expr: &str) -> String {
+    match norm_ty {
+        "bfloat" => format!("bfloat4({expr})"),
+        "half" => format!("half4({expr})"),
+        _ => round_vec4_to_act_expr(t, expr),
+    }
+}
+
+fn chain_norm_vec_store_rounded_expr(t: &str, expr: &str) -> String {
+    chain_norm_vec_store_rounded_expr_for(chain_norm_smem_ty(t), t, expr)
+}
+
+fn chain_norm_scalar_store_rounded_expr_for(norm_ty: &str, t: &str, expr: &str) -> String {
+    match norm_ty {
+        "bfloat" => format!("bfloat({expr})"),
+        "half" => format!("half({expr})"),
+        _ => round_scalar_to_act_expr(t, expr),
+    }
+}
+
+fn chain_norm_scalar_store_rounded_expr(t: &str, expr: &str) -> String {
+    chain_norm_scalar_store_rounded_expr_for(chain_norm_smem_ty(t), t, expr)
+}
+
 fn env_on(name: &str) -> bool {
     std::env::var(name)
         .ok()
@@ -54,6 +117,251 @@ fn env_on(name: &str) -> bool {
             matches!(s.as_str(), "1" | "true" | "yes" | "on")
         })
         .unwrap_or(false)
+}
+
+fn env_bool_default(name: &str, default: bool) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|s| {
+            let s = s.trim().to_ascii_lowercase();
+            matches!(s.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(default)
+}
+
+fn emit_dual_qgemv_inner_with_unroll2_default<F: Fn(&str) -> String>(
+    w: &mut MslWriter,
+    acc_g: &str,
+    acc_u: &str,
+    gate_w_packed_row: &str,
+    gate_scales_row: &str,
+    gate_biases_row: &str,
+    up_w_packed_row: &str,
+    up_scales_row: &str,
+    up_biases_row: &str,
+    m_const: &str,
+    bits: u32,
+    group_size: u32,
+    qgemv_unroll2_default: bool,
+    x_expr: F,
+) {
+    let lanes_per_word = 32 / bits;
+    let qgemv_unroll2 = env_bool_default("FUSEKIT_QGEMV_UNROLL2", qgemv_unroll2_default);
+    // The dual gate/up qMV body has enough independent work to keep the
+    // adjacent two-word schedule profitable for q8 large projections: both
+    // words stay in one quant group, so one scale/bias load feeds two packed
+    // words for gate and up. q4 measured worse with the extra live unpack
+    // state, so it stays on the strided schedule.
+    let adjacent_default = bits == 8;
+    let qgemv_adjacent_unroll2 =
+        env_bool_default("FUSEKIT_QGEMV_ADJACENT_UNROLL2", adjacent_default)
+            && qgemv_unroll2
+            && matches!(bits, 4 | 8)
+            && group_size.is_multiple_of(lanes_per_word * 2);
+    let mask = if bits == 4 { "0xFu" } else { "0xFFu" };
+
+    w.line("{");
+    w.push_indent();
+    w.writeln(format_args!("constexpr uint LANES_ = {lanes_per_word}u;"));
+    w.writeln(format_args!("constexpr uint GROUP_ = {group_size}u;"));
+    w.writeln(format_args!("uint in_words_ = {m_const} / LANES_;"));
+    w.writeln(format_args!(
+        "device const uint *gate_w_row_ = {gate_w_packed_row};"
+    ));
+    w.writeln(format_args!(
+        "device const uint *up_w_row_ = {up_w_packed_row};"
+    ));
+
+    let emit_word_accum = |w: &mut MslWriter,
+                           suffix: &str,
+                           word_g: &str,
+                           word_u: &str,
+                           inb: &str| {
+        for off in 0..lanes_per_word {
+            w.writeln(format_args!(
+                "float x{suffix}_{off}_ = {};",
+                x_expr(&format!("{inb} + {off}u"))
+            ));
+        }
+        if bits == 8 {
+            w.writeln(format_args!("float xsum{suffix}_ = 0.0f;"));
+            w.writeln(format_args!("float qacc_g{suffix}_ = 0.0f;"));
+            w.writeln(format_args!("float qacc_u{suffix}_ = 0.0f;"));
+            for off in 0..lanes_per_word {
+                let shift = off * bits;
+                w.writeln(format_args!("xsum{suffix}_ += x{suffix}_{off}_;"));
+                w.writeln(format_args!(
+                    "qacc_g{suffix}_ += x{suffix}_{off}_ * float(({word_g} >> {shift}u) & {mask});"
+                ));
+                w.writeln(format_args!(
+                    "qacc_u{suffix}_ += x{suffix}_{off}_ * float(({word_u} >> {shift}u) & {mask});"
+                ));
+            }
+            w.writeln(format_args!(
+                "{acc_g} += gate_scale{suffix}_ * qacc_g{suffix}_ + gate_bias{suffix}_ * xsum{suffix}_;"
+            ));
+            w.writeln(format_args!(
+                "{acc_u} += up_scale{suffix}_ * qacc_u{suffix}_ + up_bias{suffix}_ * xsum{suffix}_;"
+            ));
+        } else {
+            for off in 0..lanes_per_word {
+                let shift = off * bits;
+                w.writeln(format_args!(
+                    "{acc_g} += x{suffix}_{off}_ * (float(({word_g} >> {shift}u) & {mask}) * gate_scale{suffix}_ + gate_bias{suffix}_);"
+                ));
+            }
+            for off in 0..lanes_per_word {
+                let shift = off * bits;
+                w.writeln(format_args!(
+                    "{acc_u} += x{suffix}_{off}_ * (float(({word_u} >> {shift}u) & {mask}) * up_scale{suffix}_ + up_bias{suffix}_);"
+                ));
+            }
+        }
+    };
+
+    if qgemv_unroll2 {
+        if qgemv_adjacent_unroll2 {
+            w.line("uint widx_ = simd_lane * 2u;");
+            w.line("for (; widx_ + 1u < in_words_; widx_ += 64u) {");
+            w.push_indent();
+            w.line("uint gate_word0_ = gate_w_row_[widx_];");
+            w.line("uint gate_word1_ = gate_w_row_[widx_ + 1u];");
+            w.line("uint up_word0_ = up_w_row_[widx_];");
+            w.line("uint up_word1_ = up_w_row_[widx_ + 1u];");
+            w.writeln(format_args!("uint inb0_ = widx_ * {lanes_per_word}u;"));
+            w.writeln(format_args!("uint inb1_ = inb0_ + {lanes_per_word}u;"));
+            w.line("uint group0_ = inb0_ / GROUP_;");
+            w.writeln(format_args!(
+                "float gate_scale0_ = float(({gate_scales_row})[group0_]);"
+            ));
+            w.writeln(format_args!(
+                "float gate_bias0_ = float(({gate_biases_row})[group0_]);"
+            ));
+            w.writeln(format_args!(
+                "float up_scale0_ = float(({up_scales_row})[group0_]);"
+            ));
+            w.writeln(format_args!(
+                "float up_bias0_ = float(({up_biases_row})[group0_]);"
+            ));
+            w.line("float gate_scale1_ = gate_scale0_;");
+            w.line("float gate_bias1_ = gate_bias0_;");
+            w.line("float up_scale1_ = up_scale0_;");
+            w.line("float up_bias1_ = up_bias0_;");
+            emit_word_accum(w, "0", "gate_word0_", "up_word0_", "inb0_");
+            emit_word_accum(w, "1", "gate_word1_", "up_word1_", "inb1_");
+            w.pop_indent();
+            w.line("}");
+            w.line("if (widx_ < in_words_) {");
+            w.push_indent();
+            w.line("uint gate_wordt_ = gate_w_row_[widx_];");
+            w.line("uint up_wordt_ = up_w_row_[widx_];");
+            w.writeln(format_args!("uint inbt_ = widx_ * {lanes_per_word}u;"));
+            w.line("uint groupt_ = inbt_ / GROUP_;");
+            w.writeln(format_args!(
+                "float gate_scalet_ = float(({gate_scales_row})[groupt_]);"
+            ));
+            w.writeln(format_args!(
+                "float gate_biast_ = float(({gate_biases_row})[groupt_]);"
+            ));
+            w.writeln(format_args!(
+                "float up_scalet_ = float(({up_scales_row})[groupt_]);"
+            ));
+            w.writeln(format_args!(
+                "float up_biast_ = float(({up_biases_row})[groupt_]);"
+            ));
+            emit_word_accum(w, "t", "gate_wordt_", "up_wordt_", "inbt_");
+            w.pop_indent();
+            w.line("}");
+        } else {
+            w.line("uint widx_ = simd_lane;");
+            w.line("for (; widx_ + 32u < in_words_; widx_ += 64u) {");
+            w.push_indent();
+            w.line("uint gate_word0_ = gate_w_row_[widx_];");
+            w.line("uint gate_word1_ = gate_w_row_[widx_ + 32u];");
+            w.line("uint up_word0_ = up_w_row_[widx_];");
+            w.line("uint up_word1_ = up_w_row_[widx_ + 32u];");
+            w.writeln(format_args!("uint inb0_ = widx_ * {lanes_per_word}u;"));
+            w.writeln(format_args!(
+                "uint inb1_ = (widx_ + 32u) * {lanes_per_word}u;"
+            ));
+            w.line("uint group0_ = inb0_ / GROUP_;");
+            w.line("uint group1_ = inb1_ / GROUP_;");
+            w.writeln(format_args!(
+                "float gate_scale0_ = float(({gate_scales_row})[group0_]);"
+            ));
+            w.writeln(format_args!(
+                "float gate_bias0_ = float(({gate_biases_row})[group0_]);"
+            ));
+            w.writeln(format_args!(
+                "float up_scale0_ = float(({up_scales_row})[group0_]);"
+            ));
+            w.writeln(format_args!(
+                "float up_bias0_ = float(({up_biases_row})[group0_]);"
+            ));
+            w.writeln(format_args!(
+                "float gate_scale1_ = float(({gate_scales_row})[group1_]);"
+            ));
+            w.writeln(format_args!(
+                "float gate_bias1_ = float(({gate_biases_row})[group1_]);"
+            ));
+            w.writeln(format_args!(
+                "float up_scale1_ = float(({up_scales_row})[group1_]);"
+            ));
+            w.writeln(format_args!(
+                "float up_bias1_ = float(({up_biases_row})[group1_]);"
+            ));
+            emit_word_accum(w, "0", "gate_word0_", "up_word0_", "inb0_");
+            emit_word_accum(w, "1", "gate_word1_", "up_word1_", "inb1_");
+            w.pop_indent();
+            w.line("}");
+            w.line("if (widx_ < in_words_) {");
+            w.push_indent();
+            w.line("uint gate_wordt_ = gate_w_row_[widx_];");
+            w.line("uint up_wordt_ = up_w_row_[widx_];");
+            w.writeln(format_args!("uint inbt_ = widx_ * {lanes_per_word}u;"));
+            w.line("uint groupt_ = inbt_ / GROUP_;");
+            w.writeln(format_args!(
+                "float gate_scalet_ = float(({gate_scales_row})[groupt_]);"
+            ));
+            w.writeln(format_args!(
+                "float gate_biast_ = float(({gate_biases_row})[groupt_]);"
+            ));
+            w.writeln(format_args!(
+                "float up_scalet_ = float(({up_scales_row})[groupt_]);"
+            ));
+            w.writeln(format_args!(
+                "float up_biast_ = float(({up_biases_row})[groupt_]);"
+            ));
+            emit_word_accum(w, "t", "gate_wordt_", "up_wordt_", "inbt_");
+            w.pop_indent();
+            w.line("}");
+        }
+    } else {
+        w.line("for (uint widx_ = simd_lane; widx_ < in_words_; widx_ += 32u) {");
+        w.push_indent();
+        w.line("uint gate_word_ = gate_w_row_[widx_];");
+        w.line("uint up_word_ = up_w_row_[widx_];");
+        w.writeln(format_args!("uint inb_ = widx_ * {lanes_per_word}u;"));
+        w.line("uint group_ = inb_ / GROUP_;");
+        w.writeln(format_args!(
+            "float gate_scale_ = float(({gate_scales_row})[group_]);"
+        ));
+        w.writeln(format_args!(
+            "float gate_bias_ = float(({gate_biases_row})[group_]);"
+        ));
+        w.writeln(format_args!(
+            "float up_scale_ = float(({up_scales_row})[group_]);"
+        ));
+        w.writeln(format_args!(
+            "float up_bias_ = float(({up_biases_row})[group_]);"
+        ));
+        emit_word_accum(w, "", "gate_word_", "up_word_", "inb_");
+        w.pop_indent();
+        w.line("}");
+    }
+
+    w.pop_indent();
+    w.line("}");
 }
 
 pub fn emit(
@@ -83,6 +391,18 @@ pub fn emit(
         .map(|s| s.op_name.as_str())
         .collect::<Vec<_>>()
         .join(" → ");
+
+    if let Some(reduction_idx) = pointwise_prefix_reduction_index(&steps) {
+        return emit_pointwise_prefix_reduction_chain(
+            fusion,
+            &steps,
+            reduction_idx,
+            meta,
+            w,
+            &fn_name,
+            &op_summary,
+        );
+    }
 
     // Choose body emit by the first step's category. Heavy-first
     // chains (today only Matmul) own their thread shape and pass the
@@ -118,7 +438,6 @@ pub fn emit(
             }
         }
     }
-
     let n: u32 = crate::target::current_chip()
         .active_elems(&fusion.outputs[0].shape)
         .min(u32::MAX as u64) as u32;
@@ -158,6 +477,220 @@ pub fn emit(
         act_ty: crate::codegen::kernels::act_ty(meta),
     };
     crate::codegen::pieces::compose(&fn_name, &pieces, &ctx, w);
+    Ok(())
+}
+
+fn chain_shape_elems(shape: &[i32]) -> i32 {
+    shape.iter().product::<i32>().max(1)
+}
+
+fn pointwise_prefix_reduction_index(steps: &[ChainStep]) -> Option<usize> {
+    let mut reduction_idx = None;
+    for (idx, step) in steps.iter().enumerate() {
+        match categorize_name(&step.op_name) {
+            OpCategory::Reduction => {
+                if reduction_idx.replace(idx).is_some() {
+                    return None;
+                }
+            }
+            OpCategory::Pointwise => {}
+            OpCategory::View
+                if matches!(
+                    step.op_name.as_str(),
+                    "Reshape" | "Flatten" | "Unflatten" | "Squeeze" | "ExpandDims" | "AsContiguous"
+                ) => {}
+            _ => return None,
+        }
+    }
+    let idx = reduction_idx?;
+    if idx == 0 || steps[idx].op_name != "RMSNorm" {
+        return None;
+    }
+    Some(idx)
+}
+
+fn emit_pointwise_prefix_reduction_chain(
+    fusion: &Fusion,
+    steps: &[ChainStep],
+    reduction_idx: usize,
+    meta: &ModelMeta,
+    w: &mut MslWriter,
+    fn_name: &str,
+    op_summary: &str,
+) -> Result<()> {
+    let fallback_t = crate::codegen::kernels::act_ty(meta);
+    let n_inputs = fusion.inputs.len();
+    let rms = &steps[reduction_idx];
+    if rms.op_name != "RMSNorm" || rms.inputs.len() != 2 {
+        bail!("pointwise-prefix reduction chain expects RMSNorm(x, weight)");
+    }
+    let w_buf = match rms.inputs[1] {
+        ChainOperand::External { buffer_index } => buffer_index,
+        _ => bail!("RMSNorm weight must be an external buffer"),
+    };
+    let eps = match rms.op_attrs {
+        crate::graph::Attrs::RmsNorm { eps } => eps,
+        _ => 1e-6_f32,
+    };
+    let norm_shape = rms.output_shape.clone();
+    if norm_shape.is_empty() {
+        bail!("pointwise-prefix reduction chain: RMSNorm output shape empty");
+    }
+    if fusion.outputs.is_empty() || fusion.outputs.len() > 2 {
+        bail!("pointwise-prefix reduction chain expects one output, or prefix+reduction outputs");
+    }
+    let reduction_out_index = if fusion.outputs.len() == 2 {
+        1usize
+    } else {
+        0usize
+    };
+    let prefix_out_index = (fusion.outputs.len() == 2).then_some(0usize);
+    if let Some(prefix_idx) = prefix_out_index {
+        if chain_shape_elems(&fusion.outputs[prefix_idx].shape) != chain_shape_elems(&norm_shape) {
+            bail!("pointwise-prefix reduction chain: prefix output shape mismatch");
+        }
+    }
+    let reduction_out_t = crate::codegen::kernels::scalar_ty_for_dtype(
+        fusion.outputs[reduction_out_index].dtype,
+        fallback_t,
+    );
+    let hidden = *norm_shape.last().unwrap();
+    let rows: i32 = crate::target::current_chip()
+        .active_rows_before_last(&norm_shape)
+        .min(i32::MAX as u64) as i32;
+    let out_shape = fusion.outputs[reduction_out_index].shape.clone();
+    let weight_elems: i32 = fusion
+        .inputs
+        .get(w_buf as usize)
+        .map(|b| b.shape.iter().product::<i32>().max(1))
+        .unwrap_or(1);
+    let weight_is_vector = weight_elems >= hidden;
+
+    let emit_prefix_registers = |w: &mut MslWriter| -> Result<()> {
+        for (idx, step) in steps.iter().enumerate().take(reduction_idx) {
+            let expr = render_pointwise_expr_reduction(step, fusion, hidden, rows, &norm_shape)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "pointwise-prefix reduction chain: unsupported prefix op `{}`",
+                        step.op_name
+                    )
+                })?;
+            let rounded = round_scalar_to_dtype_expr(step.output_dtype, fallback_t, &expr);
+            w.line(format!("float r{idx} = {rounded};"));
+        }
+        Ok(())
+    };
+
+    w.line(format!(
+        "// Fusion #{}: FusedChain (pointwise-prefix RMSNorm, ROWS={}, HIDDEN={}, chain: {})",
+        fusion.id, rows, hidden, op_summary
+    ));
+    w.line(format!("kernel void {fn_name}("));
+    w.push_indent();
+    for i in 0..n_inputs {
+        let ty = crate::codegen::kernels::scalar_ty_for_dtype(fusion.inputs[i].dtype, fallback_t);
+        w.line(format!("device const {ty} *in{i} [[buffer({i})]],"));
+    }
+    for (out_idx, output) in fusion.outputs.iter().enumerate() {
+        let ty = crate::codegen::kernels::scalar_ty_for_dtype(output.dtype, fallback_t);
+        w.line(format!(
+            "device {ty}       *out{out_idx} [[buffer({})]],",
+            n_inputs + out_idx
+        ));
+    }
+    w.line("uint tid     [[thread_position_in_threadgroup]],");
+    w.line("uint tg_size [[threads_per_threadgroup]],");
+    w.line("uint gid     [[threadgroup_position_in_grid]]");
+    w.pop_indent();
+    w.line(") {");
+    w.push_indent();
+    w.line(format!("constexpr uint HIDDEN = {hidden};"));
+    w.line(format!("constexpr uint ROWS   = {rows};"));
+    w.line(format!("constexpr float EPS   = {eps};"));
+    w.line(format!(
+        "constexpr bool WEIGHT_IS_VECTOR = {};",
+        if weight_is_vector { "true" } else { "false" }
+    ));
+    w.line("threadgroup float reduce_buf[32];");
+    w.line("uint row = gid;");
+    w.line("if (row >= ROWS) return;");
+    w.line("float sum_sq = 0.0f;");
+    w.line("for (uint i = tid; i < HIDDEN; i += tg_size) {");
+    w.push_indent();
+    emit_prefix_registers(w)?;
+    let x_expr = operand_expr_reduction(&rms.inputs[0], fusion, hidden, rows, &norm_shape);
+    w.line(format!("float xi = {x_expr};"));
+    w.line("sum_sq += xi * xi;");
+    w.pop_indent();
+    w.line("}");
+    w.line("uint simd_lane = tid % 32u;");
+    w.line("uint simd_id   = tid / 32u;");
+    w.line("sum_sq = simd_sum(sum_sq);");
+    w.line("if (simd_lane == 0u) reduce_buf[simd_id] = sum_sq;");
+    w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
+    w.line("if (simd_id == 0u) {");
+    w.push_indent();
+    w.line("float v = (tid < tg_size / 32u) ? reduce_buf[tid] : 0.0f;");
+    w.line("v = simd_sum(v);");
+    w.line("if (simd_lane == 0u) reduce_buf[0] = v;");
+    w.pop_indent();
+    w.line("}");
+    w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
+    w.line("float rms_scale = metal::precise::rsqrt(reduce_buf[0] / float(HIDDEN) + EPS);");
+    w.line(format!(
+        "float scalar_weight = WEIGHT_IS_VECTOR ? 1.0f : float(in{w_buf}[0]);"
+    ));
+    w.line("for (uint i = tid; i < HIDDEN; i += tg_size) {");
+    w.push_indent();
+    emit_prefix_registers(w)?;
+    if let Some(prefix_idx) = prefix_out_index {
+        let prefix_step_idx = reduction_idx - 1;
+        let prefix_t = crate::codegen::kernels::scalar_ty_for_dtype(
+            fusion.outputs[prefix_idx].dtype,
+            fallback_t,
+        );
+        w.line(format!(
+            "out{prefix_idx}[row * HIDDEN + i] = {prefix_t}(r{prefix_step_idx});"
+        ));
+    }
+    let x_expr = operand_expr_reduction(&rms.inputs[0], fusion, hidden, rows, &norm_shape);
+    w.line(format!("float xi = {x_expr};"));
+    let rms_t = crate::codegen::kernels::scalar_ty_for_dtype(rms.output_dtype, fallback_t);
+    w.line(format!("{rms_t} normed = {rms_t}(xi * rms_scale);"));
+    w.line(format!(
+        "{rms_t} wi = WEIGHT_IS_VECTOR ? in{w_buf}[i] : {rms_t}(scalar_weight);"
+    ));
+    w.line(format!(
+        "float r{reduction_idx} = float({rms_t}(wi * normed));"
+    ));
+    let n_steps = steps.len();
+    for (idx, step) in steps.iter().enumerate().skip(reduction_idx + 1) {
+        let is_last = idx + 1 == n_steps;
+        let expr = render_pointwise_expr_reduction(step, fusion, hidden, rows, &out_shape)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "pointwise-prefix reduction chain: unsupported tail op `{}`",
+                    step.op_name
+                )
+            })?;
+        if is_last {
+            w.line(format!(
+                "out{reduction_out_index}[row * HIDDEN + i] = {reduction_out_t}({expr});"
+            ));
+        } else {
+            w.line(format!("float r{idx} = float({expr});"));
+        }
+    }
+    if reduction_idx + 1 == n_steps {
+        w.line(format!(
+            "out{reduction_out_index}[row * HIDDEN + i] = {reduction_out_t}(r{reduction_idx});"
+        ));
+    }
+    w.pop_indent();
+    w.line("}");
+    w.pop_indent();
+    w.line("}");
+    w.blank();
     Ok(())
 }
 
@@ -267,7 +800,8 @@ fn emit_matmul_chain(
     w.line(format!("device {t}       *out0 [[buffer({})]],", n_inputs));
     w.line("uint tid     [[thread_position_in_threadgroup]],");
     w.line("uint tg_size [[threads_per_threadgroup]],");
-    w.line("uint gid     [[threadgroup_position_in_grid]]");
+    w.line("uint gid     [[threadgroup_position_in_grid]],");
+    w.line("uint tpg     [[threadgroups_per_grid]]");
     w.pop_indent();
     w.line(") {");
     w.push_indent();
@@ -319,8 +853,10 @@ fn emit_matmul_chain(
     // or 4. col_base is always a multiple of ROWS_PER_SG (i_base
     // computation guarantees alignment), so the float2/float4 read
     // is properly aligned. Cuts B-side loads from R scalar to 1 wide.
-    let use_k2_unroll =
-        dense_k2_unroll_enabled() && b_is_transposed_param && !is_lm_head_projection && k % 8 == 0;
+    let use_k2_unroll = dense_k2_unroll_enabled(k, n_dim)
+        && b_is_transposed_param
+        && !is_lm_head_projection
+        && k % 8 == 0;
     if use_k2_unroll {
         w.line(format!(
             "device const {t}4* A4 = (device const {t}4*)(in{a} + (b_idx * M + row) * K);",
@@ -467,17 +1003,34 @@ pub fn function_name(fusion: &Fusion) -> String {
     format!("fusekit_chain_f{}", fusion.id)
 }
 
-fn dense_k2_unroll_enabled() -> bool {
+fn dense_k2_unroll_enabled(k_dim: u32, out_dim: u32) -> bool {
     if let Ok(raw) = std::env::var("FUSEKIT_DENSE_K2_UNROLL") {
         let raw = raw.trim().to_ascii_lowercase();
         return matches!(raw.as_str(), "1" | "true" | "yes" | "on");
     }
 
-    // On M5 decode GEMV, the two-vector K loop increases live ranges enough
-    // to lose scheduler occupancy on dense bf16 chains. The single-vector
-    // loop measured faster across 0.5B/1.5B/4B bf16 decode; older targets keep
-    // the historical default unless explicitly swept.
-    !matches!(crate::target::current_chip(), crate::target::ChipModel::M5)
+    // Large dense decode GEMV is weight-streaming dominated. On M5,
+    // two K4 vectors per lane improves the 4B-class bf16 FusedChain
+    // path without exposing the smaller hidden/output shapes to the
+    // live-range pressure that made the global M5 K2 default lose.
+    if matches!(crate::target::current_chip(), crate::target::ChipModel::M5) {
+        return k_dim >= 2048 && out_dim >= 2048;
+    }
+    true
+}
+
+fn dense_k4_unroll_enabled(k_dim: u32, out_dim: u32) -> bool {
+    matches!(crate::target::current_chip(), crate::target::ChipModel::M5)
+        && k_dim >= 2048
+        && out_dim >= 2048
+        && k_dim.is_multiple_of(16)
+}
+
+fn dense_k8_unroll_enabled(k_dim: u32, out_dim: u32) -> bool {
+    matches!(crate::target::current_chip(), crate::target::ChipModel::M5)
+        && k_dim >= 2048
+        && out_dim >= 2048
+        && k_dim.is_multiple_of(32)
 }
 
 /// Emit a 4-way vectorized GEMV inner loop for a dense (non-quantized)
@@ -501,6 +1054,7 @@ fn emit_chain_dense_matmul(
     acc_var: &str,
     hidden: u32,
     virtual_transposed: bool,
+    out_dim: u32,
     out_dim_expr: &str,
 ) {
     if virtual_transposed {
@@ -512,7 +1066,7 @@ fn emit_chain_dense_matmul(
             "uint tr_col = logical - tr_row * ({out_dim_expr});"
         ));
         w.line(format!(
-            "{acc_var} += norm_y[k] * float(in{w_buf}[tr_col * HIDDEN + tr_row]);"
+            "{acc_var} += float(norm_y[k]) * float(in{w_buf}[tr_col * HIDDEN + tr_row]);"
         ));
         w.pop_indent();
         w.line("}");
@@ -521,19 +1075,70 @@ fn emit_chain_dense_matmul(
     w.line(format!(
         "device const {t}4* W4 = (device const {t}4*)(in{w_buf} + ({out_idx_var}) * HIDDEN);"
     ));
-    w.line("threadgroup float4* ny4 = (threadgroup float4*)norm_y;");
-    if dense_k2_unroll_enabled() && hidden % 8 == 0 {
+    let norm_ty = chain_norm_smem_ty(t);
+    w.line(format!(
+        "threadgroup {norm_ty}4* ny4 = (threadgroup {norm_ty}4*)norm_y;"
+    ));
+    if dense_k8_unroll_enabled(hidden, out_dim) {
+        w.line("for (uint k4 = simd_lane * 8u; k4 < HIDDEN / 4u; k4 += 256u) {");
+        w.push_indent();
+        w.line(format!(
+            "{acc_var} += dot(float4(ny4[k4]),     float4(W4[k4]))"
+        ));
+        w.line(format!(
+            "          + dot(float4(ny4[k4+1u]), float4(W4[k4+1u]))"
+        ));
+        w.line(format!(
+            "          + dot(float4(ny4[k4+2u]), float4(W4[k4+2u]))"
+        ));
+        w.line(format!(
+            "          + dot(float4(ny4[k4+3u]), float4(W4[k4+3u]))"
+        ));
+        w.line(format!(
+            "          + dot(float4(ny4[k4+4u]), float4(W4[k4+4u]))"
+        ));
+        w.line(format!(
+            "          + dot(float4(ny4[k4+5u]), float4(W4[k4+5u]))"
+        ));
+        w.line(format!(
+            "          + dot(float4(ny4[k4+6u]), float4(W4[k4+6u]))"
+        ));
+        w.line(format!(
+            "          + dot(float4(ny4[k4+7u]), float4(W4[k4+7u]));"
+        ));
+        w.pop_indent();
+        w.line("}");
+    } else if dense_k4_unroll_enabled(hidden, out_dim) {
+        w.line("for (uint k4 = simd_lane * 4u; k4 < HIDDEN / 4u; k4 += 128u) {");
+        w.push_indent();
+        w.line(format!(
+            "{acc_var} += dot(float4(ny4[k4]),     float4(W4[k4]))"
+        ));
+        w.line(format!(
+            "          + dot(float4(ny4[k4+1u]), float4(W4[k4+1u]))"
+        ));
+        w.line(format!(
+            "          + dot(float4(ny4[k4+2u]), float4(W4[k4+2u]))"
+        ));
+        w.line(format!(
+            "          + dot(float4(ny4[k4+3u]), float4(W4[k4+3u]));"
+        ));
+        w.pop_indent();
+        w.line("}");
+    } else if dense_k2_unroll_enabled(hidden, out_dim) && hidden % 8 == 0 {
         w.line("for (uint k4 = simd_lane * 2u; k4 < HIDDEN / 4u; k4 += 64u) {");
         w.push_indent();
         w.line(format!(
-            "{acc_var} += dot(ny4[k4], float4(W4[k4])) + dot(ny4[k4 + 1u], float4(W4[k4 + 1u]));"
+            "{acc_var} += dot(float4(ny4[k4]), float4(W4[k4])) + dot(float4(ny4[k4 + 1u]), float4(W4[k4 + 1u]));"
         ));
         w.pop_indent();
         w.line("}");
     } else {
         w.line("for (uint k4 = simd_lane; k4 < HIDDEN / 4u; k4 += 32u) {");
         w.push_indent();
-        w.line(format!("{acc_var} += dot(ny4[k4], float4(W4[k4]));"));
+        w.line(format!(
+            "{acc_var} += dot(float4(ny4[k4]), float4(W4[k4]));"
+        ));
         w.pop_indent();
         w.line("}");
     }
@@ -549,14 +1154,16 @@ fn emit_chain_dense_matmul(
 /// `out_idx_base_var` is the variable holding the first output row's
 /// index; subsequent rows are at `out_idx_base + 1u`, etc. Caller is
 /// responsible for ensuring `out_idx_base + rows - 1 < OUT_DIM`.
-fn emit_chain_dense_matmul_multirow(
+fn emit_chain_dense_matmul_multirow_named(
     w: &mut MslWriter,
     t: &str,
     w_buf: u32,
     out_idx_base_var: &str,
+    acc_prefix: &str,
     rows: u32,
     hidden: u32,
     virtual_transposed: bool,
+    out_dim: u32,
     out_dim_expr: &str,
 ) {
     if rows <= 1 {
@@ -565,9 +1172,10 @@ fn emit_chain_dense_matmul_multirow(
             t,
             w_buf,
             out_idx_base_var,
-            "acc0",
+            &format!("{acc_prefix}0"),
             hidden,
             virtual_transposed,
+            out_dim,
             out_dim_expr,
         );
         return;
@@ -575,7 +1183,7 @@ fn emit_chain_dense_matmul_multirow(
     if virtual_transposed {
         w.line("for (uint k = simd_lane; k < HIDDEN; k += 32u) {");
         w.push_indent();
-        w.line("float xv = norm_y[k];");
+        w.line("float xv = float(norm_y[k]);");
         for r in 0..rows {
             w.line(format!(
                 "uint logical_{r} = (({out_idx_base_var}) + {r}u) * HIDDEN + k;"
@@ -585,7 +1193,7 @@ fn emit_chain_dense_matmul_multirow(
                 "uint tr_col_{r} = logical_{r} - tr_row_{r} * ({out_dim_expr});"
             ));
             w.line(format!(
-                "acc{r} += xv * float(in{w_buf}[tr_col_{r} * HIDDEN + tr_row_{r}]);"
+                "{acc_prefix}{r} += xv * float(in{w_buf}[tr_col_{r} * HIDDEN + tr_row_{r}]);"
             ));
         }
         w.pop_indent();
@@ -597,15 +1205,32 @@ fn emit_chain_dense_matmul_multirow(
             "device const {t}4* W4_{r} = (device const {t}4*)(in{w_buf} + (({out_idx_base_var}) + {r}u) * HIDDEN);"
         ));
     }
-    w.line("threadgroup float4* ny4 = (threadgroup float4*)norm_y;");
-    if dense_k2_unroll_enabled() && hidden % 8 == 0 {
-        w.line("for (uint k4 = simd_lane * 2u; k4 < HIDDEN / 4u; k4 += 64u) {");
+    let norm_ty = chain_norm_smem_ty(t);
+    w.line(format!(
+        "threadgroup {norm_ty}4* ny4 = (threadgroup {norm_ty}4*)norm_y;"
+    ));
+    if dense_k4_unroll_enabled(hidden, out_dim) {
+        w.line("for (uint k4 = simd_lane * 4u; k4 < HIDDEN / 4u; k4 += 128u) {");
         w.push_indent();
-        w.line("float4 xv0 = ny4[k4];");
-        w.line("float4 xv1 = ny4[k4 + 1u];");
+        w.line("float4 xv0 = float4(ny4[k4]);");
+        w.line("float4 xv1 = float4(ny4[k4 + 1u]);");
+        w.line("float4 xv2 = float4(ny4[k4 + 2u]);");
+        w.line("float4 xv3 = float4(ny4[k4 + 3u]);");
         for r in 0..rows {
             w.line(format!(
-                "acc{r} += dot(xv0, float4(W4_{r}[k4])) + dot(xv1, float4(W4_{r}[k4 + 1u]));"
+                "{acc_prefix}{r} += dot(xv0, float4(W4_{r}[k4])) + dot(xv1, float4(W4_{r}[k4 + 1u])) + dot(xv2, float4(W4_{r}[k4 + 2u])) + dot(xv3, float4(W4_{r}[k4 + 3u]));"
+            ));
+        }
+        w.pop_indent();
+        w.line("}");
+    } else if dense_k2_unroll_enabled(hidden, out_dim) && hidden % 8 == 0 {
+        w.line("for (uint k4 = simd_lane * 2u; k4 < HIDDEN / 4u; k4 += 64u) {");
+        w.push_indent();
+        w.line("float4 xv0 = float4(ny4[k4]);");
+        w.line("float4 xv1 = float4(ny4[k4 + 1u]);");
+        for r in 0..rows {
+            w.line(format!(
+                "{acc_prefix}{r} += dot(xv0, float4(W4_{r}[k4])) + dot(xv1, float4(W4_{r}[k4 + 1u]));"
             ));
         }
         w.pop_indent();
@@ -613,13 +1238,38 @@ fn emit_chain_dense_matmul_multirow(
     } else {
         w.line("for (uint k4 = simd_lane; k4 < HIDDEN / 4u; k4 += 32u) {");
         w.push_indent();
-        w.line("float4 xv = ny4[k4];");
+        w.line("float4 xv = float4(ny4[k4]);");
         for r in 0..rows {
-            w.line(format!("acc{r} += dot(xv, float4(W4_{r}[k4]));"));
+            w.line(format!("{acc_prefix}{r} += dot(xv, float4(W4_{r}[k4]));"));
         }
         w.pop_indent();
         w.line("}");
     }
+}
+
+fn emit_chain_dense_matmul_multirow(
+    w: &mut MslWriter,
+    t: &str,
+    w_buf: u32,
+    out_idx_base_var: &str,
+    rows: u32,
+    hidden: u32,
+    virtual_transposed: bool,
+    out_dim: u32,
+    out_dim_expr: &str,
+) {
+    emit_chain_dense_matmul_multirow_named(
+        w,
+        t,
+        w_buf,
+        out_idx_base_var,
+        "acc",
+        rows,
+        hidden,
+        virtual_transposed,
+        out_dim,
+        out_dim_expr,
+    );
 }
 
 /// Emit a chain whose first step is `QuantizedMatmul` with a pointwise
@@ -894,7 +1544,8 @@ pub(crate) fn emit_qmm_chain(
     ));
     w.line("uint tid     [[thread_position_in_threadgroup]],");
     w.line("uint tg_size [[threads_per_threadgroup]],");
-    w.line("uint gid     [[threadgroup_position_in_grid]]");
+    w.line("uint gid     [[threadgroup_position_in_grid]],");
+    w.line("uint tpg     [[threadgroups_per_grid]]");
     w.pop_indent();
     w.line(") {");
     w.push_indent();
@@ -1264,10 +1915,15 @@ fn operand_expr_reduction(
                 .unwrap_or(&[]);
             let elems: i32 = s.iter().product::<i32>().max(1);
             let active_elems = hidden.saturating_mul(rows).max(1);
+            let out_elems: i32 = out_shape.iter().product::<i32>().max(1);
             let same = s == out_shape;
             let broadcast = elems == hidden && s.iter().any(|&d| d == hidden);
+            let flat_alias = elems == out_elems;
             let contiguous_active = elems >= active_elems
-                && (same || s.last().copied() == Some(hidden) || elems == active_elems);
+                && (same
+                    || flat_alias
+                    || s.last().copied() == Some(hidden)
+                    || elems == active_elems);
             if contiguous_active {
                 format!("float(in{}[row * HIDDEN + i])", buffer_index)
             } else if broadcast {
@@ -1443,7 +2099,8 @@ fn emit_reduction_swiglu_absorb_chain(
     ));
     w.line("uint tid     [[thread_position_in_threadgroup]],");
     w.line("uint tg_size [[threads_per_threadgroup]],");
-    w.line("uint gid     [[threadgroup_position_in_grid]]");
+    w.line("uint gid     [[threadgroup_position_in_grid]],");
+    w.line("uint tpg     [[threadgroups_per_grid]]");
     w.pop_indent();
     w.line(") {");
     w.push_indent();
@@ -1451,15 +2108,34 @@ fn emit_reduction_swiglu_absorb_chain(
     w.line(format!("constexpr uint OUT_DIM = {out_dim};"));
     w.line(format!("constexpr uint ROWS    = {rows};"));
     w.line(format!("constexpr float EPS    = {eps};"));
-    w.line("threadgroup float norm_y[HIDDEN];");
-    w.line("threadgroup float reduce_buf[32];");
 
     let chip_rows = crate::target::current_chip().gemv_rows_per_simdgroup();
-    let rows_per_sg = if chip_rows > 1
-        && (out_dim as u32) >= chip_rows
-        && (out_dim as u32) % chip_rows == 0
+    let rows_per_sg =
+        if chip_rows > 1 && (out_dim as u32) >= chip_rows && (out_dim as u32) % chip_rows == 0 {
+            chip_rows
+        } else {
+            1
+        };
+    let token_rows_per_sg = if rows > 1
+        && rows_per_sg == 1
+        && crate::codegen::kernels::mtp_token_m_reduction_fanout_enabled()
+        && matches!(bits, 4 | 8)
     {
-        chip_rows
+        let base = crate::target::current_chip().qgemm_m_rows_per_simdgroup(
+            rows as u32,
+            bits,
+            hidden as u32,
+            out_dim as u32,
+        );
+        if matches!(crate::target::current_chip(), crate::target::ChipModel::M5)
+            && group_size == 64
+            && out_dim >= 2048
+            && rows >= 4
+        {
+            base.max(4).min(rows as u32)
+        } else {
+            base
+        }
     } else {
         1
     };
@@ -1467,7 +2143,205 @@ fn emit_reduction_swiglu_absorb_chain(
     w.line("uint simd_lane  = tid % 32u;");
     w.line("uint simd_id    = tid / 32u;");
     w.line("uint sgs_per_tg = tg_size / 32u;");
-    w.line("uint tgs_per_row = (OUT_DIM + sgs_per_tg * ROWS_PER_SG - 1u) / (sgs_per_tg * ROWS_PER_SG);");
+
+    if token_rows_per_sg > 1 {
+        let full_token_blocks = (rows as u32).is_multiple_of(token_rows_per_sg);
+        w.line("// Small-M swiglu-absorbed qGEMM: share gate/up weight rows across active M rows.");
+        w.line(format!(
+            "constexpr uint TOKEN_ROWS_PER_SG = {token_rows_per_sg}u;"
+        ));
+        w.line("constexpr uint ROW_BLOCKS = (ROWS + TOKEN_ROWS_PER_SG - 1u) / TOKEN_ROWS_PER_SG;");
+        w.line("uint tgs_per_row_block = max(tpg / ROW_BLOCKS, 1u);");
+        w.line("uint row_block = gid / tgs_per_row_block;");
+        w.line("if (row_block >= ROW_BLOCKS) return;");
+        w.line("uint row_base = row_block * TOKEN_ROWS_PER_SG;");
+        w.line("uint tg_in_row = gid - row_block * tgs_per_row_block;");
+        w.line("uint out_idx_base = (tg_in_row * sgs_per_tg + simd_id) * ROWS_PER_SG;");
+        w.line("if (out_idx_base >= OUT_DIM) return;");
+        w.line(format!(
+            "threadgroup float reduce_m_buf[{}];",
+            token_rows_per_sg * 32
+        ));
+        for r in 0..token_rows_per_sg {
+            w.line(format!("float sum{r} = 0.0f;"));
+        }
+        w.line("if constexpr (HIDDEN % 4u == 0u) {");
+        w.push_indent();
+        w.line("constexpr uint HIDDEN4 = HIDDEN / 4u;");
+        for r in 0..token_rows_per_sg {
+            if !full_token_blocks {
+                w.line(format!("if (row_base + {r}u < ROWS) {{"));
+                w.push_indent();
+            }
+            w.line(format!(
+                "device const {t}4* x{r}_4 = (device const {t}4*)(in{x_buf} + (row_base + {r}u) * HIDDEN);"
+            ));
+            w.line("for (uint i = tid; i < HIDDEN4; i += tg_size) {");
+            w.push_indent();
+            w.line(format!("float4 x{r}v = float4(x{r}_4[i]);"));
+            w.line(format!("sum{r} += dot(x{r}v, x{r}v);"));
+            w.pop_indent();
+            w.line("}");
+            if !full_token_blocks {
+                w.pop_indent();
+                w.line("}");
+            }
+        }
+        w.pop_indent();
+        w.line("} else {");
+        w.push_indent();
+        for r in 0..token_rows_per_sg {
+            if !full_token_blocks {
+                w.line(format!("if (row_base + {r}u < ROWS) {{"));
+                w.push_indent();
+            }
+            w.line("for (uint i = tid; i < HIDDEN; i += tg_size) {");
+            w.push_indent();
+            w.line(format!(
+                "float x{r}v = float(in{x_buf}[(row_base + {r}u) * HIDDEN + i]);"
+            ));
+            w.line(format!("sum{r} += x{r}v * x{r}v;"));
+            w.pop_indent();
+            w.line("}");
+            if !full_token_blocks {
+                w.pop_indent();
+                w.line("}");
+            }
+        }
+        w.pop_indent();
+        w.line("}");
+        for r in 0..token_rows_per_sg {
+            w.line(format!("sum{r} = simd_sum(sum{r});"));
+        }
+        w.line("if (simd_lane == 0u) {");
+        w.push_indent();
+        for r in 0..token_rows_per_sg {
+            w.line(format!("reduce_m_buf[{r}u * 32u + simd_id] = sum{r};"));
+        }
+        w.pop_indent();
+        w.line("}");
+        w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
+        w.line("if (simd_id == 0u) {");
+        w.push_indent();
+        for r in 0..token_rows_per_sg {
+            w.line(format!(
+                "float v{r} = (tid < tg_size / 32u) ? reduce_m_buf[{r}u * 32u + tid] : 0.0f;"
+            ));
+            w.line(format!("v{r} = simd_sum(v{r});"));
+        }
+        w.line("if (simd_lane == 0u) {");
+        w.push_indent();
+        for r in 0..token_rows_per_sg {
+            w.line(format!("reduce_m_buf[{r}] = v{r};"));
+        }
+        w.pop_indent();
+        w.line("}");
+        w.pop_indent();
+        w.line("}");
+        w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
+        for r in 0..token_rows_per_sg {
+            w.line(format!(
+                "float rms_scale{r} = metal::precise::rsqrt(reduce_m_buf[{r}] / float(HIDDEN) + EPS);"
+            ));
+            w.line(format!("float acc_g{r} = 0.0f;"));
+            w.line(format!("float acc_u{r} = 0.0f;"));
+        }
+        w.line(format!("constexpr uint BITS  = {bits}u;"));
+        w.line(format!("constexpr uint GROUP = {group_size}u;"));
+        w.line(format!("constexpr uint LANES = {lanes_per_word}u;"));
+        w.line("constexpr uint MASK = (1u << BITS) - 1u;");
+        w.line(format!("constexpr uint IN_WORDS = {packed_words}u;"));
+        w.line("constexpr uint N_GROUPS = HIDDEN / GROUP;");
+        crate::codegen::kernels::emit_int4_gemv_inner_token_cols_with_options(
+            w,
+            |r, c| {
+                if c == 0 {
+                    format!("acc_g{r}")
+                } else {
+                    format!("acc_u{r}")
+                }
+            },
+            |c| {
+                let buf = if c == 0 { gw } else { uw };
+                format!("in{buf} + out_idx_base * IN_WORDS")
+            },
+            |c| {
+                let buf = if c == 0 { gs } else { us };
+                format!("in{buf} + out_idx_base * N_GROUPS")
+            },
+            |c| {
+                let buf = if c == 0 { gb } else { ub };
+                format!("in{buf} + out_idx_base * N_GROUPS")
+            },
+            "HIDDEN",
+            bits,
+            group_size,
+            token_rows_per_sg,
+            2,
+            crate::codegen::kernels::qgemv_unroll2_default_for_shape(
+                bits,
+                hidden as u32,
+                out_dim as u32,
+            ),
+            |r, kk| {
+                let expr = round_scalar_to_act_expr(
+                    t,
+                    &format!(
+                        "float(in{x_buf}[(row_base + {r}u) * HIDDEN + {kk}]) * rms_scale{r} * float(in{w_rms_buf}[{kk}])"
+                    ),
+                );
+                if full_token_blocks {
+                    expr
+                } else {
+                    format!("((row_base + {r}u < ROWS) ? ({expr}) : 0.0f)")
+                }
+            },
+        );
+        for r in 0..token_rows_per_sg {
+            w.line(format!("acc_g{r} = simd_sum(acc_g{r});"));
+            w.line(format!("acc_u{r} = simd_sum(acc_u{r});"));
+        }
+        w.line("if (simd_lane == 0u) {");
+        w.push_indent();
+        for r in 0..token_rows_per_sg {
+            if !full_token_blocks {
+                w.line(format!("if (row_base + {r}u < ROWS) {{"));
+                w.push_indent();
+            }
+            w.line("{");
+            w.push_indent();
+            w.line(format!("{t} gate_v = {t}(acc_g{r});"));
+            w.line(format!("{t} up_v = {t}(acc_u{r});"));
+            w.line(format!("{t} one_v = {t}(1.0f);"));
+            w.line(format!(
+                "{t} sig_y = one_v / (one_v + metal::exp(metal::abs(gate_v)));"
+            ));
+            w.line(format!(
+                "{t} sig_v = (gate_v < {t}(0.0f)) ? sig_y : {t}(one_v - sig_y);"
+            ));
+            w.line(format!("{t} silu_v = {t}(gate_v * sig_v);"));
+            w.line(format!(
+                "out0[(row_base + {r}u) * OUT_DIM + out_idx_base] = {t}(silu_v * up_v);"
+            ));
+            w.pop_indent();
+            w.line("}");
+            if !full_token_blocks {
+                w.pop_indent();
+                w.line("}");
+            }
+        }
+        w.pop_indent();
+        w.line("}");
+        w.pop_indent();
+        w.line("}");
+        w.blank();
+        return Ok(());
+    }
+
+    let norm_ty = chain_norm_smem_ty_for_quant_bits(t, bits);
+    w.line(format!("threadgroup {norm_ty} norm_y[HIDDEN];"));
+    w.line("threadgroup float reduce_buf[32];");
+    w.line("uint tgs_per_row = max(tpg / ROWS, 1u);");
     w.line("uint row       = gid / tgs_per_row;");
     w.line("uint tg_in_row = gid - row * tgs_per_row;");
     w.line("if (row >= ROWS) return;");
@@ -1480,7 +2354,10 @@ fn emit_reduction_swiglu_absorb_chain(
         w.line("for (uint i = tid; i < HIDDEN; i += tg_size) {");
         w.push_indent();
         w.line(format!("float xi = float(in{x_buf}[row * HIDDEN + i]);"));
-        w.line("norm_y[i] = xi;");
+        w.line(format!(
+            "norm_y[i] = {};",
+            chain_norm_scalar_store_expr_for(norm_ty, "xi")
+        ));
         w.line("sum_sq += xi * xi;");
         w.pop_indent();
         w.line("}");
@@ -1491,11 +2368,16 @@ fn emit_reduction_swiglu_absorb_chain(
         w.line(format!(
             "device const {t}4* x4 = (device const {t}4*)(in{x_buf} + row * HIDDEN);"
         ));
-        w.line("threadgroup float4* ny4_init = (threadgroup float4*)norm_y;");
+        w.line(format!(
+            "threadgroup {norm_ty}4* ny4_init = (threadgroup {norm_ty}4*)norm_y;"
+        ));
         w.line("for (uint i = tid; i < HIDDEN4; i += tg_size) {");
         w.push_indent();
         w.line("float4 xv = float4(x4[i]);");
-        w.line("ny4_init[i] = xv;");
+        w.line(format!(
+            "ny4_init[i] = {};",
+            chain_norm_vec_store_expr_for(norm_ty, "xv")
+        ));
         w.line("sum_sq += dot(xv, xv);");
         w.pop_indent();
         w.line("}");
@@ -1505,7 +2387,10 @@ fn emit_reduction_swiglu_absorb_chain(
         w.line("for (uint i = tid; i < HIDDEN; i += tg_size) {");
         w.push_indent();
         w.line(format!("float xi = float(in{x_buf}[row * HIDDEN + i]);"));
-        w.line("norm_y[i] = xi;");
+        w.line(format!(
+            "norm_y[i] = {};",
+            chain_norm_scalar_store_expr_for(norm_ty, "xi")
+        ));
         w.line("sum_sq += xi * xi;");
         w.pop_indent();
         w.line("}");
@@ -1530,12 +2415,18 @@ fn emit_reduction_swiglu_absorb_chain(
     w.line(format!(
         "device const {t}4* w4 = (device const {t}4*)(in{w_rms_buf});"
     ));
-    w.line("threadgroup float4* ny4 = (threadgroup float4*)norm_y;");
+    w.line(format!(
+        "threadgroup {norm_ty}4* ny4 = (threadgroup {norm_ty}4*)norm_y;"
+    ));
     w.line("for (uint i = tid; i < HIDDEN4; i += tg_size) {");
     w.push_indent();
     w.line(format!(
         "ny4[i] = {};",
-        round_vec4_to_act_expr(t, "ny4[i] * rms_scale * float4(w4[i])")
+        chain_norm_vec_store_rounded_expr_for(
+            norm_ty,
+            t,
+            "float4(ny4[i]) * rms_scale * float4(w4[i])"
+        )
     ));
     w.pop_indent();
     w.line("}");
@@ -1546,9 +2437,10 @@ fn emit_reduction_swiglu_absorb_chain(
     w.push_indent();
     w.line(format!(
         "norm_y[i] = {};",
-        round_scalar_to_act_expr(
+        chain_norm_scalar_store_rounded_expr_for(
+            norm_ty,
             t,
-            &format!("norm_y[i] * rms_scale * float(in{w_rms_buf}[i])")
+            &format!("float(norm_y[i]) * rms_scale * float(in{w_rms_buf}[i])")
         )
     ));
     w.pop_indent();
@@ -1559,12 +2451,9 @@ fn emit_reduction_swiglu_absorb_chain(
     w.blank();
 
     // Stage 3: per-SG dual GEMV → SwiGLU in register → 1 write.
-    w.line("uint out_idx_base = (tg_in_row * sgs_per_tg + simd_id) * ROWS_PER_SG;");
-    w.line("if (out_idx_base >= OUT_DIM) return;");
-    for r in 0..rows_per_sg {
-        w.line(format!("float acc_g{r} = 0.0f;"));
-        w.line(format!("float acc_u{r} = 0.0f;"));
-    }
+    // The stride loop lets a capped dispatch reuse the normalized row
+    // across multiple output strips. With the default exact dispatch the
+    // loop has one iteration, preserving the old schedule.
     w.line(format!("constexpr uint BITS  = {bits}u;"));
     w.line(format!("constexpr uint GROUP = {group_size}u;"));
     w.line(format!("constexpr uint LANES = {lanes_per_word}u;"));
@@ -1578,6 +2467,28 @@ fn emit_reduction_swiglu_absorb_chain(
     let uw_cap = uw;
     let us_cap = us;
     let ub_cap = ub;
+    let emit_dual_row_fallback = |w: &mut MslWriter| {
+        emit_dual_qgemv_inner_with_unroll2_default(
+            w,
+            "acc_g0",
+            "acc_u0",
+            &format!("in{gw_cap} + out_idx_base * IN_WORDS"),
+            &format!("in{gs_cap} + out_idx_base * N_GROUPS"),
+            &format!("in{gb_cap} + out_idx_base * N_GROUPS"),
+            &format!("in{uw_cap} + out_idx_base * IN_WORDS"),
+            &format!("in{us_cap} + out_idx_base * N_GROUPS"),
+            &format!("in{ub_cap} + out_idx_base * N_GROUPS"),
+            "HIDDEN",
+            bits,
+            group_size,
+            crate::codegen::kernels::qgemv_unroll2_default_for_shape(
+                bits,
+                hidden as u32,
+                out_dim as u32,
+            ),
+            |off| format!("norm_y[{off}]"),
+        );
+    };
     let emit_single_row_fallback = |w: &mut MslWriter| {
         crate::codegen::kernels::emit_int4_gemv_inner_with_unroll2_default(
             w,
@@ -1617,24 +2528,51 @@ fn emit_reduction_swiglu_absorb_chain(
         6 => 4,
         _ => 32 / bits.max(1),
     };
-    let packs_per_thread = if bits == 2 { 1 } else { 2 };
+    let packs_per_thread = crate::codegen::kernels::qmv_fast_tg2_packs_per_thread(bits)
+        .unwrap_or_else(|| if bits == 2 { 1 } else { 2 });
     let block_size = pack_factor * packs_per_thread * 32;
     let use_mlx_tg_qmv = group_size == 64
         && matches!(bits, 2 | 3 | 4 | 5 | 6 | 8)
         && (hidden as u32) % block_size == 0;
+    let use_mlx_tg_qmv_tail = std::env::var("FUSEKIT_FUSEDCHAIN_TG_QMV_TAIL").as_deref() == Ok("1")
+        && group_size == 64
+        && matches!(bits, 4 | 8)
+        && (hidden as u32) % block_size != 0;
+    w.line("uint sg_global = tg_in_row * sgs_per_tg + simd_id;");
+    w.line("uint sg_stride = tgs_per_row * sgs_per_tg;");
+    w.line("for (uint out_idx_base = sg_global * ROWS_PER_SG;");
+    w.line("     out_idx_base < OUT_DIM;");
+    w.line("     out_idx_base += sg_stride * ROWS_PER_SG) {");
+    w.push_indent();
+    for r in 0..rows_per_sg {
+        w.line(format!("float acc_g{r} = 0.0f;"));
+        w.line(format!("float acc_u{r} = 0.0f;"));
+    }
+
     if rows_per_sg <= 1 {
-        if use_mlx_tg_qmv {
+        if use_mlx_tg_qmv || use_mlx_tg_qmv_tail {
+            let helper = if use_mlx_tg_qmv_tail {
+                "fusekit_qmv_fast_tg2_partial_tail_impl"
+            } else {
+                "fusekit_qmv_fast_tg2_partial_impl"
+            };
             w.line("#if FUSEKIT_HAVE_MLX_NAX");
             w.push_indent();
             w.writeln(format_args!(
-                "fusekit_qmv_fast_tg2_partial_impl<{t}, {group_size}, {bits}>(in{gw_cap}, in{gs_cap}, in{gb_cap}, in{uw_cap}, in{us_cap}, in{ub_cap}, norm_y, HIDDEN, int(out_idx_base), simd_lane, &acc_g0, &acc_u0);"
+                "{helper}<{t}, {group_size}, {bits}>(in{gw_cap}, in{gs_cap}, in{gb_cap}, in{uw_cap}, in{us_cap}, in{ub_cap}, norm_y, HIDDEN, int(out_idx_base), simd_lane, &acc_g0, &acc_u0);"
             ));
             w.pop_indent();
             w.line("#else");
             w.push_indent();
-            emit_single_row_fallback(w);
+            if matches!(bits, 4 | 8) {
+                emit_dual_row_fallback(w);
+            } else {
+                emit_single_row_fallback(w);
+            }
             w.pop_indent();
             w.line("#endif");
+        } else if matches!(bits, 4 | 8) {
+            emit_dual_row_fallback(w);
         } else {
             emit_single_row_fallback(w);
         }
@@ -1670,8 +2608,8 @@ fn emit_reduction_swiglu_absorb_chain(
         w.line(format!("acc_g{r} = simd_sum(acc_g{r});"));
         w.line(format!("acc_u{r} = simd_sum(acc_u{r});"));
     }
-    w.line("if (simd_lane != 0u) return;");
-    w.blank();
+    w.line("if (simd_lane == 0u) {");
+    w.push_indent();
 
     // SwiGLU: silu(gate) * up = sigmoid(g) * g * u, written into out0.
     for r in 0..rows_per_sg {
@@ -1694,6 +2632,297 @@ fn emit_reduction_swiglu_absorb_chain(
         w.pop_indent();
         w.line("}");
     }
+    w.pop_indent();
+    w.line("}");
+    w.pop_indent();
+    w.line("}");
+
+    w.pop_indent();
+    w.line("}");
+    w.blank();
+    Ok(())
+}
+
+/// Dense (`Matmul`) sibling of `emit_reduction_swiglu_absorb_chain`.
+/// It preserves the same semantic lowering, but replaces quantized qMV
+/// with dense bf16/fp16 GEMV. The important part is structural: gate
+/// and up projections share the RMSNorm SMEM row, keep both accumulators
+/// in registers, apply SwiGLU immediately, and write only the activated
+/// MLP intermediate. That removes the separate gate/up materialization
+/// and pointwise activation pass for bf16 models.
+fn emit_reduction_dense_swiglu_absorb_chain(
+    fusion: &Fusion,
+    _steps: &[ChainStep],
+    meta: &ModelMeta,
+    w: &mut MslWriter,
+    fn_name: &str,
+    op_summary: &str,
+    x_buf: u32,
+    w_rms_buf: u32,
+    eps: f32,
+    hidden: i32,
+    rows: i32,
+    gate_w_buf: u32,
+    up_w_buf: u32,
+    out_dim: i32,
+) -> Result<()> {
+    let t = crate::codegen::kernels::act_ty(meta);
+    let n_inputs = fusion.inputs.len();
+
+    w.line(format!(
+        "// Fusion #{}: FusedChain (swiglu-absorbed-dense, ROWS={}, HIDDEN={}, OUT_DIM={}, chain: {})",
+        fusion.id, rows, hidden, out_dim, op_summary,
+    ));
+    w.line(format!("kernel void {fn_name}("));
+    w.push_indent();
+    for i in 0..n_inputs as u32 {
+        let ty = crate::codegen::kernels::scalar_ty_for_dtype(fusion.inputs[i as usize].dtype, t);
+        w.line(format!("device const {ty} *in{i} [[buffer({i})]],"));
+    }
+    let out_t = crate::codegen::kernels::scalar_ty_for_dtype(fusion.outputs[0].dtype, t);
+    w.line(format!(
+        "device {out_t}       *out0 [[buffer({})]],",
+        n_inputs
+    ));
+    w.line("uint tid     [[thread_position_in_threadgroup]],");
+    w.line("uint tg_size [[threads_per_threadgroup]],");
+    w.line("uint gid     [[threadgroup_position_in_grid]],");
+    w.line("uint tpg     [[threadgroups_per_grid]]");
+    w.pop_indent();
+    w.line(") {");
+    w.push_indent();
+    w.line(format!("constexpr uint HIDDEN  = {hidden};"));
+    w.line(format!("constexpr uint OUT_DIM = {out_dim};"));
+    w.line(format!("constexpr uint ROWS    = {rows};"));
+    w.line(format!("constexpr float EPS    = {eps};"));
+
+    let chip_rows =
+        crate::target::current_chip().dense_gemv_rows_per_simdgroup(hidden as u32, out_dim as u32);
+    let rows_per_sg =
+        if chip_rows > 1 && (out_dim as u32) >= chip_rows && (out_dim as u32) % chip_rows == 0 {
+            chip_rows
+        } else {
+            1
+        };
+    w.line(format!("constexpr uint ROWS_PER_SG = {rows_per_sg}u;"));
+    w.line("uint simd_lane  = tid % 32u;");
+    w.line("uint simd_id    = tid / 32u;");
+    w.line("uint sgs_per_tg = tg_size / 32u;");
+    let norm_ty = chain_norm_smem_ty(t);
+    w.line(format!("threadgroup {norm_ty} norm_y[HIDDEN];"));
+    w.line("threadgroup float reduce_buf[32];");
+    w.line("uint tgs_per_row = max(tpg / ROWS, 1u);");
+    w.line("uint row       = gid / tgs_per_row;");
+    w.line("uint tg_in_row = gid - row * tgs_per_row;");
+    w.line("if (row >= ROWS) return;");
+    w.blank();
+
+    w.line("float sum_sq = 0.0f;");
+    let rf_norm_scalar = std::env::var("FUSEKIT_RF_NORM_SCALAR").as_deref() == Ok("1");
+    if rf_norm_scalar {
+        w.line("for (uint i = tid; i < HIDDEN; i += tg_size) {");
+        w.push_indent();
+        w.line(format!("float xi = float(in{x_buf}[row * HIDDEN + i]);"));
+        w.line(format!(
+            "norm_y[i] = {};",
+            chain_norm_scalar_store_expr(t, "xi")
+        ));
+        w.line("sum_sq += xi * xi;");
+        w.pop_indent();
+        w.line("}");
+    } else {
+        w.line("if constexpr (HIDDEN % 4u == 0u) {");
+        w.push_indent();
+        w.line("constexpr uint HIDDEN4 = HIDDEN / 4u;");
+        w.line(format!(
+            "device const {t}4* x4 = (device const {t}4*)(in{x_buf} + row * HIDDEN);"
+        ));
+        w.line(format!(
+            "threadgroup {norm_ty}4* ny4_init = (threadgroup {norm_ty}4*)norm_y;"
+        ));
+        w.line("for (uint i = tid; i < HIDDEN4; i += tg_size) {");
+        w.push_indent();
+        w.line("float4 xv = float4(x4[i]);");
+        w.line(format!(
+            "ny4_init[i] = {};",
+            chain_norm_vec_store_expr(t, "xv")
+        ));
+        w.line("sum_sq += dot(xv, xv);");
+        w.pop_indent();
+        w.line("}");
+        w.pop_indent();
+        w.line("} else {");
+        w.push_indent();
+        w.line("for (uint i = tid; i < HIDDEN; i += tg_size) {");
+        w.push_indent();
+        w.line(format!("float xi = float(in{x_buf}[row * HIDDEN + i]);"));
+        w.line(format!(
+            "norm_y[i] = {};",
+            chain_norm_scalar_store_expr(t, "xi")
+        ));
+        w.line("sum_sq += xi * xi;");
+        w.pop_indent();
+        w.line("}");
+        w.pop_indent();
+        w.line("}");
+    }
+    w.line("sum_sq = simd_sum(sum_sq);");
+    w.line("if (simd_lane == 0u) reduce_buf[simd_id] = sum_sq;");
+    w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
+    w.line("if (simd_id == 0u) {");
+    w.push_indent();
+    w.line("float v = (tid < tg_size / 32u) ? reduce_buf[tid] : 0.0f;");
+    w.line("v = simd_sum(v);");
+    w.line("if (simd_lane == 0u) reduce_buf[0] = v;");
+    w.pop_indent();
+    w.line("}");
+    w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
+    w.line("float rms_scale = metal::precise::rsqrt(reduce_buf[0] / float(HIDDEN) + EPS);");
+    w.line("if constexpr (HIDDEN % 4u == 0u) {");
+    w.push_indent();
+    w.line("constexpr uint HIDDEN4 = HIDDEN / 4u;");
+    w.line(format!(
+        "device const {t}4* w4 = (device const {t}4*)(in{w_rms_buf});"
+    ));
+    w.line(format!(
+        "threadgroup {norm_ty}4* ny4 = (threadgroup {norm_ty}4*)norm_y;"
+    ));
+    w.line("for (uint i = tid; i < HIDDEN4; i += tg_size) {");
+    w.push_indent();
+    w.line(format!(
+        "ny4[i] = {};",
+        chain_norm_vec_store_rounded_expr(t, "float4(ny4[i]) * rms_scale * float4(w4[i])")
+    ));
+    w.pop_indent();
+    w.line("}");
+    w.pop_indent();
+    w.line("} else {");
+    w.push_indent();
+    w.line("for (uint i = tid; i < HIDDEN; i += tg_size) {");
+    w.push_indent();
+    w.line(format!(
+        "norm_y[i] = {};",
+        chain_norm_scalar_store_rounded_expr(
+            t,
+            &format!("float(norm_y[i]) * rms_scale * float(in{w_rms_buf}[i])")
+        )
+    ));
+    w.pop_indent();
+    w.line("}");
+    w.pop_indent();
+    w.line("}");
+    w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
+    w.blank();
+
+    w.line("uint sg_global = tg_in_row * sgs_per_tg + simd_id;");
+    w.line("uint sg_stride = tgs_per_row * sgs_per_tg;");
+    w.line("for (uint out_idx_base = sg_global * ROWS_PER_SG;");
+    w.line("     out_idx_base < OUT_DIM;");
+    w.line("     out_idx_base += sg_stride * ROWS_PER_SG) {");
+    w.push_indent();
+    for r in 0..rows_per_sg {
+        w.line(format!("float acc_g{r} = 0.0f;"));
+        w.line(format!("float acc_u{r} = 0.0f;"));
+    }
+    if rows_per_sg <= 1 {
+        w.line("{");
+        w.push_indent();
+        emit_chain_dense_matmul(
+            w,
+            t,
+            gate_w_buf,
+            "out_idx_base",
+            "acc_g0",
+            hidden as u32,
+            false,
+            out_dim as u32,
+            "OUT_DIM",
+        );
+        w.pop_indent();
+        w.line("}");
+        w.line("{");
+        w.push_indent();
+        emit_chain_dense_matmul(
+            w,
+            t,
+            up_w_buf,
+            "out_idx_base",
+            "acc_u0",
+            hidden as u32,
+            false,
+            out_dim as u32,
+            "OUT_DIM",
+        );
+        w.pop_indent();
+        w.line("}");
+    } else {
+        w.line("{");
+        w.push_indent();
+        emit_chain_dense_matmul_multirow_named(
+            w,
+            t,
+            gate_w_buf,
+            "out_idx_base",
+            "acc_g",
+            rows_per_sg,
+            hidden as u32,
+            false,
+            out_dim as u32,
+            "OUT_DIM",
+        );
+        w.pop_indent();
+        w.line("}");
+        w.line("{");
+        w.push_indent();
+        emit_chain_dense_matmul_multirow_named(
+            w,
+            t,
+            up_w_buf,
+            "out_idx_base",
+            "acc_u",
+            rows_per_sg,
+            hidden as u32,
+            false,
+            out_dim as u32,
+            "OUT_DIM",
+        );
+        w.pop_indent();
+        w.line("}");
+    }
+    for r in 0..rows_per_sg {
+        w.line(format!("acc_g{r} = simd_sum(acc_g{r});"));
+        w.line(format!("acc_u{r} = simd_sum(acc_u{r});"));
+    }
+    w.line("if (simd_lane == 0u) {");
+    w.push_indent();
+    for r in 0..rows_per_sg {
+        w.line("{");
+        w.push_indent();
+        w.line(format!("uint out_idx = out_idx_base + {r}u;"));
+        w.line("if (out_idx < OUT_DIM) {");
+        w.push_indent();
+        w.line(format!("{t} gate_v = {t}(acc_g{r});"));
+        w.line(format!("{t} up_v = {t}(acc_u{r});"));
+        w.line(format!("{t} one_v = {t}(1.0f);"));
+        w.line(format!(
+            "{t} sig_y = one_v / (one_v + metal::exp(metal::abs(gate_v)));"
+        ));
+        w.line(format!(
+            "{t} sig_v = (gate_v < {t}(0.0f)) ? sig_y : {t}(one_v - sig_y);"
+        ));
+        w.line(format!("{t} silu_v = {t}(gate_v * sig_v);"));
+        w.line(format!(
+            "out0[row * OUT_DIM + out_idx] = {t}(silu_v * up_v);"
+        ));
+        w.pop_indent();
+        w.line("}");
+        w.pop_indent();
+        w.line("}");
+    }
+    w.pop_indent();
+    w.line("}");
+    w.pop_indent();
+    w.line("}");
 
     w.pop_indent();
     w.line("}");
@@ -1731,8 +2960,8 @@ fn emit_reduction_fanout_chain(
         && steps[3].op_name == "Sigmoid"
         && steps[4].op_name == "Multiply"
         && steps[5].op_name == "Multiply"
-        && steps[1].op_name == "QuantizedMatmul"
-        && steps[2].op_name == "QuantizedMatmul"
+        && ((steps[1].op_name == "QuantizedMatmul" && steps[2].op_name == "QuantizedMatmul")
+            || (steps[1].op_name == "Matmul" && steps[2].op_name == "Matmul"))
     {
         let (x_buf_a, w_rms_buf_a) = match (head.inputs[0], head.inputs[1]) {
             (
@@ -1751,43 +2980,74 @@ fn emit_reduction_fanout_chain(
             .active_rows_before_last(&head_out_a)
             .min(i32::MAX as u64) as i32;
         let out_dim_a = *steps[1].output_shape.last().unwrap();
-        let extract_qm = |s: &ChainStep| -> Result<(u32, u32, u32, u32, u32)> {
-            if s.inputs.len() != 4 {
-                bail!("swiglu absorb: QM step expects 4 operands");
-            }
-            let resolve = |idx: usize| -> Result<u32> {
-                match s.inputs[idx] {
+        if steps[1].op_name == "QuantizedMatmul" {
+            let extract_qm = |s: &ChainStep| -> Result<(u32, u32, u32, u32, u32)> {
+                if s.inputs.len() != 4 {
+                    bail!("swiglu absorb: QM step expects 4 operands");
+                }
+                let resolve = |idx: usize| -> Result<u32> {
+                    match s.inputs[idx] {
+                        ChainOperand::External { buffer_index } => Ok(buffer_index),
+                        _ => bail!("swiglu absorb: QM weights must be External"),
+                    }
+                };
+                let w_buf = resolve(1)?;
+                let s_buf = resolve(2)?;
+                let b_buf = resolve(3)?;
+                let (bits, gs) = match s.op_attrs {
+                    crate::graph::Attrs::Quantized { bits, group_size } => (bits, group_size),
+                    _ => (4u32, 64u32),
+                };
+                Ok((w_buf, s_buf, b_buf, bits, gs))
+            };
+            let qm_g = extract_qm(&steps[1])?;
+            let qm_u = extract_qm(&steps[2])?;
+            return emit_reduction_swiglu_absorb_chain(
+                fusion,
+                steps,
+                meta,
+                w,
+                fn_name,
+                op_summary,
+                x_buf_a,
+                w_rms_buf_a,
+                eps_a,
+                hidden_a,
+                rows_a,
+                qm_g,
+                qm_u,
+                out_dim_a,
+            );
+        }
+        if steps[1].op_name == "Matmul" && steps[2].op_name == "Matmul" {
+            let extract_dense_w = |s: &ChainStep| -> Result<u32> {
+                if s.inputs.len() < 2 {
+                    bail!("swiglu dense absorb: Matmul step expects 2 operands");
+                }
+                match s.inputs[1] {
                     ChainOperand::External { buffer_index } => Ok(buffer_index),
-                    _ => bail!("swiglu absorb: QM weights must be External"),
+                    _ => bail!("swiglu dense absorb: Matmul weight must be External"),
                 }
             };
-            let w_buf = resolve(1)?;
-            let s_buf = resolve(2)?;
-            let b_buf = resolve(3)?;
-            let (bits, gs) = match s.op_attrs {
-                crate::graph::Attrs::Quantized { bits, group_size } => (bits, group_size),
-                _ => (4u32, 64u32),
-            };
-            Ok((w_buf, s_buf, b_buf, bits, gs))
-        };
-        let qm_g = extract_qm(&steps[1])?;
-        let qm_u = extract_qm(&steps[2])?;
-        return emit_reduction_swiglu_absorb_chain(
-            fusion,
-            steps,
-            meta,
-            w,
-            fn_name,
-            op_summary,
-            x_buf_a,
-            w_rms_buf_a,
-            eps_a,
-            hidden_a,
-            rows_a,
-            qm_g,
-            qm_u,
-            out_dim_a,
-        );
+            let gate_w = extract_dense_w(&steps[1])?;
+            let up_w = extract_dense_w(&steps[2])?;
+            return emit_reduction_dense_swiglu_absorb_chain(
+                fusion,
+                steps,
+                meta,
+                w,
+                fn_name,
+                op_summary,
+                x_buf_a,
+                w_rms_buf_a,
+                eps_a,
+                hidden_a,
+                rows_a,
+                gate_w,
+                up_w,
+                out_dim_a,
+            );
+        }
     }
     let (x_buf, w_rms_buf) = match (head.inputs[0], head.inputs[1]) {
         (
@@ -2148,6 +3408,15 @@ fn emit_reduction_fanout_chain(
             let packed_row = format!("in{} + out_idx_base * IN_WORDS_{k}", h.w_buf);
             let scales_row = format!("in{} + out_idx_base * N_GROUPS_{k}", s_buf);
             let biases_row = format!("in{} + out_idx_base * N_GROUPS_{k}", b_buf);
+            let x_expr = |r, kk: &str| {
+                if full_token_blocks {
+                    format!("(float(in{x_buf}[(row_base + {r}u) * HIDDEN + {kk}]) * rms_scale{r} * float(in{w_rms_buf}[{kk}]))")
+                } else {
+                    format!(
+                        "((row_base + {r}u < ACTIVE_ROWS) ? (float(in{x_buf}[(row_base + {r}u) * HIDDEN + {kk}]) * rms_scale{r} * float(in{w_rms_buf}[{kk}])) : 0.0f)"
+                    )
+                }
+            };
             crate::codegen::kernels::emit_int4_gemv_inner_token_rows_with_options(
                 w,
                 |r| format!("acc{r}"),
@@ -2163,15 +3432,7 @@ fn emit_reduction_fanout_chain(
                     hidden as u32,
                     h.out_dim as u32,
                 ),
-                |r, kk| {
-                    if full_token_blocks {
-                        format!("(float(in{x_buf}[(row_base + {r}u) * HIDDEN + {kk}]) * rms_scale{r} * float(in{w_rms_buf}[{kk}]))")
-                    } else {
-                        format!(
-                            "((row_base + {r}u < ACTIVE_ROWS) ? (float(in{x_buf}[(row_base + {r}u) * HIDDEN + {kk}]) * rms_scale{r} * float(in{w_rms_buf}[{kk}])) : 0.0f)"
-                        )
-                    }
-                },
+                x_expr,
             );
             for r in 0..token_fanout_m_rows {
                 w.line(format!("acc{r} = simd_sum(acc{r});"));
@@ -2208,7 +3469,11 @@ fn emit_reduction_fanout_chain(
         return Ok(());
     }
 
-    w.line("threadgroup float norm_y[HIDDEN];");
+    let all_q8_heavies = heavies
+        .iter()
+        .all(|h| h.qm.map(|(_, _, bits, _)| bits == 8).unwrap_or(false));
+    let norm_ty = chain_norm_smem_ty_for_quant_bits(t, if all_q8_heavies { 8 } else { 0 });
+    w.line(format!("threadgroup {norm_ty} norm_y[HIDDEN];"));
     w.line("threadgroup float reduce_buf[32];");
     w.line("uint tgs_per_row = max(tpg / ACTIVE_ROWS, 1u);");
     w.line("uint row       = gid / tgs_per_row;");
@@ -2233,11 +3498,16 @@ fn emit_reduction_fanout_chain(
     w.line(format!(
         "device const {t}4* x4 = (device const {t}4*)(in{x_buf} + row * HIDDEN);"
     ));
-    w.line("threadgroup float4* ny4_init = (threadgroup float4*)norm_y;");
+    w.line(format!(
+        "threadgroup {norm_ty}4* ny4_init = (threadgroup {norm_ty}4*)norm_y;"
+    ));
     w.line("for (uint i = tid; i < HIDDEN4; i += tg_size) {");
     w.push_indent();
     w.line("float4 xv = float4(x4[i]);");
-    w.line("ny4_init[i] = xv;");
+    w.line(format!(
+        "ny4_init[i] = {};",
+        chain_norm_vec_store_expr_for(norm_ty, "xv")
+    ));
     w.line("sum_sq += dot(xv, xv);");
     w.pop_indent();
     w.line("}");
@@ -2247,7 +3517,10 @@ fn emit_reduction_fanout_chain(
     w.line("for (uint i = tid; i < HIDDEN; i += tg_size) {");
     w.push_indent();
     w.line(format!("float xi = float(in{x_buf}[row * HIDDEN + i]);"));
-    w.line("norm_y[i] = xi;");
+    w.line(format!(
+        "norm_y[i] = {};",
+        chain_norm_scalar_store_expr_for(norm_ty, "xi")
+    ));
     w.line("sum_sq += xi * xi;");
     w.pop_indent();
     w.line("}");
@@ -2272,12 +3545,18 @@ fn emit_reduction_fanout_chain(
     w.line(format!(
         "device const {t}4* w4 = (device const {t}4*)(in{w_rms_buf});"
     ));
-    w.line("threadgroup float4* ny4 = (threadgroup float4*)norm_y;");
+    w.line(format!(
+        "threadgroup {norm_ty}4* ny4 = (threadgroup {norm_ty}4*)norm_y;"
+    ));
     w.line("for (uint i = tid; i < HIDDEN4; i += tg_size) {");
     w.push_indent();
     w.line(format!(
         "ny4[i] = {};",
-        round_vec4_to_act_expr(t, "ny4[i] * rms_scale * float4(w4[i])")
+        chain_norm_vec_store_rounded_expr_for(
+            norm_ty,
+            t,
+            "float4(ny4[i]) * rms_scale * float4(w4[i])"
+        )
     ));
     w.pop_indent();
     w.line("}");
@@ -2288,9 +3567,10 @@ fn emit_reduction_fanout_chain(
     w.push_indent();
     w.line(format!(
         "norm_y[i] = {};",
-        round_scalar_to_act_expr(
+        chain_norm_scalar_store_rounded_expr_for(
+            norm_ty,
             t,
-            &format!("norm_y[i] * rms_scale * float(in{w_rms_buf}[i])")
+            &format!("float(norm_y[i]) * rms_scale * float(in{w_rms_buf}[i])")
         )
     ));
     w.pop_indent();
@@ -2326,6 +3606,7 @@ fn emit_reduction_fanout_chain(
         1
     };
     w.line(format!("constexpr uint ROWS_PER_SG = {rows_per_sg}u;"));
+
     w.line("uint sg_global = tg_in_row * sgs_per_tg + simd_id;");
     w.line("uint sg_stride = tgs_per_row * sgs_per_tg;");
     w.line("for (uint flat_out_base = sg_global * ROWS_PER_SG;");
@@ -2333,7 +3614,6 @@ fn emit_reduction_fanout_chain(
     w.line("     flat_out_base += sg_stride * ROWS_PER_SG) {");
     w.push_indent();
 
-    // Emit one range branch per Heavy step.
     let mut cum: i32 = 0;
     for (k, h) in heavies.iter().enumerate() {
         let lo = cum;
@@ -2360,6 +3640,7 @@ fn emit_reduction_fanout_chain(
                         "acc0",
                         hidden as u32,
                         virtual_transposed,
+                        h.out_dim as u32,
                         &out_dim_expr,
                     );
                 } else {
@@ -2371,6 +3652,7 @@ fn emit_reduction_fanout_chain(
                         rows_per_sg,
                         hidden as u32,
                         virtual_transposed,
+                        h.out_dim as u32,
                         &out_dim_expr,
                     );
                 }
@@ -2387,6 +3669,7 @@ fn emit_reduction_fanout_chain(
                         "acc0",
                         hidden as u32,
                         virtual_transposed,
+                        h.out_dim as u32,
                         &out_dim_expr,
                     );
                 } else {
@@ -2398,6 +3681,7 @@ fn emit_reduction_fanout_chain(
                         rows_per_sg,
                         hidden as u32,
                         virtual_transposed,
+                        h.out_dim as u32,
                         &out_dim_expr,
                     );
                 }
@@ -2536,7 +3820,6 @@ fn emit_reduction_fanout_chain(
         w.pop_indent();
         w.line("}");
     }
-
     w.pop_indent();
     w.line("}");
     w.pop_indent();
@@ -2683,7 +3966,8 @@ fn emit_reduction_then_heavy_chain(
     w.line(format!("constexpr uint ROWS    = {rows};"));
     w.line(format!("constexpr uint ACTIVE_ROWS = {active_rows};"));
     w.line(format!("constexpr float EPS    = {eps};"));
-    w.line("threadgroup float norm_y[HIDDEN];");
+    let norm_ty = chain_norm_smem_ty(t);
+    w.line(format!("threadgroup {norm_ty} norm_y[HIDDEN];"));
     w.line("threadgroup float reduce_buf[32];");
     // Chip-aware multi-row coalesce: each simdgroup owns
     // ROWS_PER_SG consecutive output rows of the Heavy step. Shares
@@ -2727,11 +4011,16 @@ fn emit_reduction_then_heavy_chain(
     w.line(format!(
         "device const {t}4* x4 = (device const {t}4*)(in{x_buf} + row * HIDDEN);"
     ));
-    w.line("threadgroup float4* ny4_init = (threadgroup float4*)norm_y;");
+    w.line(format!(
+        "threadgroup {norm_ty}4* ny4_init = (threadgroup {norm_ty}4*)norm_y;"
+    ));
     w.line("for (uint i = tid; i < HIDDEN4; i += tg_size) {");
     w.push_indent();
     w.line("float4 xv = float4(x4[i]);");
-    w.line("ny4_init[i] = xv;");
+    w.line(format!(
+        "ny4_init[i] = {};",
+        chain_norm_vec_store_expr(t, "xv")
+    ));
     w.line("sum_sq += dot(xv, xv);");
     w.pop_indent();
     w.line("}");
@@ -2741,7 +4030,10 @@ fn emit_reduction_then_heavy_chain(
     w.line("for (uint i = tid; i < HIDDEN; i += tg_size) {");
     w.push_indent();
     w.line(format!("float xi = float(in{x_buf}[row * HIDDEN + i]);"));
-    w.line("norm_y[i] = xi;");
+    w.line(format!(
+        "norm_y[i] = {};",
+        chain_norm_scalar_store_expr(t, "xi")
+    ));
     w.line("sum_sq += xi * xi;");
     w.pop_indent();
     w.line("}");
@@ -2767,12 +4059,14 @@ fn emit_reduction_then_heavy_chain(
     w.line(format!(
         "device const {t}4* w4 = (device const {t}4*)(in{w_rms_buf});"
     ));
-    w.line("threadgroup float4* ny4 = (threadgroup float4*)norm_y;");
+    w.line(format!(
+        "threadgroup {norm_ty}4* ny4 = (threadgroup {norm_ty}4*)norm_y;"
+    ));
     w.line("for (uint i = tid; i < HIDDEN4; i += tg_size) {");
     w.push_indent();
     w.line(format!(
         "ny4[i] = {};",
-        round_vec4_to_act_expr(t, "ny4[i] * rms_scale * float4(w4[i])")
+        chain_norm_vec_store_rounded_expr(t, "float4(ny4[i]) * rms_scale * float4(w4[i])")
     ));
     w.pop_indent();
     w.line("}");
@@ -2783,9 +4077,9 @@ fn emit_reduction_then_heavy_chain(
     w.push_indent();
     w.line(format!(
         "norm_y[i] = {};",
-        round_scalar_to_act_expr(
+        chain_norm_scalar_store_rounded_expr(
             t,
-            &format!("norm_y[i] * rms_scale * float(in{w_rms_buf}[i])")
+            &format!("float(norm_y[i]) * rms_scale * float(in{w_rms_buf}[i])")
         )
     ));
     w.pop_indent();
@@ -2824,10 +4118,12 @@ fn emit_reduction_then_heavy_chain(
                 "device const {t}4* W4_{r} = (device const {t}4*)(in{w_buf} + (out_idx_base + {r}u) * HIDDEN);"
             ));
         }
-        w.line("threadgroup float4* ny4 = (threadgroup float4*)norm_y;");
+        w.line(format!(
+            "threadgroup {norm_ty}4* ny4 = (threadgroup {norm_ty}4*)norm_y;"
+        ));
         w.line("for (uint k4 = simd_lane; k4 < HIDDEN / 4u; k4 += 32u) {");
         w.push_indent();
-        w.line("float4 xv = ny4[k4];");
+        w.line("float4 xv = float4(ny4[k4]);");
         for r in 0..rows_per_sg {
             w.line(format!("acc{r} += dot(xv, float4(W4_{r}[k4]));"));
         }

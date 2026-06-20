@@ -84,12 +84,88 @@ fn ceil_div_u64(n: u64, d: u64) -> u64 {
     n.saturating_add(d.saturating_sub(1)) / d.max(1)
 }
 
+pub fn qmv_m_qdot_default(bits: u32) -> bool {
+    // M-row qMV carries one accumulator set per active token row. q8 benefits
+    // from MLX's compact qdot helper in that register-pressure regime; q4 has
+    // measured better with the explicit unpack body in fused decode chains.
+    matches!(bits, 8)
+}
+
+pub fn qmv_fast_qdot_default(bits: u32) -> bool {
+    // This is the shared default for standalone/fused qMV helper kernels.
+    // It is selected from quant metadata, not model names. q4 stays explicit
+    // because fused-chain decode profiles show the qdot affine regrouping
+    // increases live ranges there; q8 keeps qdot for the helper kernels.
+    match bits {
+        4 => false,
+        5 | 6 | 8 => true,
+        _ => true,
+    }
+}
+
+pub fn qmv_fast_residual_qdot_default(bits: u32) -> bool {
+    matches!(
+        (crate::target::current_chip(), bits),
+        (crate::target::ChipModel::M5, 8)
+    )
+}
+
+pub fn qmv_fast_qparam_broadcast_default(bits: u32) -> bool {
+    // q8/group_size=64 reuses one scale/bias pair across eight lanes. The
+    // broadcast saves repeated qparam loads in residual/fanout qMV helpers.
+    // q4's packed-word reuse has measured better without the shuffle.
+    bits == 8
+}
+
+pub fn qmv_fast_packs_per_thread_default(bits: u32) -> Option<u32> {
+    match bits {
+        2 => Some(1),
+        3 | 4 | 5 | 6 | 8 => Some(2),
+        _ => None,
+    }
+}
+
+pub fn qmv_fast_tg2_packs_per_thread_default(bits: u32) -> Option<u32> {
+    match bits {
+        8 if matches!(crate::target::current_chip(), crate::target::ChipModel::M5) => Some(4),
+        _ => qmv_fast_packs_per_thread_default(bits),
+    }
+}
+
+pub fn qmv_fast_tg2_packs_per_thread(bits: u32) -> Option<u32> {
+    let default = qmv_fast_tg2_packs_per_thread_default(bits)?;
+    if bits == 2 {
+        return Some(default);
+    }
+    Some(
+        std::env::var(format!("FUSEKIT_QMV_FAST_TG2_PACKS_Q{bits}"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .filter(|&n| matches!(n, 1 | 2 | 4))
+            .unwrap_or(default),
+    )
+}
+
+pub fn qmv_fast_packs_per_thread(bits: u32) -> Option<u32> {
+    let default = qmv_fast_packs_per_thread_default(bits)?;
+    if bits == 2 {
+        return Some(default);
+    }
+    Some(
+        std::env::var(format!("FUSEKIT_QMV_FAST_PACKS_Q{bits}"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .filter(|&n| matches!(n, 1 | 2 | 4))
+            .unwrap_or(default),
+    )
+}
+
 pub fn mtp_token_m_qgemv_enabled() -> bool {
     !env_bool_off("FUSEKIT_MTP_TOKEN2_QGEMV")
 }
 
 pub fn mtp_token_m_reduction_fanout_enabled() -> bool {
-    env_bool_on("FUSEKIT_MTP_TOKEN2_REDUCTION_FANOUT")
+    !env_bool_off("FUSEKIT_MTP_TOKEN2_REDUCTION_FANOUT")
 }
 
 pub fn qmv_fanout_pair2_compatible(
@@ -120,7 +196,7 @@ pub fn qmv_fanout_pair2_compatible(
 }
 
 fn qmv_fanout_pair2_large_decode_pressure(t: crate::fusion::ir::QmvFanoutTarget) -> bool {
-    t.active_rows <= 1 && t.group_size == 64 && matches!(t.bits, 4 | 5 | 6 | 8) && t.k_dim >= 1024
+    t.active_rows <= 1 && t.group_size == 64 && matches!(t.bits, 4 | 5 | 6) && t.k_dim >= 1024
 }
 
 pub fn qmv_fanout_pair2_m_compatible(
@@ -180,6 +256,18 @@ pub fn qmv_fanout_exact_pair2_compatible(
         && a.group_size == b.group_size
 }
 
+pub fn qmv_fanout_emit_exact(targets: &[crate::fusion::ir::QmvFanoutTarget]) -> bool {
+    qmv_fanout_exact_enabled()
+        || targets.iter().any(|target| {
+            !qmv_fast_shape_is_tail_free(
+                target.k_dim,
+                target.out_dim,
+                target.active_rows,
+                target.bits,
+            )
+        })
+}
+
 pub fn qmv_exact_simdgroups() -> u32 {
     std::env::var("FUSEKIT_QMV_EXACT_SGS")
         .ok()
@@ -212,8 +300,8 @@ pub fn qmv_fanout_exact_cols_per_threadgroup() -> u32 {
     qmv_exact_cols_per_threadgroup()
 }
 
-pub fn qmv_fanout_target_y_tiles(target: crate::fusion::ir::QmvFanoutTarget) -> u64 {
-    if qmv_fanout_exact_enabled() {
+fn qmv_fanout_target_y_tiles_exact(target: crate::fusion::ir::QmvFanoutTarget, exact: bool) -> u64 {
+    if exact {
         return ceil_div_u64(
             target.out_dim as u64,
             qmv_fanout_exact_cols_per_threadgroup() as u64,
@@ -226,6 +314,10 @@ pub fn qmv_fanout_target_y_tiles(target: crate::fusion::ir::QmvFanoutTarget) -> 
         target.out_dim,
     ) as u64;
     ceil_div_u64(target.out_dim as u64, cols_per_tg)
+}
+
+pub fn qmv_fanout_target_y_tiles(target: crate::fusion::ir::QmvFanoutTarget) -> u64 {
+    qmv_fanout_target_y_tiles_exact(target, qmv_fanout_exact_enabled())
 }
 
 fn qmv_fanout_homogeneous_q4_cols_per_simdgroup(
@@ -264,11 +356,11 @@ fn qmv_fanout_homogeneous_q4_cols_per_simdgroup(
                 && first.active_rows <= 1
                 && first.out_dim <= 16_384
             {
-                // M5 q4 decode fanouts are still register-pressure
-                // sensitive, but cols/sg=2 launches enough extra tiles to
-                // lose at the full decode-chain level even when an isolated
-                // kernel profile looks better. cols/sg=4 is the fastest
-                // verified point for this small-M homogeneous fanout class.
+                // M5 q4 decode fanouts are register-pressure sensitive in
+                // the full decode chain. Four columns per simdgroup is the
+                // verified point for this homogeneous fanout class; lower
+                // values can help isolated kernels but have not held up
+                // end-to-end.
                 4
             } else {
                 8
@@ -374,19 +466,19 @@ pub fn qmv_fanout_targets_cols_per_threadgroup(
 }
 
 pub fn qmv_fanout_y_tiles(targets: &[crate::fusion::ir::QmvFanoutTarget]) -> u64 {
-    let target_set_cols_per_tg = (!qmv_fanout_exact_enabled()
-        && qmv_fanout_targets_use_set_tiling(targets))
-    .then(|| qmv_fanout_targets_cols_per_threadgroup(targets) as u64);
+    let exact = qmv_fanout_emit_exact(targets);
+    let target_set_cols_per_tg = (!exact && qmv_fanout_targets_use_set_tiling(targets))
+        .then(|| qmv_fanout_targets_cols_per_threadgroup(targets) as u64);
     let mut tiles = 0u64;
     let mut idx = 0usize;
     while idx < targets.len() {
         let target = targets[idx];
         let target_tiles = target_set_cols_per_tg
             .map(|cols_per_tg| ceil_div_u64(target.out_dim as u64, cols_per_tg))
-            .unwrap_or_else(|| qmv_fanout_target_y_tiles(target));
+            .unwrap_or_else(|| qmv_fanout_target_y_tiles_exact(target, exact));
         tiles = tiles.saturating_add(target_tiles);
         let pair2 = idx + 1 < targets.len()
-            && if qmv_fanout_exact_enabled() {
+            && if exact {
                 qmv_fanout_exact_pair2_compatible(target, targets[idx + 1])
             } else {
                 qmv_fanout_pair2_any_compatible(target, targets[idx + 1])
@@ -478,6 +570,8 @@ pub mod rmsnorm_rope_qgate_decode;
 pub mod rope_kv_cache_store_decode;
 pub mod rope_kv_cache_store_decode_quant;
 pub mod rope_q_decode;
+pub mod routed_qmv_reduce;
+pub mod routed_qmv_swiglu;
 pub mod sdpa_decode;
 pub mod sdpa_decode_quant;
 pub mod sdpa_prefill;
@@ -565,7 +659,7 @@ pub fn qmv_fast_token_rows(active_rows: u64, bits: u32, k_dim: u32, out_dim: u32
 }
 
 pub fn qmv_fanout_token_rows(targets: &[crate::fusion::ir::QmvFanoutTarget]) -> u32 {
-    if qmv_fanout_exact_enabled() {
+    if qmv_fanout_emit_exact(targets) {
         return 1;
     }
     targets
@@ -695,23 +789,23 @@ pub fn linear_residual_qmv_fast_cols_per_simdgroup(
             && k_dim >= 8192
             && out_dim >= 512
         {
-            // Large-reduction residual qMV (MLP down-proj) repeatedly
-            // streams enough q4 weight that column fanout becomes register
-            // pressure before it saves meaningful activation bandwidth. M5
-            // profiles on 4B-class q4 down-proj favored one output column
-            // per simdgroup; smaller residual projections keep the generic
-            // policy below.
-            1
+            // Large-reduction residual qMV (MLP down-proj) is dominated by
+            // q4 weight streaming. On M5, two adjacent output columns per
+            // simdgroup gives enough weight-stream amortization without the
+            // register-pressure loss seen at wider tiles.
+            2
         } else if matches!(crate::target::current_chip(), crate::target::ChipModel::M5)
             && bits == 8
             && active_rows <= 1
             && k_dim >= 4096
             && out_dim >= 512
         {
-            // q8 keeps enough byte-lane memory work in flight to benefit
-            // from the wider tile; leave the previous large-reduction
-            // policy in place until q8 profiles say otherwise.
-            8
+            // Large q8 residual decode is register-pressure sensitive once
+            // the surrounding MLP/QKV chains are fused. L512 profiles on M5
+            // favor two adjacent output rows per simdgroup: one leaves memory
+            // parallelism on the table, while four/eight spill enough live
+            // qparam/unpack state to lose end-to-end TPS.
+            2
         } else if matches!(crate::target::current_chip(), crate::target::ChipModel::M5)
             && matches!(bits, 4 | 5)
             && active_rows <= 1
@@ -776,15 +870,14 @@ fn qmv_fanout_base_fast_simdgroups(
     cols_per_sg: u32,
 ) -> u32 {
     let sgs = if matches!(crate::target::current_chip(), crate::target::ChipModel::M5)
-        && bits == 4
+        && bits == 8
         && active_rows <= 1
         && k_dim >= 1024
-        && out_dim <= 16_384
+        && out_dim <= 32_768
     {
-        // Small-M fanout runs inside a long decode chain. One simdgroup per
-        // threadgroup gives the best verified chain-active time for this
-        // class by avoiding the extra per-TG pressure from the generic qMV
-        // default.
+        // q8 small-M fanout is register-pressure sensitive on M5. One
+        // simdgroup per threadgroup measured lower late-token chain time
+        // than the generic two-SG qMV tile for mid-size decode shapes.
         1
     } else {
         qmv_base_fast_simdgroups(out_dim, cols_per_sg)
@@ -837,6 +930,13 @@ fn qmv_fanout_fast_simdgroups_with_cols(
 
 fn qmv_base_fast_cols_per_simdgroup(active_rows: u64, bits: u32, k_dim: u32, out_dim: u32) -> u32 {
     let cols = if bits == 4 && active_rows <= 2 && out_dim >= 131_072 && k_dim >= 1024 {
+        8
+    } else if matches!(crate::target::current_chip(), crate::target::ChipModel::M5)
+        && bits == 4
+        && active_rows <= 1
+        && k_dim >= 2048
+        && out_dim >= 8192
+    {
         8
     } else {
         4
@@ -980,7 +1080,7 @@ pub fn qmv_fast_block_size(bits: u32) -> Option<u32> {
         2 | 4 | 8 => 32 / bits,
         _ => return None,
     };
-    let packs_per_thread = if bits == 2 { 1 } else { 2 };
+    let packs_per_thread = qmv_fast_packs_per_thread(bits)?;
     Some(pack_factor * packs_per_thread * 32)
 }
 
@@ -1023,6 +1123,61 @@ pub fn qmm_mlx_qmmt_shape(fusion: &Fusion) -> Option<(u32, u32, u64, u32, u32)> 
         return None;
     }
     Some((k_dim, out_dim, active_rows, *bits, *group_size))
+}
+
+pub fn qmm_mlx_qmmt_tile(k_dim: u32, out_dim: u32, active_rows: u64, bits: u32) -> (u32, u32, u32) {
+    if active_rows >= 128 && matches!(bits, 4 | 8) && k_dim >= 512 && out_dim >= 128 {
+        // Full-prompt qMM is dominated by MLP gate/up/down weight
+        // streaming. Profiling on M5 with Qwen2.5-0.5B q4 prefill M=256
+        // showed BK=64 reducing qMM GPU time without the occupancy loss
+        // seen from BM=64 or the register pressure seen from BN=64.
+        return (32, 64, 32);
+    }
+
+    (32, 32, 32)
+}
+
+pub fn qmm_prefill_nax_preferred(fusion: &Fusion) -> bool {
+    let Some((_k_dim, out_dim, active_rows, bits, group_size)) = qmm_nax_shape(fusion) else {
+        return false;
+    };
+    active_rows >= 128
+        && matches!(bits, 4 | 8)
+        && group_size == 64
+        // Keep narrow K/V cache projections on the conservative qMM_t
+        // path. A full-NAX prefill attempt corrupted KV cache values for
+        // the N=128 branch; the larger Q/O/MLP projections are the actual
+        // qMM bottleneck and do not feed cache storage directly.
+        && out_dim >= 256
+        && std::env::var("FUSEKIT_PREFILL_NAX_LARGE_QMM").as_deref() != Ok("0")
+}
+
+pub fn qmv_swiglu_prefill_qmmt(
+    gate: crate::fusion::ir::QmvFanoutTarget,
+    up: crate::fusion::ir::QmvFanoutTarget,
+) -> bool {
+    gate.k_dim == up.k_dim
+        && gate.out_dim == up.out_dim
+        && gate.active_rows == up.active_rows
+        && gate.bits == up.bits
+        && gate.group_size == up.group_size
+        && gate.active_rows >= 128
+        && matches!(gate.bits, 4 | 8)
+        && gate.group_size == 64
+        && gate.k_dim.is_multiple_of(32)
+        && gate.out_dim >= 128
+}
+
+pub fn qmv_swiglu_prefill_nax(
+    gate: crate::fusion::ir::QmvFanoutTarget,
+    up: crate::fusion::ir::QmvFanoutTarget,
+) -> bool {
+    qmv_swiglu_prefill_qmmt(gate, up)
+        && gate.active_rows >= 128
+        && matches!(gate.bits, 4 | 8)
+        && gate.group_size == 64
+        && gate.out_dim >= 256
+        && std::env::var("FUSEKIT_PREFILL_NAX_SWIGLU").as_deref() != Ok("0")
 }
 
 pub fn qmm_chain_mlx_qmv_fast_shape(fusion: &Fusion) -> Option<(u32, u32, u64, u32, u32)> {
@@ -1097,9 +1252,6 @@ pub fn qmm_chain_mlx_qmv_fast_shape(fusion: &Fusion) -> Option<(u32, u32, u64, u
     let active_rows = crate::target::current_chip()
         .active_rows_before_last(out_shape)
         .max(1);
-    if active_rows <= 1 {
-        reject!(format!("active_rows={active_rows}"));
-    }
     let pack_factor = match bits {
         3 | 5 => 8,
         6 => 4,
@@ -1308,7 +1460,35 @@ pub fn linear_residual_mlx_qmv_fast_shape(fusion: &Fusion) -> Option<(u32, u32, 
         || auto_small_m
         || std::env::var("FUSEKIT_QMM_MLX_QMV_M").as_deref() == Ok("1")
         || std::env::var("FUSEKIT_LINEAR_RESIDUAL_MLX_QMV_M").as_deref() == Ok("1");
-    if !allow_m || !k_dim.is_multiple_of(block_size) || !out_dim.is_multiple_of(8) {
+    let tail_free = k_dim.is_multiple_of(block_size);
+    let tail_safe_m = active_rows > 1 && matches!(q.bits, 4 | 8);
+    if !allow_m || !out_dim.is_multiple_of(8) || (!tail_free && !tail_safe_m) {
+        return None;
+    }
+    Some((k_dim, out_dim, active_rows, q.bits, q.group_size))
+}
+
+pub fn linear_residual_nax_shape(fusion: &Fusion) -> Option<(u32, u32, u64, u32, u32)> {
+    if std::env::var("FUSEKIT_LINEAR_RESIDUAL_NAX").as_deref() == Ok("0") {
+        return None;
+    }
+    let FusionAttrs::LinearResidual { quant: Some(q) } = &fusion.attrs else {
+        return None;
+    };
+    if q.group_size != 64 || !matches!(q.bits, 4 | 8) {
+        return None;
+    }
+    let x_shape = fusion.inputs.first().map(|b| b.shape.as_slice())?;
+    let out_shape = fusion.outputs.first().map(|b| b.shape.as_slice())?;
+    if x_shape.is_empty() || out_shape.is_empty() {
+        return None;
+    }
+    let k_dim = x_shape.last().copied().unwrap_or(0).max(1) as u32;
+    let out_dim = out_shape.last().copied().unwrap_or(0).max(1) as u32;
+    let active_rows = crate::target::current_chip()
+        .active_rows_before_last(out_shape)
+        .max(1);
+    if active_rows <= 1 || out_dim < 64 {
         return None;
     }
     Some((k_dim, out_dim, active_rows, q.bits, q.group_size))
@@ -1323,12 +1503,11 @@ pub fn qgemv_unroll2_default_for_shape(bits: u32, input_dim: u32, output_dim: u3
         return false;
     }
     match bits {
-        // Small q4 GEMV loses more to live-value pressure than it gains from
-        // the 2-word unroll. Check both axes: decode down/lm_head can have a
-        // large reduction axis but still only a small number of active output
-        // rows per layer/model. Larger q4 and q8 keep enough memory work in
-        // flight to benefit from the wider loop body.
-        4 => input_dim > 1024 && output_dim > 1024,
+        // M5 q4 single-token decode loses more to live-value pressure than it
+        // gains from the 2-word qGEMV body once the surrounding semantic chain
+        // is fused. Keep q4 on the narrower loop; q8 still has enough memory
+        // work in flight to benefit on large projections.
+        4 => false,
         // q8 explicit unpack wins on the 4B-class decode projections
         // where both axes are large enough to hide the extra live ranges.
         // Smaller q8 models keep the MLX qdot helper path; forcing the
@@ -1401,6 +1580,12 @@ pub fn emit_int4_gemv_inner_with_unroll2_default<F: Fn(&str) -> String>(
     );
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum QdotPolicy {
+    Default,
+    Disable,
+}
+
 pub fn emit_int4_gemv_inner_with_options<F: Fn(&str) -> String>(
     w: &mut MslWriter,
     acc: &str,
@@ -1412,6 +1597,36 @@ pub fn emit_int4_gemv_inner_with_options<F: Fn(&str) -> String>(
     group_size: u32,
     qgemv_unroll2_default: bool,
     qparam_broadcast_default: bool,
+    x_expr: F,
+) {
+    emit_int4_gemv_inner_with_options_and_qdot(
+        w,
+        acc,
+        w_packed_row,
+        w_scales_row,
+        w_biases_row,
+        m_const,
+        bits,
+        group_size,
+        qgemv_unroll2_default,
+        qparam_broadcast_default,
+        QdotPolicy::Default,
+        x_expr,
+    );
+}
+
+pub fn emit_int4_gemv_inner_with_options_and_qdot<F: Fn(&str) -> String>(
+    w: &mut MslWriter,
+    acc: &str,
+    w_packed_row: &str,
+    w_scales_row: &str,
+    w_biases_row: &str,
+    m_const: &str,
+    bits: u32,
+    group_size: u32,
+    qgemv_unroll2_default: bool,
+    qparam_broadcast_default: bool,
+    qdot_policy: QdotPolicy,
     x_expr: F,
 ) {
     let lanes_per_word = 32 / bits;
@@ -1440,6 +1655,10 @@ pub fn emit_int4_gemv_inner_with_options<F: Fn(&str) -> String>(
         })
         .unwrap_or(qgemv_unroll2_default)
         && !qparam_broadcast;
+    // The adjacent two-word form was tested on M5 q4/q8 decode and regressed
+    // both wall time and late-token kernel time. Keep the proven strided
+    // two-word unroll as the default general path.
+    let qgemv_adjacent_unroll2 = false;
     let qgemv_prefetch = std::env::var("FUSEKIT_QGEMV_PREFETCH")
         .ok()
         .map(|s| {
@@ -1459,19 +1678,22 @@ pub fn emit_int4_gemv_inner_with_options<F: Fn(&str) -> String>(
     w.writeln(format_args!("device const uint *w_row_ = {w_packed_row};"));
     let scale_at_group = format!("({w_scales_row})[group_]");
     let bias_at_group = format!("({w_biases_row})[group_]");
-    let qgemv_mlx_qdot = std::env::var("FUSEKIT_QGEMV_MLX_QDOT")
-        .ok()
-        .map(|s| {
-            let s = s.trim().to_ascii_lowercase();
-            matches!(s.as_str(), "1" | "true" | "yes" | "on")
-        })
-        // q8 uses the MLX qdot helper for small shapes, but large M5
-        // decode projections pass qgemv_unroll2_default=true from the
-        // shape heuristic above and use the generated explicit-unpack
-        // path. This keeps the 4B q8 win without forcing the small-q8
-        // engine path into the body that can stall.
-        .unwrap_or(bits == 8 && !qgemv_unroll2_default)
-        && (bits == 4 || bits == 8)
+    let qgemv_qdot_default = bits == 8 && !qgemv_unroll2_default;
+    let qgemv_mlx_qdot = match qdot_policy {
+        QdotPolicy::Default => std::env::var("FUSEKIT_QGEMV_MLX_QDOT")
+            .ok()
+            .map(|s| {
+                let s = s.trim().to_ascii_lowercase();
+                matches!(s.as_str(), "1" | "true" | "yes" | "on")
+            })
+            // q8 keeps the qdot body for small shapes, but large q8 projections
+            // use the explicit-unpack path. Large q4 decode projections on M5
+            // also favor the explicit two-word body in late-token profiles: the
+            // reduced live range beats the affine qdot regrouping once surrounding
+            // chain fusion has already raised register pressure.
+            .unwrap_or(qgemv_qdot_default),
+        QdotPolicy::Disable => false,
+    } && (bits == 4 || bits == 8)
         && group_size.is_multiple_of(lanes_per_word * 2);
     if qgemv_mlx_qdot {
         let emit_word = |w: &mut MslWriter, p: u32| {
@@ -1566,54 +1788,102 @@ pub fn emit_int4_gemv_inner_with_options<F: Fn(&str) -> String>(
         // the dependent FMA chain with independent loads so the
         // serial appearance doesn't actually stall the FPU.
         if qgemv_unroll2 {
-            let x0 = |off: u32| x_expr(&format!("inb0_ + {off}u"));
-            let x1 = |off: u32| x_expr(&format!("inb1_ + {off}u"));
-            let xt = |off: u32| x_expr(&format!("inb_ + {off}u"));
-            w.line("uint widx_ = simd_lane;");
-            w.line("for (; widx_ + 32u < in_words_; widx_ += 64u) {");
-            w.push_indent();
-            w.line("uint word0_ = w_row_[widx_];");
-            w.line("uint word1_ = w_row_[widx_ + 32u];");
-            w.line("uint inb0_ = widx_ * 8u;");
-            w.line("uint inb1_ = (widx_ + 32u) * 8u;");
-            w.writeln(format_args!("uint group0_ = inb0_ / {group_size}u;"));
-            w.writeln(format_args!("uint group1_ = inb1_ / {group_size}u;"));
-            w.line(format!("float scale0_ = float(({w_scales_row})[group0_]);"));
-            w.line(format!("float bias0_  = float(({w_biases_row})[group0_]);"));
-            w.line(format!("float scale1_ = float(({w_scales_row})[group1_]);"));
-            w.line(format!("float bias1_  = float(({w_biases_row})[group1_]);"));
-            for off in 0..8u32 {
-                let shift = off * 4;
-                w.writeln(format_args!(
-                    "{acc} += {x} * (float((word0_ >> {shift}u) & 0xFu) * scale0_ + bias0_);",
-                    x = x0(off)
-                ));
+            if qgemv_adjacent_unroll2 {
+                let x0 = |off: u32| x_expr(&format!("inb0_ + {off}u"));
+                let x1 = |off: u32| x_expr(&format!("inb1_ + {off}u"));
+                let xt = |off: u32| x_expr(&format!("inb_ + {off}u"));
+                w.line("uint widx_ = simd_lane * 2u;");
+                w.line("for (; widx_ + 1u < in_words_; widx_ += 64u) {");
+                w.push_indent();
+                w.line("uint word0_ = w_row_[widx_];");
+                w.line("uint word1_ = w_row_[widx_ + 1u];");
+                w.line("uint inb0_ = widx_ * 8u;");
+                w.line("uint inb1_ = inb0_ + 8u;");
+                w.writeln(format_args!("uint group_ = inb0_ / {group_size}u;"));
+                w.line(format!("float scale_ = float({scale_at_group});"));
+                w.line(format!("float bias_  = float({bias_at_group});"));
+                for off in 0..8u32 {
+                    let shift = off * 4;
+                    w.writeln(format_args!(
+                        "{acc} += {x} * (float((word0_ >> {shift}u) & 0xFu) * scale_ + bias_);",
+                        x = x0(off)
+                    ));
+                }
+                for off in 0..8u32 {
+                    let shift = off * 4;
+                    w.writeln(format_args!(
+                        "{acc} += {x} * (float((word1_ >> {shift}u) & 0xFu) * scale_ + bias_);",
+                        x = x1(off)
+                    ));
+                }
+                w.pop_indent();
+                w.line("}");
+                w.line("if (widx_ < in_words_) {");
+                w.push_indent();
+                w.line("uint word_   = w_row_[widx_];");
+                w.line("uint inb_    = widx_ * 8u;");
+                w.writeln(format_args!("uint group_  = inb_ / {group_size}u;"));
+                w.line(format!("float scale_ = float({scale_at_group});"));
+                w.line(format!("float bias_  = float({bias_at_group});"));
+                for off in 0..8u32 {
+                    let shift = off * 4;
+                    w.writeln(format_args!(
+                        "{acc} += {x} * (float((word_ >> {shift}u) & 0xFu) * scale_ + bias_);",
+                        x = xt(off)
+                    ));
+                }
+                w.pop_indent();
+                w.line("}");
+            } else {
+                let x0 = |off: u32| x_expr(&format!("inb0_ + {off}u"));
+                let x1 = |off: u32| x_expr(&format!("inb1_ + {off}u"));
+                let xt = |off: u32| x_expr(&format!("inb_ + {off}u"));
+                w.line("uint widx_ = simd_lane;");
+                w.line("for (; widx_ + 32u < in_words_; widx_ += 64u) {");
+                w.push_indent();
+                w.line("uint word0_ = w_row_[widx_];");
+                w.line("uint word1_ = w_row_[widx_ + 32u];");
+                w.line("uint inb0_ = widx_ * 8u;");
+                w.line("uint inb1_ = (widx_ + 32u) * 8u;");
+                w.writeln(format_args!("uint group0_ = inb0_ / {group_size}u;"));
+                w.writeln(format_args!("uint group1_ = inb1_ / {group_size}u;"));
+                w.line(format!("float scale0_ = float(({w_scales_row})[group0_]);"));
+                w.line(format!("float bias0_  = float(({w_biases_row})[group0_]);"));
+                w.line(format!("float scale1_ = float(({w_scales_row})[group1_]);"));
+                w.line(format!("float bias1_  = float(({w_biases_row})[group1_]);"));
+                for off in 0..8u32 {
+                    let shift = off * 4;
+                    w.writeln(format_args!(
+                        "{acc} += {x} * (float((word0_ >> {shift}u) & 0xFu) * scale0_ + bias0_);",
+                        x = x0(off)
+                    ));
+                }
+                for off in 0..8u32 {
+                    let shift = off * 4;
+                    w.writeln(format_args!(
+                        "{acc} += {x} * (float((word1_ >> {shift}u) & 0xFu) * scale1_ + bias1_);",
+                        x = x1(off)
+                    ));
+                }
+                w.pop_indent();
+                w.line("}");
+                w.line("if (widx_ < in_words_) {");
+                w.push_indent();
+                w.line("uint word_   = w_row_[widx_];");
+                w.line("uint inb_    = widx_ * 8u;");
+                w.writeln(format_args!("uint group_  = inb_ / {group_size}u;"));
+                w.line(format!("float scale_ = float({scale_at_group});"));
+                w.line(format!("float bias_  = float({bias_at_group});"));
+                for off in 0..8u32 {
+                    let shift = off * 4;
+                    w.writeln(format_args!(
+                        "{acc} += {x} * (float((word_ >> {shift}u) & 0xFu) * scale_ + bias_);",
+                        x = xt(off)
+                    ));
+                }
+                w.pop_indent();
+                w.line("}");
             }
-            for off in 0..8u32 {
-                let shift = off * 4;
-                w.writeln(format_args!(
-                    "{acc} += {x} * (float((word1_ >> {shift}u) & 0xFu) * scale1_ + bias1_);",
-                    x = x1(off)
-                ));
-            }
-            w.pop_indent();
-            w.line("}");
-            w.line("if (widx_ < in_words_) {");
-            w.push_indent();
-            w.line("uint word_   = w_row_[widx_];");
-            w.line("uint inb_    = widx_ * 8u;");
-            w.writeln(format_args!("uint group_  = inb_ / {group_size}u;"));
-            w.line(format!("float scale_ = float({scale_at_group});"));
-            w.line(format!("float bias_  = float({bias_at_group});"));
-            for off in 0..8u32 {
-                let shift = off * 4;
-                w.writeln(format_args!(
-                    "{acc} += {x} * (float((word_ >> {shift}u) & 0xFu) * scale_ + bias_);",
-                    x = xt(off)
-                ));
-            }
-            w.pop_indent();
-            w.line("}");
         } else if qgemv_prefetch {
             let next_scale_at_group = format!("({w_scales_row})[next_group_]");
             let next_bias_at_group = format!("({w_biases_row})[next_group_]");
@@ -1721,54 +1991,102 @@ pub fn emit_int4_gemv_inner_with_options<F: Fn(&str) -> String>(
         // the 4-bit path; q8 has 2× the precision so the same MSL
         // pattern matters even more for compile-time fma scheduling.
         if qgemv_unroll2 {
-            let x0 = |off: u32| x_expr(&format!("inb0_ + {off}u"));
-            let x1 = |off: u32| x_expr(&format!("inb1_ + {off}u"));
-            let xt = |off: u32| x_expr(&format!("inb_ + {off}u"));
-            w.line("uint widx_ = simd_lane;");
-            w.line("for (; widx_ + 32u < in_words_; widx_ += 64u) {");
-            w.push_indent();
-            w.line("uint word0_ = w_row_[widx_];");
-            w.line("uint word1_ = w_row_[widx_ + 32u];");
-            w.line("uint inb0_ = widx_ * 4u;");
-            w.line("uint inb1_ = (widx_ + 32u) * 4u;");
-            w.writeln(format_args!("uint group0_ = inb0_ / {group_size}u;"));
-            w.writeln(format_args!("uint group1_ = inb1_ / {group_size}u;"));
-            w.line(format!("float scale0_ = float(({w_scales_row})[group0_]);"));
-            w.line(format!("float bias0_  = float(({w_biases_row})[group0_]);"));
-            w.line(format!("float scale1_ = float(({w_scales_row})[group1_]);"));
-            w.line(format!("float bias1_  = float(({w_biases_row})[group1_]);"));
-            for off in 0..4u32 {
-                let shift = off * 8;
-                w.writeln(format_args!(
-                    "{acc} += {x} * (float((word0_ >> {shift}u) & 0xFFu) * scale0_ + bias0_);",
-                    x = x0(off)
-                ));
+            if qgemv_adjacent_unroll2 {
+                let x0 = |off: u32| x_expr(&format!("inb0_ + {off}u"));
+                let x1 = |off: u32| x_expr(&format!("inb1_ + {off}u"));
+                let xt = |off: u32| x_expr(&format!("inb_ + {off}u"));
+                w.line("uint widx_ = simd_lane * 2u;");
+                w.line("for (; widx_ + 1u < in_words_; widx_ += 64u) {");
+                w.push_indent();
+                w.line("uint word0_ = w_row_[widx_];");
+                w.line("uint word1_ = w_row_[widx_ + 1u];");
+                w.line("uint inb0_ = widx_ * 4u;");
+                w.line("uint inb1_ = inb0_ + 4u;");
+                w.writeln(format_args!("uint group_ = inb0_ / {group_size}u;"));
+                w.line(format!("float scale_ = float({scale_at_group});"));
+                w.line(format!("float bias_  = float({bias_at_group});"));
+                for off in 0..4u32 {
+                    let shift = off * 8;
+                    w.writeln(format_args!(
+                        "{acc} += {x} * (float((word0_ >> {shift}u) & 0xFFu) * scale_ + bias_);",
+                        x = x0(off)
+                    ));
+                }
+                for off in 0..4u32 {
+                    let shift = off * 8;
+                    w.writeln(format_args!(
+                        "{acc} += {x} * (float((word1_ >> {shift}u) & 0xFFu) * scale_ + bias_);",
+                        x = x1(off)
+                    ));
+                }
+                w.pop_indent();
+                w.line("}");
+                w.line("if (widx_ < in_words_) {");
+                w.push_indent();
+                w.line("uint word_   = w_row_[widx_];");
+                w.line("uint inb_    = widx_ * 4u;");
+                w.writeln(format_args!("uint group_  = inb_ / {group_size}u;"));
+                w.line(format!("float scale_ = float({scale_at_group});"));
+                w.line(format!("float bias_  = float({bias_at_group});"));
+                for off in 0..4u32 {
+                    let shift = off * 8;
+                    w.writeln(format_args!(
+                        "{acc} += {x} * (float((word_ >> {shift}u) & 0xFFu) * scale_ + bias_);",
+                        x = xt(off)
+                    ));
+                }
+                w.pop_indent();
+                w.line("}");
+            } else {
+                let x0 = |off: u32| x_expr(&format!("inb0_ + {off}u"));
+                let x1 = |off: u32| x_expr(&format!("inb1_ + {off}u"));
+                let xt = |off: u32| x_expr(&format!("inb_ + {off}u"));
+                w.line("uint widx_ = simd_lane;");
+                w.line("for (; widx_ + 32u < in_words_; widx_ += 64u) {");
+                w.push_indent();
+                w.line("uint word0_ = w_row_[widx_];");
+                w.line("uint word1_ = w_row_[widx_ + 32u];");
+                w.line("uint inb0_ = widx_ * 4u;");
+                w.line("uint inb1_ = (widx_ + 32u) * 4u;");
+                w.writeln(format_args!("uint group0_ = inb0_ / {group_size}u;"));
+                w.writeln(format_args!("uint group1_ = inb1_ / {group_size}u;"));
+                w.line(format!("float scale0_ = float(({w_scales_row})[group0_]);"));
+                w.line(format!("float bias0_  = float(({w_biases_row})[group0_]);"));
+                w.line(format!("float scale1_ = float(({w_scales_row})[group1_]);"));
+                w.line(format!("float bias1_  = float(({w_biases_row})[group1_]);"));
+                for off in 0..4u32 {
+                    let shift = off * 8;
+                    w.writeln(format_args!(
+                        "{acc} += {x} * (float((word0_ >> {shift}u) & 0xFFu) * scale0_ + bias0_);",
+                        x = x0(off)
+                    ));
+                }
+                for off in 0..4u32 {
+                    let shift = off * 8;
+                    w.writeln(format_args!(
+                        "{acc} += {x} * (float((word1_ >> {shift}u) & 0xFFu) * scale1_ + bias1_);",
+                        x = x1(off)
+                    ));
+                }
+                w.pop_indent();
+                w.line("}");
+                w.line("if (widx_ < in_words_) {");
+                w.push_indent();
+                w.line("uint word_   = w_row_[widx_];");
+                w.line("uint inb_    = widx_ * 4u;");
+                w.writeln(format_args!("uint group_  = inb_ / {group_size}u;"));
+                w.line(format!("float scale_ = float({scale_at_group});"));
+                w.line(format!("float bias_  = float({bias_at_group});"));
+                for off in 0..4u32 {
+                    let shift = off * 8;
+                    w.writeln(format_args!(
+                        "{acc} += {x} * (float((word_ >> {shift}u) & 0xFFu) * scale_ + bias_);",
+                        x = xt(off)
+                    ));
+                }
+                w.pop_indent();
+                w.line("}");
             }
-            for off in 0..4u32 {
-                let shift = off * 8;
-                w.writeln(format_args!(
-                    "{acc} += {x} * (float((word1_ >> {shift}u) & 0xFFu) * scale1_ + bias1_);",
-                    x = x1(off)
-                ));
-            }
-            w.pop_indent();
-            w.line("}");
-            w.line("if (widx_ < in_words_) {");
-            w.push_indent();
-            w.line("uint word_   = w_row_[widx_];");
-            w.line("uint inb_    = widx_ * 4u;");
-            w.writeln(format_args!("uint group_  = inb_ / {group_size}u;"));
-            w.line(format!("float scale_ = float({scale_at_group});"));
-            w.line(format!("float bias_  = float({bias_at_group});"));
-            for off in 0..4u32 {
-                let shift = off * 8;
-                w.writeln(format_args!(
-                    "{acc} += {x} * (float((word_ >> {shift}u) & 0xFFu) * scale_ + bias_);",
-                    x = xt(off)
-                ));
-            }
-            w.pop_indent();
-            w.line("}");
         } else if qgemv_prefetch {
             let next_scale_at_group = format!("({w_scales_row})[next_group_]");
             let next_bias_at_group = format!("({w_biases_row})[next_group_]");
@@ -2508,6 +2826,53 @@ pub fn emit_int4_gemv_inner_token_rows_with_options<FA, FX>(
     w.line("constexpr uint MASK_ = (1u << BITS_) - 1u;");
     w.writeln(format_args!("uint in_words_ = {m_const} / LANES_;"));
     w.writeln(format_args!("device const uint *w_row_ = {w_packed_row};"));
+    let emit_token_rows_affine_word = |w: &mut MslWriter,
+                                       word_var: &str,
+                                       scale_var: &str,
+                                       bias_var: &str,
+                                       in_base_var: &str,
+                                       suffix: &str| {
+        let elems_per_word = 32 / bits;
+        let mask = if bits == 4 { "0xFu" } else { "0xFFu" };
+        if bits == 8 {
+            for r in 0..token_rows {
+                w.writeln(format_args!("float qacc_{suffix}_{r}_ = 0.0f;"));
+                w.writeln(format_args!("float xsum_{suffix}_{r}_ = 0.0f;"));
+            }
+            for off in 0..elems_per_word {
+                let shift = off * bits;
+                let q_expr = format!("float(({word_var} >> {shift}u) & {mask})");
+                for r in 0..token_rows {
+                    let x = x_expr(r, &format!("{in_base_var} + {off}u"));
+                    w.writeln(format_args!("float x_{suffix}_{r}_{off}_ = {x};"));
+                    w.writeln(format_args!(
+                        "qacc_{suffix}_{r}_ += x_{suffix}_{r}_{off}_ * {q_expr};"
+                    ));
+                    w.writeln(format_args!("xsum_{suffix}_{r}_ += x_{suffix}_{r}_{off}_;"));
+                }
+            }
+            for r in 0..token_rows {
+                w.writeln(format_args!(
+                    "{acc} += {scale_var} * qacc_{suffix}_{r}_ + {bias_var} * xsum_{suffix}_{r}_;",
+                    acc = acc_fn(r)
+                ));
+            }
+        } else {
+            for off in 0..elems_per_word {
+                let shift = off * bits;
+                let wj = format!(
+                    "(float(({word_var} >> {shift}u) & {mask}) * {scale_var} + {bias_var})"
+                );
+                for r in 0..token_rows {
+                    w.writeln(format_args!(
+                        "{acc} += {x} * {wj};",
+                        acc = acc_fn(r),
+                        x = x_expr(r, &format!("{in_base_var} + {off}u"))
+                    ));
+                }
+            }
+        }
+    };
     if qgemv_unroll2 {
         w.line("uint widx_ = simd_lane;");
         w.line("for (; widx_ + 32u < in_words_; widx_ += 64u) {");
@@ -2532,61 +2897,8 @@ pub fn emit_int4_gemv_inner_token_rows_with_options<FA, FX>(
         w.writeln(format_args!(
             "float bias1_  = float(({w_biases_row})[group1_]);"
         ));
-        if bits == 4 {
-            for off in 0..8u32 {
-                let shift = off * 4;
-                w.writeln(format_args!(
-                    "float wv0_{off}_ = float((word0_ >> {shift}u) & 0xFu) * scale0_ + bias0_;"
-                ));
-                for r in 0..token_rows {
-                    w.writeln(format_args!(
-                        "{acc} += {x} * wv0_{off}_;",
-                        acc = acc_fn(r),
-                        x = x_expr(r, &format!("inb0_ + {off}u"))
-                    ));
-                }
-            }
-            for off in 0..8u32 {
-                let shift = off * 4;
-                w.writeln(format_args!(
-                    "float wv1_{off}_ = float((word1_ >> {shift}u) & 0xFu) * scale1_ + bias1_;"
-                ));
-                for r in 0..token_rows {
-                    w.writeln(format_args!(
-                        "{acc} += {x} * wv1_{off}_;",
-                        acc = acc_fn(r),
-                        x = x_expr(r, &format!("inb1_ + {off}u"))
-                    ));
-                }
-            }
-        } else {
-            for off in 0..4u32 {
-                let shift = off * 8;
-                w.writeln(format_args!(
-                    "float wv0_{off}_ = float((word0_ >> {shift}u) & 0xFFu) * scale0_ + bias0_;"
-                ));
-                for r in 0..token_rows {
-                    w.writeln(format_args!(
-                        "{acc} += {x} * wv0_{off}_;",
-                        acc = acc_fn(r),
-                        x = x_expr(r, &format!("inb0_ + {off}u"))
-                    ));
-                }
-            }
-            for off in 0..4u32 {
-                let shift = off * 8;
-                w.writeln(format_args!(
-                    "float wv1_{off}_ = float((word1_ >> {shift}u) & 0xFFu) * scale1_ + bias1_;"
-                ));
-                for r in 0..token_rows {
-                    w.writeln(format_args!(
-                        "{acc} += {x} * wv1_{off}_;",
-                        acc = acc_fn(r),
-                        x = x_expr(r, &format!("inb1_ + {off}u"))
-                    ));
-                }
-            }
-        }
+        emit_token_rows_affine_word(w, "word0_", "scale0_", "bias0_", "inb0_", "0");
+        emit_token_rows_affine_word(w, "word1_", "scale1_", "bias1_", "inb1_", "1");
         w.pop_indent();
         w.line("}");
         w.line("if (widx_ < in_words_) {");
@@ -2604,35 +2916,7 @@ pub fn emit_int4_gemv_inner_token_rows_with_options<FA, FX>(
     w.writeln(format_args!(
         "float bias_  = float(({w_biases_row})[group_]);"
     ));
-    if bits == 4 {
-        for off in 0..8u32 {
-            let shift = off * 4;
-            w.writeln(format_args!(
-                "float wv_{off}_ = float((word_ >> {shift}u) & 0xFu) * scale_ + bias_;"
-            ));
-            for r in 0..token_rows {
-                w.writeln(format_args!(
-                    "{acc} += {x} * wv_{off}_;",
-                    acc = acc_fn(r),
-                    x = x_expr(r, &format!("inb_ + {off}u"))
-                ));
-            }
-        }
-    } else if bits == 8 {
-        for off in 0..4u32 {
-            let shift = off * 8;
-            w.writeln(format_args!(
-                "float wv_{off}_ = float((word_ >> {shift}u) & 0xFFu) * scale_ + bias_;"
-            ));
-            for r in 0..token_rows {
-                w.writeln(format_args!(
-                    "{acc} += {x} * wv_{off}_;",
-                    acc = acc_fn(r),
-                    x = x_expr(r, &format!("inb_ + {off}u"))
-                ));
-            }
-        }
-    }
+    emit_token_rows_affine_word(w, "word_", "scale_", "bias_", "inb_", "t");
     w.pop_indent();
     w.line("}");
     w.pop_indent();
@@ -3345,6 +3629,8 @@ pub fn emit_for(
         FusionKind::Single(_) => single::emit(fusion, partition, meta, w),
         FusionKind::QmvFanout => qmv_fanout::emit(fusion, partition, meta, w),
         FusionKind::QmvSwiglu => qmv_swiglu::emit(fusion, partition, meta, w),
+        FusionKind::RoutedQmvSwiglu => routed_qmv_swiglu::emit(fusion, partition, meta, w),
+        FusionKind::RoutedQmvReduce => routed_qmv_reduce::emit(fusion, partition, meta, w),
         // Stage 3 general-fusion product — one MSL kernel per chain,
         // intermediates in registers.
         FusionKind::FusedChain => fused_chain::emit(fusion, partition, meta, w),
@@ -3631,7 +3917,39 @@ pub fn extra_bindings_for(fusion: &Fusion, meta: &ModelMeta) -> Vec<ExtraBinding
                     role: SlotRole::LayerCapacity,
                 },
             ]);
-            if sdpa_decode::flash_decoding_enabled() {
+            let active_m = fusion
+                .outputs
+                .first()
+                .map(|b| crate::target::current_chip().active_tokens_for_shape(&b.shape))
+                .unwrap_or_else(|| crate::target::current_chip().active_m_for_unshaped(8))
+                .max(1);
+            let qk_dim = fusion
+                .inputs
+                .first()
+                .and_then(|b| b.shape.last().copied())
+                .unwrap_or(meta.head_dim as i32)
+                .max(1) as u32;
+            let v_dim = fusion
+                .inputs
+                .get(2)
+                .and_then(|b| b.shape.last().copied())
+                .or_else(|| {
+                    fusion.outputs.first().and_then(|b| {
+                        b.shape
+                            .last()
+                            .copied()
+                            .map(|d| d / (meta.num_attention_heads as i32).max(1))
+                    })
+                })
+                .unwrap_or(meta.head_dim as i32)
+                .max(1) as u32;
+            if sdpa_decode::flash_decoding_enabled_for(
+                meta.num_attention_heads,
+                meta.num_key_value_heads,
+                qk_dim,
+                v_dim,
+                active_m,
+            ) {
                 // Slot 5 (out) is normally filled by `t["outputs"]`
                 // append in dispatch.py, but adding extras at slots 6+
                 // breaks that index assumption. Bind out explicitly so
@@ -3651,6 +3969,33 @@ pub fn extra_bindings_for(fusion: &Fusion, meta: &ModelMeta) -> Vec<ExtraBinding
             }
             v
         }
+        // Trace-native prefill attention often survives as a single
+        // `ScaledDotProductAttention` op after the QKV projection has
+        // already written the live K/V cache. Bind it to the same
+        // semantic buffers as SdpaDecode so the M>1 prefill variant can
+        // dispatch without relying on model-name patterns.
+        FusionKind::Single(ref name) if name == "ScaledDotProductAttention" => vec![
+            ExtraBinding {
+                slot: 0,
+                role: SlotRole::LayerScratch(QBuf),
+            },
+            ExtraBinding {
+                slot: 1,
+                role: SlotRole::LayerCacheK,
+            },
+            ExtraBinding {
+                slot: 2,
+                role: SlotRole::LayerCacheV,
+            },
+            ExtraBinding {
+                slot: 3,
+                role: SlotRole::LayerKvLen,
+            },
+            ExtraBinding {
+                slot: 4,
+                role: SlotRole::LayerCapacity,
+            },
+        ],
         // `LinearResidual`'s o_proj variant needs its `x` slot
         // overridden to `LayerScratch(SdpaBuf)` because the trace
         // routes SDPA's output through a transpose+reshape we skip
@@ -3797,7 +4142,7 @@ pub fn extra_bindings_for(fusion: &Fusion, meta: &ModelMeta) -> Vec<ExtraBinding
                 slot: 1,
                 role: SlotRole::LayerArraysCache { index: cache_index },
             }];
-            if crate::target::current_chip().active_m(8) > 1 {
+            if crate::target::current_chip().active_m_for_unshaped(8) > 1 {
                 out.push(ExtraBinding {
                     slot: 2,
                     role: SlotRole::LayerArraysCacheRollback { index: cache_index },
@@ -4081,6 +4426,8 @@ pub fn kernel_function_name(fusion: &Fusion) -> String {
         FusionKind::Single(_) => single::function_name(fusion),
         FusionKind::QmvFanout => qmv_fanout::function_name(fusion),
         FusionKind::QmvSwiglu => qmv_swiglu::function_name(fusion),
+        FusionKind::RoutedQmvSwiglu => routed_qmv_swiglu::function_name(fusion),
+        FusionKind::RoutedQmvReduce => routed_qmv_reduce::function_name(fusion),
         FusionKind::FusedChain => fused_chain::function_name(fusion),
         FusionKind::LayerBlock => layer_block::function_name(fusion),
         // Kinds without a landed emitter yet — fall back to a stable
@@ -4129,6 +4476,7 @@ pub fn kernel_threadgroup(fusion: &Fusion) -> u64 {
         // RMS_N_READS=4 and 64 threads for head_dim=256.
         FusionKind::RmsNormRopeQGateDecode | FusionKind::RmsNormRopeKvCacheStoreDecode => 64,
         FusionKind::QmvFanout | FusionKind::QmvSwiglu => 64,
+        FusionKind::RoutedQmvSwiglu | FusionKind::RoutedQmvReduce => 256,
         _ => TG_THREADS,
     }
 }
@@ -4157,23 +4505,70 @@ pub fn kernel_threadgroup_for(
     let _ = smem_needed;
 
     // SDPA has a hand-tuned dependency: TG=128 + sgs_per_tg=4 keeps
-    // the partial-sum reduction order stable. Pin it regardless of
-    // budget; revisiting would need a re-bench. `FUSEKIT_SDPA_TG_SGS=N`
-    // lets us A/B smaller TGs against the legacy default without a
-    // rebuild — sized for the flash path where Stage 3 only uses
-    // HEAD_DIM threads (≤64) and bigger TGs just idle the rest.
+    // the partial-sum reduction order stable for the legacy two-pass
+    // path. Flash SDPA is different: each output dimension is owned by
+    // one thread (`tid < V_DIM`), so the launch must provide at least
+    // V_DIM lanes. Pick the minimum simdgroup count required by the
+    // semantic V/head dim; this is shape based, not model-name based.
     let sgs = match fusion.kind {
-        FusionKind::SdpaDecode | FusionKind::LayerBlock => std::env::var("FUSEKIT_SDPA_TG_SGS")
+        FusionKind::SdpaDecode => {
+            let active_m = fusion
+                .outputs
+                .first()
+                .map(|b| crate::target::current_chip().active_tokens_for_shape(&b.shape))
+                .unwrap_or_else(|| crate::target::current_chip().active_m_for_unshaped(8))
+                .max(1);
+            let qk_dim = fusion
+                .inputs
+                .first()
+                .and_then(|b| b.shape.last().copied())
+                .unwrap_or(meta.head_dim as i32)
+                .max(1) as u32;
+            let v_dim = fusion
+                .inputs
+                .get(2)
+                .and_then(|b| b.shape.last().copied())
+                .or_else(|| {
+                    fusion.outputs.first().and_then(|b| {
+                        b.shape
+                            .last()
+                            .copied()
+                            .map(|d| d / (meta.num_attention_heads as i32).max(1))
+                    })
+                })
+                .unwrap_or(meta.head_dim as i32)
+                .max(1) as u32;
+            let flash_sdpa = sdpa_decode::flash_decoding_enabled_for(
+                meta.num_attention_heads,
+                meta.num_key_value_heads,
+                qk_dim,
+                v_dim,
+                active_m,
+            ) || std::env::var_os("FUSEKIT_SDPA_FLASH").is_some();
+            let flash_sgs = if flash_sdpa {
+                ceil_div_u64(v_dim as u64, b.simd_width as u64) as u32
+            } else {
+                4
+            };
+            std::env::var("FUSEKIT_SDPA_TG_SGS")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .filter(|&n| (1..=8).contains(&n))
+                .unwrap_or_else(|| flash_sgs.clamp(4, 8))
+        }
+        FusionKind::LayerBlock => std::env::var("FUSEKIT_SDPA_TG_SGS")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
             .filter(|&n| (1..=8).contains(&n))
             .unwrap_or(4),
-        FusionKind::FusedChain if fused_chain_prefers_dense_tg4(fusion) => {
+        FusionKind::FinalRmsNormLmHead => 8,
+        FusionKind::FusedChain if fused_chain_dense_default_simdgroups(fusion).is_some() => {
+            let default_sgs = fused_chain_dense_default_simdgroups(fusion).expect("shape checked");
             std::env::var("FUSEKIT_CHAIN_TG_SGS")
                 .ok()
                 .and_then(|s| s.parse::<u32>().ok())
                 .filter(|&n| (1..=16).contains(&n))
-                .unwrap_or(4)
+                .unwrap_or(default_sgs)
         }
         FusionKind::FusedChain
             if fused_chain_qmm_nax_dispatch_shape(fusion).is_some()
@@ -4188,7 +4583,7 @@ pub fn kernel_threadgroup_for(
         }
         FusionKind::QmvFanout => {
             if let FusionAttrs::QmvFanout { targets } = &fusion.attrs {
-                if qmv_fanout_exact_enabled() {
+                if qmv_fanout_emit_exact(targets) {
                     qmv_fanout_exact_simdgroups()
                 } else if !targets.is_empty() {
                     qmv_fanout_targets_simdgroups(targets)
@@ -4200,16 +4595,49 @@ pub fn kernel_threadgroup_for(
             }
         }
         FusionKind::QmvSwiglu => {
-            if let FusionAttrs::QmvSwiglu { gate, .. } = &fusion.attrs {
+            if let FusionAttrs::QmvSwiglu { gate, up } = &fusion.attrs {
+                if qmv_swiglu_prefill_qmmt(*gate, *up) {
+                    return (4 * b.simd_width) as u64;
+                }
                 qmv_fast_simdgroups(gate.active_rows, gate.bits, gate.k_dim, gate.out_dim)
             } else {
                 2
             }
         }
+        FusionKind::RoutedQmvSwiglu | FusionKind::RoutedQmvReduce => {
+            target.chip.gatherqmm_simdgroups_per_tg()
+        }
         FusionKind::Single(ref name)
             if name == "QuantizedMatmul" && qmm_mlx_qmmt_shape(fusion).is_some() =>
         {
             4
+        }
+        FusionKind::Single(ref name) if name == "ScaledDotProductAttention" => {
+            match single::sdpa_prefill_plan(fusion, meta) {
+                single::SdpaPrefillPlan::BlockNax => {
+                    // Block-NAX SDPA maps one query block/head to one
+                    // threadgroup and uses WM=1, WN=2, i.e. two
+                    // simdgroups per threadgroup.
+                    2
+                }
+                single::SdpaPrefillPlan::Online => {
+                    // The default online prefill emitter maps one query/head
+                    // to one simdgroup; vectorized K/V splitting is kept as a
+                    // forced debug path because it profiles slower here.
+                    1
+                }
+                single::SdpaPrefillPlan::OnlineVector => {
+                    // MLX sdpa_vector shape: one query/head per TG, with 32
+                    // simdgroups splitting K/V rows and reducing partial
+                    // softmax state inside the TG.
+                    32
+                }
+                single::SdpaPrefillPlan::FlashGqa => {
+                    let (_, _, _, flash_sgs) = single::sdpa_prefill_flash_tiling(meta);
+                    flash_sgs.max(1)
+                }
+                single::SdpaPrefillPlan::Materialized => 4,
+            }
         }
         FusionKind::Single(ref name)
             if name == "QuantizedMatmul" && qmm_mlx_qmv_shape(fusion).is_some() =>
@@ -4223,6 +4651,18 @@ pub fn kernel_threadgroup_for(
                 qmm_mlx_qmv_fast_shape(fusion).expect("shape checked");
             qmv_fast_simdgroups(active_rows, bits, k_dim, out_dim)
         }
+        FusionKind::LinearResidual
+            if linear_residual_dense_default_simdgroups(fusion).is_some() =>
+        {
+            let default_sgs =
+                linear_residual_dense_default_simdgroups(fusion).expect("shape checked");
+            std::env::var("FUSEKIT_LINEAR_RESIDUAL_TG_SGS")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .filter(|&n| (1..=16).contains(&n))
+                .unwrap_or(default_sgs)
+        }
+        FusionKind::LinearResidual if linear_residual_nax_shape(fusion).is_some() => 4,
         FusionKind::LinearResidual if linear_residual_mlx_qmv_fast_shape(fusion).is_some() => {
             let (k_dim, out_dim, active_rows, bits, _) =
                 linear_residual_mlx_qmv_fast_shape(fusion).expect("shape checked");
@@ -4263,6 +4703,8 @@ pub fn kernel_threadgroup_for(
             FusionKind::FinalRmsNormLmHead => "final_rmsnorm_lm_head",
             FusionKind::LinearResidual => "linear_residual",
             FusionKind::QmvSwiglu => "qmv_swiglu",
+            FusionKind::RoutedQmvSwiglu => "routed_qmv_swiglu",
+            FusionKind::RoutedQmvReduce => "routed_qmv_reduce",
             FusionKind::RopeQDecode => "rope_q",
             FusionKind::RopeKvCacheStoreDecode => "rope_kv_cache_store",
             FusionKind::KvCacheStoreDecode => "kv_cache_store",
@@ -4279,19 +4721,42 @@ pub fn kernel_threadgroup_for(
     (sgs * b.simd_width) as u64
 }
 
-fn fused_chain_prefers_dense_tg4(fusion: &Fusion) -> bool {
+fn fused_chain_dense_default_simdgroups(fusion: &Fusion) -> Option<u32> {
     let FusionAttrs::FusedChain { steps, .. } = &fusion.attrs else {
-        return false;
+        return None;
     };
     let mut has_dense_heavy = false;
     for step in steps {
         match step.op_name.as_str() {
-            "QuantizedMatmul" | "GatherQMM" | "QuantizedGatherQMM" => return false,
-            "Matmul" | "AddMM" => has_dense_heavy = true,
+            "QuantizedMatmul" | "GatherQMM" | "QuantizedGatherQMM" => return None,
+            "Matmul" | "AddMM" => {
+                has_dense_heavy = true;
+            }
             _ => {}
         }
     }
-    has_dense_heavy
+    if !has_dense_heavy {
+        return None;
+    }
+    Some(4)
+}
+
+fn linear_residual_dense_default_simdgroups(fusion: &Fusion) -> Option<u32> {
+    let FusionAttrs::LinearResidual { quant: None } = &fusion.attrs else {
+        return None;
+    };
+    let x_shape = fusion.inputs.first().map(|b| b.shape.as_slice())?;
+    let y_shape = fusion.outputs.first().map(|b| b.shape.as_slice())?;
+    let k_dim = x_shape.last().copied().unwrap_or(1).max(1) as u32;
+    let out_dim = y_shape.last().copied().unwrap_or(1).max(1) as u32;
+    if matches!(crate::target::current_chip(), crate::target::ChipModel::M5)
+        && k_dim >= 2048
+        && out_dim >= 2048
+    {
+        Some(2)
+    } else {
+        None
+    }
 }
 
 fn fused_chain_qmm_nax_dispatch_shape(fusion: &Fusion) -> Option<(u64, u64)> {
@@ -4437,11 +4902,21 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
         shape
             .filter(|s| !s.is_empty())
             .map(|s| crate::target::current_chip().active_tokens_for_shape(s) as u64)
-            .unwrap_or_else(|| crate::target::current_chip().active_m(8) as u64)
+            .unwrap_or_else(|| {
+                std::env::var("FUSEKIT_ACTIVE_M")
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .filter(|&n| n >= 1)
+                    .unwrap_or_else(|| {
+                        crate::target::current_chip().active_m_for_unshaped(8) as u64
+                    })
+            })
             .max(1)
     };
     let argmax_active_rows = || -> u64 {
-        let default_active_rows = crate::target::current_chip().active_m(8).max(1);
+        let default_active_rows = crate::target::current_chip()
+            .active_m_for_unshaped(8)
+            .max(1);
         std::env::var("FUSEKIT_ARGMAX_ACTIVE_ROWS")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
@@ -4459,7 +4934,7 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
                 return [TG_THREADS, 1, 1];
             };
             let token_rows = qmv_fanout_token_rows(targets) as u64;
-            let qmv_sgs = if qmv_fanout_exact_enabled() {
+            let qmv_sgs = if qmv_fanout_emit_exact(targets) {
                 qmv_fanout_exact_simdgroups() as u64
             } else {
                 qmv_fanout_targets_simdgroups(targets) as u64
@@ -4473,9 +4948,25 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
             ]
         }
         FusionKind::QmvSwiglu => {
-            let FusionAttrs::QmvSwiglu { gate, .. } = &fusion.attrs else {
+            let FusionAttrs::QmvSwiglu { gate, up } = &fusion.attrs else {
                 return [TG_THREADS, 1, 1];
             };
+            if qmv_swiglu_prefill_nax(*gate, *up) {
+                return [
+                    ceil_div(gate.out_dim as u64, 64) * 128,
+                    ceil_div(gate.active_rows.max(1), 64),
+                    1,
+                ];
+            }
+            if qmv_swiglu_prefill_qmmt(*gate, *up) {
+                let (bm, _bk, bn) =
+                    qmm_mlx_qmmt_tile(gate.k_dim, gate.out_dim, gate.active_rows, gate.bits);
+                return [
+                    ceil_div(gate.out_dim as u64, bn as u64) * 128,
+                    ceil_div(gate.active_rows.max(1), bm as u64),
+                    1,
+                ];
+            }
             let token_rows =
                 qmv_fast_token_rows(gate.active_rows, gate.bits, gate.k_dim, gate.out_dim) as u64;
             let qmv_sgs =
@@ -4493,6 +4984,48 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
                 y_tiles.max(1),
                 1,
             ]
+        }
+        FusionKind::RoutedQmvSwiglu => {
+            let FusionAttrs::RoutedQmvSwiglu { gate, .. } = &fusion.attrs else {
+                return [TG_THREADS, 1, 1];
+            };
+            let Some(shape) = fusion.outputs.first().map(|b| b.shape.as_slice()) else {
+                return [TG_THREADS, 1, 1];
+            };
+            let active_tokens = crate::target::current_chip().active_tokens_for_shape(shape) as u64;
+            let routes_per_token = if shape.len() >= 3 {
+                shape[2..shape.len().saturating_sub(1)]
+                    .iter()
+                    .map(|&d| d.max(0) as u64)
+                    .product::<u64>()
+                    .max(1)
+            } else {
+                1
+            };
+            let routes = active_tokens.saturating_mul(routes_per_token).max(1);
+            let chip_rows = crate::target::current_chip().gatherqmm_rows_per_simdgroup() as u64;
+            let rows_per_sg = if chip_rows > 1
+                && gate.out_dim as u64 >= chip_rows
+                && gate.out_dim as u64 % chip_rows == 0
+            {
+                chip_rows
+            } else {
+                1
+            };
+            let row_blocks = ceil_div(gate.out_dim as u64, rows_per_sg.max(1));
+            let total_sgs = routes.saturating_mul(row_blocks).max(1);
+            [ceil_div(total_sgs, sgs_per_tg.max(1)) * tg, 1, 1]
+        }
+        FusionKind::RoutedQmvReduce => {
+            let FusionAttrs::RoutedQmvReduce { target } = &fusion.attrs else {
+                return [TG_THREADS, 1, 1];
+            };
+            let Some(shape) = fusion.outputs.first().map(|b| b.shape.as_slice()) else {
+                return [TG_THREADS, 1, 1];
+            };
+            let active_tokens = crate::target::current_chip().active_tokens_for_shape(shape) as u64;
+            let total_sgs = active_tokens.saturating_mul(target.out_dim as u64).max(1);
+            [ceil_div(total_sgs, sgs_per_tg.max(1)) * tg, 1, 1]
         }
         FusionKind::FusedChain => {
             let steps = match &fusion.attrs {
@@ -4585,6 +5118,22 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
                 .skip(1)
                 .filter(|s| categorize_name(&s.op_name) == OpCategory::Heavy)
                 .count();
+            let pointwise_prefix_reduction_idx = steps.iter().enumerate().find_map(|(idx, s)| {
+                (idx > 0
+                    && s.op_name == "RMSNorm"
+                    && categorize_name(&s.op_name) == OpCategory::Reduction)
+                    .then_some(idx)
+            });
+            if let Some(idx) = pointwise_prefix_reduction_idx {
+                let has_heavy = steps
+                    .iter()
+                    .any(|s| categorize_name(&s.op_name) == OpCategory::Heavy);
+                if !has_heavy {
+                    let shape = &steps[idx].output_shape;
+                    let (rows, _) = rows_and_last(shape);
+                    return [rows * tg, 1, 1];
+                }
+            }
             match first_cat {
                 OpCategory::Reduction if heavy_count >= 1 => {
                     // SMEM-cached normed row × per-simdgroup heavy
@@ -4666,6 +5215,11 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
                         .and_then(|s| s.parse::<u64>().ok())
                         .filter(|&n| n > 0)
                         .unwrap_or(u64::MAX); // disabled by default
+                    let cap_swiglu: u64 = std::env::var("FUSEKIT_SWIGLU_CAP")
+                        .ok()
+                        .and_then(|s| s.parse::<u64>().ok())
+                        .filter(|&n| n > 0)
+                        .unwrap_or(u64::MAX); // disabled by default
                     let token_m_rows = if rows > 1
                         && rows_per_sg == 1
                         && steps[0].op_name == "RMSNorm"
@@ -4706,9 +5260,15 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
                     } else {
                         1
                     };
-                    let tgs_per_row = if rows == 1 && heavy_count == 1 && out_total >= 10000 {
+                    let tgs_per_row = if rows == 1 && swiglu_absorbed {
+                        exact_tgs.min(cap_swiglu)
+                    } else if rows == 1 && heavy_count == 1 && out_total >= 10000 {
                         exact_tgs.min(cap_lmhead)
-                    } else if rows == 1 && heavy_count >= 2 && exact_tgs > cap_fanout {
+                    } else if rows == 1
+                        && heavy_count >= 2
+                        && !swiglu_absorbed
+                        && exact_tgs > cap_fanout
+                    {
                         exact_tgs.min(cap_fanout)
                     } else {
                         exact_tgs
@@ -4874,12 +5434,24 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
                     return [ceil_div(rows.saturating_mul(row_n).max(1), tg) * tg, 1, 1];
                 }
                 if name == "QuantizedMatmul" {
-                    if let Some((_k_dim, out_dim, active_rows, _bits, _group_size)) =
+                    if qmm_prefill_nax_preferred(fusion) {
+                        if let Some((_k_dim, out_dim, active_rows, _bits, _group_size)) =
+                            qmm_nax_shape(fusion)
+                        {
+                            return [
+                                ceil_div(out_dim as u64, 64) * 128,
+                                ceil_div(active_rows, 64),
+                                1,
+                            ];
+                        }
+                    }
+                    if let Some((k_dim, out_dim, active_rows, bits, _group_size)) =
                         qmm_mlx_qmmt_shape(fusion)
                     {
+                        let (bm, _bk, bn) = qmm_mlx_qmmt_tile(k_dim, out_dim, active_rows, bits);
                         return [
-                            ceil_div(out_dim as u64, 32) * 128,
-                            ceil_div(active_rows, 32),
+                            ceil_div(out_dim as u64, bn as u64) * 128,
+                            ceil_div(active_rows, bm as u64),
                             1,
                         ];
                     }
@@ -4925,7 +5497,6 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
                     let last_dim = fusion.outputs[0].shape.last().copied().unwrap_or(0) as u64;
                     let active_rows = crate::target::current_chip()
                         .active_rows_before_last(&fusion.outputs[0].shape);
-                    let chip_rows = crate::target::current_chip().gemv_rows_per_simdgroup() as u64;
                     let (bits, _) = match &fusion.attrs {
                         FusionAttrs::Single { op_attrs, .. } => match op_attrs {
                             crate::graph::Attrs::Quantized { bits, group_size } => {
@@ -4935,6 +5506,7 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
                         },
                         _ => (4u32, 64u32),
                     };
+                    let chip_rows = crate::target::current_chip().gemv_rows_per_simdgroup() as u64;
                     let allow_output_row_coalesce = matches!(bits, 4 | 8);
                     let rows_per_sg = if allow_output_row_coalesce
                         && chip_rows > 1
@@ -4993,6 +5565,45 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
                         1,
                         1,
                     ];
+                }
+                if name == "ScaledDotProductAttention" {
+                    let shape = &fusion.outputs[0].shape;
+                    let n_heads = if shape.len() >= 3 {
+                        shape[shape.len() - 3].max(1) as u64
+                    } else {
+                        meta.num_attention_heads.max(1) as u64
+                    };
+                    let trace_m = if shape.len() >= 2 {
+                        shape[shape.len() - 2].max(1) as u32
+                    } else {
+                        1
+                    };
+                    let active_m = crate::target::current_chip().active_m(trace_m).max(1) as u64;
+                    if matches!(
+                        single::sdpa_prefill_plan(fusion, meta),
+                        single::SdpaPrefillPlan::FlashGqa
+                    ) {
+                        let n_kv = meta.num_key_value_heads.max(1) as u64;
+                        let (_q_heads_per_tg, q_rows_per_tg, q_head_blocks, _flash_sgs) =
+                            single::sdpa_prefill_flash_tiling(meta);
+                        let row_blocks = ceil_div(active_m, q_rows_per_tg as u64).max(1);
+                        return [
+                            row_blocks
+                                .saturating_mul(n_kv)
+                                .saturating_mul(q_head_blocks as u64)
+                                .saturating_mul(tg),
+                            1,
+                            1,
+                        ];
+                    }
+                    if matches!(
+                        single::sdpa_prefill_plan(fusion, meta),
+                        single::SdpaPrefillPlan::BlockNax
+                    ) {
+                        let row_blocks = ceil_div(active_m, 32).max(1);
+                        return [row_blocks.saturating_mul(n_heads).saturating_mul(tg), 1, 1];
+                    }
+                    return [active_m.saturating_mul(n_heads).saturating_mul(tg), 1, 1];
                 }
                 if name == "GatherQMM" {
                     // Routed expert QMM uses the same simdgroup-coop
@@ -5125,6 +5736,23 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
                         && q.bits == 4
                         && meta.hidden_size <= 4096 =>
                 {
+                    // Mid-size q4 LM heads are memory-streaming dominated.
+                    // M5 L512 profiles favor 32 TG slices; wider splits
+                    // repeat scan/finalize work without enough extra vocab
+                    // parallelism to pay for it. Keep tiny heads on the
+                    // earlier 128-TG rule above.
+                    32
+                }
+                FusionAttrs::FinalRmsNormLmHead { quant: Some(q), .. }
+                    if matches!(crate::target::current_chip(), crate::target::ChipModel::M5)
+                        && q.bits == 8
+                        && (2048..=4096).contains(&meta.hidden_size) =>
+                {
+                    // q8 mid-size LM heads still stream a large vocab
+                    // matrix, but the q8 scan has lower arithmetic density
+                    // than q4 and pays more finalize overhead when split too
+                    // widely. M5 L512 profiles favored 32 scan slices over
+                    // 48/64 for this hidden-width class.
                     32
                 }
                 _ => 64,
@@ -5141,7 +5769,33 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
         FusionKind::SdpaDecode => {
             let n_heads = meta.num_attention_heads as u64;
             let active_m = active_m_from_shape(fusion.outputs.first().map(|b| b.shape.as_slice()));
-            if sdpa_decode::flash_decoding_enabled() {
+            let qk_dim = fusion
+                .inputs
+                .first()
+                .and_then(|b| b.shape.last().copied())
+                .unwrap_or(meta.head_dim as i32)
+                .max(1) as u32;
+            let v_dim = fusion
+                .inputs
+                .get(2)
+                .and_then(|b| b.shape.last().copied())
+                .or_else(|| {
+                    fusion.outputs.first().and_then(|b| {
+                        b.shape
+                            .last()
+                            .copied()
+                            .map(|d| d / (meta.num_attention_heads as i32).max(1))
+                    })
+                })
+                .unwrap_or(meta.head_dim as i32)
+                .max(1) as u32;
+            if sdpa_decode::flash_decoding_enabled_for(
+                meta.num_attention_heads,
+                meta.num_key_value_heads,
+                qk_dim,
+                v_dim,
+                active_m as u32,
+            ) {
                 // Flash-Decoding: n_heads × MAX_CHUNKS TGs. Empty
                 // chunks early-exit before touching the counter, so
                 // the over-spawn is essentially free; the win is the
@@ -5165,6 +5819,15 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
             [n_heads * tg, 1, 1]
         }
         FusionKind::LinearResidual => {
+            if let Some((_k_dim, out_dim, active_rows, _bits, _group_size)) =
+                linear_residual_nax_shape(fusion)
+            {
+                return [
+                    ceil_div(out_dim as u64, 64) * 128,
+                    ceil_div(active_rows, 64),
+                    1,
+                ];
+            }
             if let Some((k_dim, out_dim, active_rows, bits, _group_size)) =
                 linear_residual_mlx_qmv_fast_shape(fusion)
             {
@@ -5185,9 +5848,17 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
                     1,
                 ];
             }
-            // Simdgroup-coop GEMV — 1 simdgroup per output row.
+            // Simdgroup-coop GEMV. Dense bf16/fp16 residual projections can
+            // compute multiple adjacent output rows per simdgroup, reusing the
+            // same activation vector load while keeping the weight layout
+            // unchanged. Keep dispatch in lockstep with that shape policy.
             let n_out = elems(&fusion.outputs[0].shape);
-            [ceil_div(n_out, sgs_per_tg) * tg, 1, 1]
+            let dense_rows = 1;
+            [
+                ceil_div(n_out, sgs_per_tg.saturating_mul(dense_rows).max(1)) * tg,
+                1,
+                1,
+            ]
         }
         FusionKind::SwigluActivation => {
             let n = elems(&fusion.outputs[0].shape);
@@ -5230,13 +5901,6 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
             [ceil_div(n, tg) * tg, 1, 1]
         }
         FusionKind::KvCacheStoreDecode => {
-            let active_m = active_m_from_shape(
-                fusion
-                    .outputs
-                    .first()
-                    .map(|b| b.shape.as_slice())
-                    .or_else(|| fusion.inputs.first().map(|b| b.shape.as_slice())),
-            );
             let k_dim = fusion
                 .inputs
                 .first()
@@ -5251,16 +5915,35 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
                 .copied()
                 .unwrap_or(meta.head_dim as i32)
                 .max(1) as u64;
-            let n_kv = if let Some(shape) = fusion.inputs.first().map(|b| b.shape.as_slice()) {
-                if shape.len() >= 4 {
-                    shape[shape.len() - 3].max(1) as u64
-                } else if shape.len() >= 2 {
-                    shape[0].max(1) as u64
+            let (n_kv, trace_m) =
+                if let Some(shape) = fusion.inputs.first().map(|b| b.shape.as_slice()) {
+                    if shape.len() >= 3 {
+                        let a = shape[shape.len() - 3].max(1) as u64;
+                        let b = shape[shape.len() - 2].max(1) as u64;
+                        let meta_n_kv = meta.num_key_value_heads.max(1) as u64;
+                        if b == meta_n_kv && a != meta_n_kv {
+                            (b, a)
+                        } else {
+                            (a, b)
+                        }
+                    } else if shape.len() == 2 {
+                        (shape[0].max(1) as u64, 1)
+                    } else {
+                        (meta.num_key_value_heads.max(1) as u64, 1)
+                    }
                 } else {
-                    meta.num_key_value_heads as u64
-                }
+                    (meta.num_key_value_heads.max(1) as u64, 1)
+                };
+            let active_m = if let Some(env_m) = std::env::var("FUSEKIT_ACTIVE_M")
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .filter(|&n| n >= 1)
+            {
+                env_m
             } else {
-                meta.num_key_value_heads as u64
+                crate::target::current_chip()
+                    .active_m(trace_m as u32)
+                    .max(1) as u64
             };
             [ceil_div(active_m * n_kv * (k_dim + v_dim), tg) * tg, 1, 1]
         }
@@ -5276,7 +5959,11 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
             [active_m * 2 * n_kv * tg, 1, 1]
         }
         FusionKind::EmbedLookupDecode => {
-            let active_m = crate::target::current_chip().active_m(8) as u64;
+            let active_m = std::env::var("FUSEKIT_ACTIVE_M")
+                .ok()
+                .and_then(|s| s.trim().parse::<u64>().ok())
+                .filter(|&n| n >= 1)
+                .unwrap_or_else(|| crate::target::current_chip().active_m(1) as u64);
             let n = active_m.max(1) * meta.hidden_size as u64;
             [ceil_div(n, tg) * tg, 1, 1]
         }

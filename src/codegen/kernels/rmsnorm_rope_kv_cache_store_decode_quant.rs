@@ -46,7 +46,7 @@ pub fn emit(
         .inputs
         .first()
         .map(|b| crate::target::current_chip().active_tokens_for_shape(&b.shape))
-        .unwrap_or_else(|| crate::target::current_chip().active_m(8))
+        .unwrap_or_else(|| crate::target::current_chip().active_m_for_unshaped(8))
         .max(1);
     let t = crate::codegen::kernels::act_ty(meta);
     let el_per_int = 32 / bits;

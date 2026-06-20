@@ -12,24 +12,71 @@ use crate::codegen::msl::MslWriter;
 use crate::fusion::ir::{Fusion, FusionAttrs, FusionKind, ModelMeta};
 use crate::task::ir::PartitionPlan;
 
-fn current_layout(shape: &[i32]) -> Result<(u32, u32, u32)> {
+#[derive(Clone, Copy)]
+enum CurrentOrder {
+    HeadSeqDim,
+    SeqHeadDim,
+}
+
+#[derive(Clone, Copy)]
+struct CurrentLayout {
+    n_kv: u32,
+    seq: u32,
+    dim: u32,
+    order: CurrentOrder,
+}
+
+fn current_layout(shape: &[i32], meta_n_kv: u32) -> Result<CurrentLayout> {
     if shape.len() >= 4 {
         let n = shape.len();
-        return Ok((
-            shape[n - 3].max(1) as u32,
-            shape[n - 2].max(1) as u32,
-            shape[n - 1].max(1) as u32,
-        ));
+        let a = shape[n - 3].max(1) as u32;
+        let b = shape[n - 2].max(1) as u32;
+        let dim = shape[n - 1].max(1) as u32;
+        // Prepared attention K/V commonly arrives as either
+        // `[B, H, T, D]` (MLX attention layout) or `[B, T, H, D]`.
+        // Preserve the semantic head axis instead of assuming token-major
+        // storage; MLA traces use `[B, H, T, D]`.
+        if meta_n_kv > 0 && b == meta_n_kv && a != meta_n_kv {
+            return Ok(CurrentLayout {
+                n_kv: b,
+                seq: a,
+                dim,
+                order: CurrentOrder::SeqHeadDim,
+            });
+        }
+        return Ok(CurrentLayout {
+            n_kv: a,
+            seq: b,
+            dim,
+            order: CurrentOrder::HeadSeqDim,
+        });
     }
     if shape.len() == 3 {
-        return Ok((
-            shape[0].max(1) as u32,
-            shape[1].max(1) as u32,
-            shape[2].max(1) as u32,
-        ));
+        let a = shape[0].max(1) as u32;
+        let b = shape[1].max(1) as u32;
+        let dim = shape[2].max(1) as u32;
+        if meta_n_kv > 0 && b == meta_n_kv && a != meta_n_kv {
+            return Ok(CurrentLayout {
+                n_kv: b,
+                seq: a,
+                dim,
+                order: CurrentOrder::SeqHeadDim,
+            });
+        }
+        return Ok(CurrentLayout {
+            n_kv: a,
+            seq: b,
+            dim,
+            order: CurrentOrder::HeadSeqDim,
+        });
     }
     if shape.len() == 2 {
-        return Ok((shape[0].max(1) as u32, 1, shape[1].max(1) as u32));
+        return Ok(CurrentLayout {
+            n_kv: shape[0].max(1) as u32,
+            seq: 1,
+            dim: shape[1].max(1) as u32,
+            order: CurrentOrder::HeadSeqDim,
+        });
     }
     bail!("KvCacheStoreDecode: unsupported current K/V shape {shape:?}");
 }
@@ -50,24 +97,42 @@ pub fn emit(
         bail!("KvCacheStoreDecode expects K and V inputs");
     }
 
-    let (n_kv_k, k_seq, k_dim) = current_layout(&fusion.inputs[0].shape)?;
-    let (n_kv_v, v_seq, v_dim) = current_layout(&fusion.inputs[1].shape)?;
-    if n_kv_k != n_kv_v {
-        bail!("KvCacheStoreDecode K/V head count mismatch: {n_kv_k} vs {n_kv_v}");
+    let meta_n_kv = meta.num_key_value_heads.max(1);
+    let k_layout = current_layout(&fusion.inputs[0].shape, meta_n_kv)?;
+    let v_layout = current_layout(&fusion.inputs[1].shape, meta_n_kv)?;
+    if k_layout.n_kv != v_layout.n_kv {
+        bail!(
+            "KvCacheStoreDecode K/V head count mismatch: {} vs {}",
+            k_layout.n_kv,
+            v_layout.n_kv
+        );
     }
-    let n_kv = n_kv_k;
+    let n_kv = k_layout.n_kv;
     let t = crate::codegen::kernels::act_ty(meta);
     let fn_name = function_name(fusion);
     let active_m = fusion
         .inputs
         .first()
-        .map(|b| crate::target::current_chip().active_tokens_for_shape(&b.shape))
-        .unwrap_or_else(|| crate::target::current_chip().active_m(8))
+        .and_then(|_| {
+            let trace_m = k_layout.seq.min(v_layout.seq).max(1);
+            Some(crate::target::current_chip().active_m(trace_m))
+        })
+        .unwrap_or_else(|| crate::target::current_chip().active_m_for_unshaped(8))
         .max(1);
+    let k_head_major = matches!(k_layout.order, CurrentOrder::HeadSeqDim);
+    let v_head_major = matches!(v_layout.order, CurrentOrder::HeadSeqDim);
 
     w.line(format!(
-        "// Fusion #{}: KvCacheStoreDecode (active_m={}, n_kv={}, k_dim={}, v_dim={}, k_seq={}, v_seq={})",
-        fusion.id, active_m, n_kv, k_dim, v_dim, k_seq, v_seq
+        "// Fusion #{}: KvCacheStoreDecode (active_m={}, n_kv={}, k_dim={}, v_dim={}, k_seq={}, v_seq={}, k_head_major={}, v_head_major={})",
+        fusion.id,
+        active_m,
+        n_kv,
+        k_layout.dim,
+        v_layout.dim,
+        k_layout.seq,
+        v_layout.seq,
+        k_head_major,
+        v_head_major
     ));
     w.line(format!("kernel void {fn_name}("));
     w.push_indent();
@@ -85,10 +150,18 @@ pub fn emit(
     w.push_indent();
     w.writeln(format_args!("constexpr uint N_KV  = {n_kv};"));
     w.writeln(format_args!("constexpr uint ACTIVE_M = {active_m};"));
-    w.writeln(format_args!("constexpr uint K_SEQ = {k_seq};"));
-    w.writeln(format_args!("constexpr uint V_SEQ = {v_seq};"));
-    w.writeln(format_args!("constexpr uint K_DIM = {k_dim};"));
-    w.writeln(format_args!("constexpr uint V_DIM = {v_dim};"));
+    w.writeln(format_args!("constexpr uint K_SEQ = {};", k_layout.seq));
+    w.writeln(format_args!("constexpr uint V_SEQ = {};", v_layout.seq));
+    w.writeln(format_args!("constexpr uint K_DIM = {};", k_layout.dim));
+    w.writeln(format_args!("constexpr uint V_DIM = {};", v_layout.dim));
+    w.writeln(format_args!(
+        "constexpr bool K_HEAD_MAJOR = {};",
+        if k_head_major { "true" } else { "false" }
+    ));
+    w.writeln(format_args!(
+        "constexpr bool V_HEAD_MAJOR = {};",
+        if v_head_major { "true" } else { "false" }
+    ));
     w.line("constexpr uint K_RANGE = N_KV * K_DIM;");
     w.line("constexpr uint TOKEN_RANGE = K_RANGE + N_KV * V_DIM;");
     w.blank();
@@ -101,7 +174,7 @@ pub fn emit(
     w.push_indent();
     w.line("uint h = local / K_DIM;");
     w.line("uint d = local - h * K_DIM;");
-    w.line("uint src = (row * N_KV + h) * K_SEQ * K_DIM + d;");
+    w.line("uint src = K_HEAD_MAJOR ? ((h * K_SEQ + row) * K_DIM + d) : ((row * N_KV + h) * K_DIM + d);");
     w.line("uint dst = h * capacity * K_DIM + (offset + row) * K_DIM + d;");
     w.line("cache_keys[dst] = K[src];");
     w.pop_indent();
@@ -110,7 +183,7 @@ pub fn emit(
     w.line("uint vg = local - K_RANGE;");
     w.line("uint h = vg / V_DIM;");
     w.line("uint d = vg - h * V_DIM;");
-    w.line("uint src = (row * N_KV + h) * V_SEQ * V_DIM + d;");
+    w.line("uint src = V_HEAD_MAJOR ? ((h * V_SEQ + row) * V_DIM + d) : ((row * N_KV + h) * V_DIM + d);");
     w.line("uint dst = h * capacity * V_DIM + (offset + row) * V_DIM + d;");
     w.line("cache_values[dst] = V[src];");
     w.pop_indent();

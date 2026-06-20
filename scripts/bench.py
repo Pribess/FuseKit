@@ -26,6 +26,12 @@ def main() -> int:
         "--prompt",
         default="Repeat the word token forever: token token token",
     )
+    parser.add_argument(
+        "--prompt-repeat",
+        type=int,
+        default=1,
+        help="Repeat the prompt text before tokenization to create long-prefill benches.",
+    )
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--max-kv-size", type=int, default=None)
     parser.add_argument("--kv-bits", type=int, choices=(4, 8), default=None)
@@ -55,6 +61,8 @@ def main() -> int:
         f"fk_chunk={os.environ.get('FK_CHUNK', '')!r}",
         flush=True,
     )
+    if args.prompt_repeat > 1:
+        args.prompt = (args.prompt + " ") * args.prompt_repeat
 
     started = time.perf_counter()
     model, tokenizer = load(args.model_dir)

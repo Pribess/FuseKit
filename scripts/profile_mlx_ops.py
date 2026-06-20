@@ -207,8 +207,29 @@ def encode_prompt(tokenizer: Any, prompt: str) -> mx.array:
     return mx.array(tokenizer.encode(prompt, add_special_tokens=add_special_tokens))
 
 
+def make_prompt_ids(tokenizer: Any, length: int) -> mx.array:
+    text = (
+        "Write a concise Python function that parses JSON lines, validates "
+        "required fields, and returns aggregate statistics. "
+    )
+    pieces: list[int] = []
+    repeated = text
+    while len(pieces) < length:
+        pieces = tokenizer.encode(repeated, add_special_tokens=True)
+        repeated += text
+    return mx.array(pieces[:length], dtype=mx.uint32)
+
+
 def cache_state(cache: Any) -> list[Any]:
-    return [c.state for c in cache]
+    states: list[Any] = []
+    for c in cache:
+        try:
+            state = c.state
+        except Exception:
+            continue
+        if state is not None:
+            states.append(state)
+    return states
 
 
 def prefill(model: Any, prompt: mx.array, prompt_cache: Any, step_size: int) -> mx.array:
@@ -290,8 +311,14 @@ def main() -> int:
     parser.add_argument("--tokens", type=int, default=4)
     parser.add_argument("--warmup", type=int, default=1)
     parser.add_argument("--prefill-step-size", type=int, default=2048)
+    parser.add_argument("--prompt-length", type=int, default=0)
     parser.add_argument("--top", type=int, default=32)
     parser.add_argument("--include-modules", action="store_true")
+    parser.add_argument(
+        "--profile-prefill-only",
+        action="store_true",
+        help="profile the prompt block forward instead of decode tokens",
+    )
     parser.add_argument("--kv-bits", type=int, choices=(4, 8), default=None)
     parser.add_argument("--kv-group-size", type=int, default=64)
     parser.add_argument("--quantized-kv-start", type=int, default=0)
@@ -316,8 +343,26 @@ def main() -> int:
     tokenizer.eos_token_ids = set()
     mx.synchronize()
 
-    prompt = encode_prompt(tokenizer, args.prompt)
+    prompt = (
+        make_prompt_ids(tokenizer, args.prompt_length)
+        if args.prompt_length > 0
+        else encode_prompt(tokenizer, args.prompt)
+    )
     prompt_cache = make_prompt_cache(model)
+    if args.profile_prefill_only:
+        mx.synchronize()
+        PROF.enabled = True
+        started = time.perf_counter()
+        token = prefill(model, prompt, prompt_cache, args.prefill_step_size)
+        mx.synchronize()
+        PROF.enabled = False
+        print(
+            f"[mlx-op-profile] wall_us={(time.perf_counter() - started) * 1_000_000.0:.2f}",
+            flush=True,
+        )
+        summarize(args.top)
+        return 0
+
     token = prefill(model, prompt, prompt_cache, args.prefill_step_size)
     maybe_quantize_kv_cache(
         prompt_cache,

@@ -31,15 +31,7 @@ pub fn emit(
         bail!("QmvFanout output count mismatch");
     }
 
-    let exact = crate::codegen::kernels::qmv_fanout_exact_enabled()
-        || targets.iter().any(|target| {
-            !crate::codegen::kernels::qmv_fast_shape_is_tail_free(
-                target.k_dim,
-                target.out_dim,
-                target.active_rows,
-                target.bits,
-            )
-        });
+    let exact = crate::codegen::kernels::qmv_fanout_emit_exact(targets);
     let first = targets[0];
     let qmv_sgs = if exact {
         crate::codegen::kernels::qmv_fanout_exact_simdgroups()

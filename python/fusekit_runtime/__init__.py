@@ -40,6 +40,397 @@ def _dispatch_enabled() -> bool:
     return True
 
 
+def _prefill_pad_multiple() -> int:
+    if _env_flag("FUSEKIT_DISABLE_PADDED_PREFILL"):
+        return 1
+    raw = os.environ.get("FUSEKIT_PREFILL_PAD_MULTIPLE", "32")
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 32
+    return max(1, min(value, 256))
+
+
+def _cache_supports_padded_prefill(cache: Any) -> bool:
+    """True when appended pad rows can be removed by cache.trim().
+
+    This is intentionally cache-semantics based. Plain KV caches expose a
+    visible offset and `trim(n)` removes the appended rows from future attention.
+    Recurrent/stateful caches such as ArraysCache cannot be made correct by
+    trimming only KV visibility, so they stay on the normal unpadded path.
+    """
+    if not cache:
+        return False
+    allowed = {
+        "KVCache",
+        "QuantizedKVCache",
+        "SimpleKVCache",
+        "RotatingKVCache",
+        "BatchKVCache",
+    }
+    for c in cache:
+        if c is None or not callable(getattr(c, "trim", None)):
+            return False
+        if type(c).__name__ not in allowed:
+            return False
+    return True
+
+
+def _model_uses_quantized_linear(model: Any) -> bool:
+    cached = getattr(model, "_fk_uses_quantized_linear", None)
+    if cached is not None:
+        return bool(cached)
+    root = getattr(model, "_fk_original", model)
+    seen: set[int] = set()
+
+    def visit(value: Any, depth: int) -> bool:
+        if depth > 8:
+            return False
+        obj_id = id(value)
+        if obj_id in seen:
+            return False
+        seen.add(obj_id)
+        if type(value).__name__ == "QuantizedLinear":
+            return True
+        if isinstance(value, dict):
+            return any(visit(v, depth + 1) for v in value.values())
+        if isinstance(value, (list, tuple)):
+            return any(visit(v, depth + 1) for v in value)
+        attrs = getattr(value, "__dict__", None)
+        if not attrs:
+            return False
+        for child in attrs.values():
+            if isinstance(child, (str, bytes, int, float, bool, type(None))):
+                continue
+            if visit(child, depth + 1):
+                return True
+        return False
+
+    result = visit(root, 0)
+    try:
+        model.__dict__["_fk_uses_quantized_linear"] = result
+    except Exception:
+        pass
+    if root is not model:
+        try:
+            root.__dict__["_fk_uses_quantized_linear"] = result
+        except Exception:
+            pass
+    return result
+
+
+def _pad_prefill_tokens_if_safe(tokens: Any, cache: Any, model: Any | None = None) -> tuple[Any, int]:
+    multiple = _prefill_pad_multiple()
+    if multiple <= 1 or not _cache_supports_padded_prefill(cache):
+        return tokens, 0
+    if (
+        model is not None
+        and not _env_flag("FUSEKIT_FORCE_PADDED_PREFILL")
+        and not _model_uses_quantized_linear(model)
+    ):
+        return tokens, 0
+    try:
+        n = int(tokens.shape[0])
+    except Exception:
+        return tokens, 0
+    padded = ((n + multiple - 1) // multiple) * multiple
+    extra = padded - n
+    if extra <= 0:
+        return tokens, 0
+    import mlx.core as mx
+
+    pad = mx.zeros((extra,), dtype=tokens.dtype)
+    return mx.concatenate([tokens, pad], axis=0), extra
+
+
+def _trim_prompt_cache_in_place(cache: Any, n: int) -> None:
+    if n <= 0:
+        return
+    for c in cache or []:
+        trim = getattr(c, "trim", None)
+        if callable(trim):
+            trim(n)
+
+
+class _FusekitSeededTokenList(list):
+    """One-token prompt segment carrying a precomputed first generation token.
+
+    oMLX external prefill normally returns the final prompt token; mlx-lm's
+    GenerationBatch constructor processes it once and silently primes the first
+    generated token.  When FuseKit has already run full-prompt prefill and
+    sampled that first generated token, the segment must carry metadata so the
+    first GenerationBatch.next() can emit it instead of dropping it.
+    """
+
+
+def _get_attr_path(root: Any, path: str) -> Any | None:
+    cur = root
+    if not path:
+        return cur
+    for seg in path.split("."):
+        try:
+            cur = getattr(cur, seg)
+        except Exception:
+            return None
+    return cur
+
+
+def _full_prefill_components(model: Any) -> tuple[Any, Any] | None:
+    """Find a semantic transformer backbone plus final projection.
+
+    mlx-lm outer language models commonly implement:
+
+        hidden = backbone(tokens, cache)
+        logits = lm_head(hidden) or embed_tokens.as_linear(hidden)
+
+    During generation we only need logits for the final real prompt row. This
+    helper discovers that structure by module capabilities, not model names, so
+    it works for Qwen2/Qwen3-style architectures and falls back for anything
+    that does not expose the same contract.
+    """
+    original = getattr(model, "_fk_original", model)
+    if original is None:
+        return None
+
+    backbone = None
+    for path in (
+        "model",
+        "language_model.model",
+        "language_model.model.model",
+        "text_model.model",
+    ):
+        candidate = _get_attr_path(original, path)
+        if candidate is not None and candidate is not original and callable(candidate):
+            backbone = candidate
+            break
+    if backbone is None:
+        return None
+
+    holders = [
+        original,
+        _get_attr_path(original, "language_model"),
+        _get_attr_path(original, "model"),
+        _get_attr_path(original, "text_model"),
+        backbone,
+    ]
+    tie_word_embeddings = None
+    for holder in holders:
+        args = getattr(holder, "args", None)
+        if args is None:
+            continue
+        value = getattr(args, "tie_word_embeddings", None)
+        if value is not None:
+            tie_word_embeddings = bool(value)
+            break
+
+    if tie_word_embeddings is not False:
+        for holder in (backbone, *holders):
+            embed = getattr(holder, "embed_tokens", None)
+            as_linear = getattr(embed, "as_linear", None)
+            if callable(as_linear):
+                return backbone, as_linear
+        if tie_word_embeddings is True:
+            return None
+
+    for holder in holders:
+        lm_head = getattr(holder, "lm_head", None)
+        if callable(lm_head):
+            return backbone, lm_head
+    return None
+
+
+def _pad_full_prefill_tokens_if_safe(tokens: Any, cache: Any) -> tuple[Any, int]:
+    multiple = _prefill_pad_multiple()
+    if multiple <= 1 or not _cache_supports_padded_prefill(cache):
+        return tokens, 0
+    try:
+        n = int(tokens.shape[0])
+    except Exception:
+        return tokens, 0
+    padded = ((n + multiple - 1) // multiple) * multiple
+    extra = padded - n
+    if extra <= 0:
+        return tokens, 0
+    import mlx.core as mx
+
+    return mx.concatenate([tokens, mx.zeros((extra,), dtype=tokens.dtype)], axis=0), extra
+
+
+def _try_full_prefill_last_logits(model: Any, tokens: Any, cache: Any) -> Any | None:
+    if _env_flag("FUSEKIT_DISABLE_FULL_PREFILL_LAST_LOGITS"):
+        return None
+    if not _cache_supports_padded_prefill(cache):
+        return None
+    try:
+        real_len = int(tokens.shape[0])
+    except Exception:
+        return None
+    if real_len <= 1:
+        return None
+    components = _full_prefill_components(model)
+    if components is None:
+        return None
+    backbone, projector = components
+    run_tokens, pad_extra = _pad_full_prefill_tokens_if_safe(tokens, cache)
+    try:
+        hidden = backbone(run_tokens[None], cache=cache)
+        if isinstance(hidden, tuple):
+            hidden = hidden[0]
+        if getattr(hidden, "shape", None) is None or len(hidden.shape) < 3:
+            raise RuntimeError("fusekit full prefill backbone returned invalid hidden state")
+        last_hidden = hidden[:, real_len - 1:real_len, :]
+        return projector(last_hidden)
+    finally:
+        _trim_prompt_cache_in_place(cache, pad_extra)
+
+
+def _sampling_seed_replay_safe(request: Any) -> bool:
+    params = getattr(request, "sampling_params", None)
+    if params is None:
+        return True
+    seed = getattr(params, "seed", None)
+    if seed is None:
+        return True
+    # A later oMLX scheduler block re-applies the request seed immediately
+    # before BatchGenerator.insert(). For stochastic samplers that would replay
+    # the RNG and make the second-token distribution wrong. Greedy is seed-free.
+    temp = getattr(params, "temperature", None)
+    try:
+        return float(temp if temp is not None else 0.0) == 0.0
+    except Exception:
+        return False
+
+
+def _engine_full_prefill_seed_candidate(
+    scheduler: Any,
+    request: Any,
+    tokens: list[int],
+    existing_cache: Any,
+    vlm_embeds: Any,
+    stats: dict[str, int] | None = None,
+) -> tuple[Any, list[int]] | None:
+    """Run oMLX external prefill as a full-prompt prefill when safe.
+
+    This mirrors mlxcel's shape/runtime idea: process all prompt tokens in one
+    backbone pass, optionally pad to a tile multiple, trim the cache, project
+    only the last real hidden row, and seed GenerationBatch with the first
+    generated token.  The path is deliberately semantic/contract based, not
+    model-name based.
+    """
+    def miss(reason: str) -> None:
+        if stats is not None:
+            stats["engine_full_prefill_seed_miss"] = (
+                stats.get("engine_full_prefill_seed_miss", 0) + 1
+            )
+            key = f"engine_full_prefill_seed_miss_{reason}"
+            stats[key] = stats.get(key, 0) + 1
+        if os.environ.get("FUSEKIT_DBG_ENGINE_PREFILL_SEED"):
+            print(
+                f"[fusekit-engine-prefill-seed] miss={reason}",
+                file=sys.stderr,
+                flush=True,
+            )
+
+    if stats is not None:
+        stats["engine_full_prefill_seed_attempt"] = (
+            stats.get("engine_full_prefill_seed_attempt", 0) + 1
+        )
+
+    if _env_flag("FUSEKIT_DISABLE_ENGINE_FULL_PREFILL_SEED"):
+        miss("disabled")
+        return None
+    if vlm_embeds is not None or existing_cache is not None:
+        miss("stateful_request")
+        return None
+    if not tokens or len(tokens) <= 1:
+        miss("short_tokens")
+        return None
+    if getattr(request, "specprefill_indices", None) is not None:
+        miss("specprefill")
+        return None
+    if getattr(request, "vlm_inputs_embeds", None) is not None:
+        miss("vlm")
+        return None
+    if not _sampling_seed_replay_safe(request):
+        miss("sampler_seed")
+        return None
+
+    # Keep the first implementation on the same safe surface as the existing
+    # benchmark path: one row at a time, no SSD boundary snapshot bookkeeping,
+    # no prefill hard-limit loop, and no in-flight prompt/generation merge.
+    config = getattr(scheduler, "config", None)
+    if getattr(config, "paged_cache_block_size", 0) and getattr(scheduler, "block_aware_cache", None) is not None:
+        miss("paged_cache")
+        return None
+    if getattr(scheduler, "_memory_limit_bytes", 0) or getattr(scheduler, "_memory_hard_limit_bytes", 0):
+        miss("memory_limit")
+        return None
+    bg = getattr(scheduler, "batch_generator", None)
+    if bg is not None:
+        try:
+            if len(getattr(bg, "_prompt_batch", [])) or len(getattr(bg, "_generation_batch", [])):
+                miss("active_batches")
+                return None
+        except Exception:
+            miss("batch_state")
+            return None
+        if int(getattr(bg, "prefill_batch_size", 1) or 1) != 1:
+            miss("prefill_batch_size")
+            return None
+
+    try:
+        sampler, logits_processors = scheduler._build_sampler_and_processors(
+            request.sampling_params, request
+        )
+    except Exception:
+        miss("sampler_build")
+        return None
+    if logits_processors:
+        miss("logits_processors")
+        return None
+
+    try:
+        from mlx_lm.models.cache import make_prompt_cache
+        import mlx.core as mx
+
+        prompt_cache = make_prompt_cache(scheduler.model)
+        if not _cache_supports_padded_prefill(prompt_cache):
+            miss("cache_type")
+            return None
+        if hasattr(scheduler.model, "clear_vlm_position_state"):
+            scheduler.model.clear_vlm_position_state()
+        token_arr = mx.array(tokens)
+        logits = _try_full_prefill_last_logits(scheduler.model, token_arr, prompt_cache)
+        if logits is None:
+            miss("last_logits")
+            return None
+        if getattr(logits, "shape", None) is None:
+            miss("logits_shape")
+            return None
+        if len(logits.shape) == 3:
+            logits_2d = logits[:, -1, :]
+        elif len(logits.shape) == 2:
+            logits_2d = logits
+        else:
+            miss("logits_rank")
+            return None
+        logprobs = logits_2d - mx.logsumexp(logits_2d, axis=-1, keepdims=True)
+        first = sampler(logprobs)
+        mx.eval(first, logprobs, [c.state for c in prompt_cache])
+        first_token = int(first.item())
+    except Exception:
+        miss("exception")
+        return None
+
+    seeded = _FusekitSeededTokenList([first_token])
+    seeded._fusekit_seeded_first_token = first_token
+    try:
+        seeded._fusekit_seeded_first_logprobs = logprobs[0]
+    except Exception:
+        seeded._fusekit_seeded_first_logprobs = None
+    return prompt_cache, seeded
+
+
 def _mlx_generate_kwargs_are_greedy(kw: dict[str, Any]) -> bool:
     """True only when mlx-lm's public generate_step contract is argmax.
 
@@ -231,6 +622,23 @@ def _register_dispatch_stats_printer(wrapper: Any) -> None:
             f"native_passthrough={native}({native_pct:.1f}%) "
             f"single_decode={int(stats.get('single_decode', 0) or 0)} "
             f"single_decode_hit={int(stats.get('single_decode_hit', 0) or 0)} "
+            f"prefill_variant={int(stats.get('prefill_variant', 0) or 0)} "
+            f"prefill_variant_hit={int(stats.get('prefill_variant_hit', 0) or 0)} "
+            f"prefill_variant_missing={int(stats.get('prefill_variant_missing', 0) or 0)} "
+            f"prefill_variant_no_output={int(stats.get('prefill_variant_no_output', 0) or 0)} "
+            f"prefill_variant_chunk_call={int(stats.get('prefill_variant_chunk_call', 0) or 0)} "
+            f"prefill_variant_chunk_attempt={int(stats.get('prefill_variant_chunk_attempt', 0) or 0)} "
+            f"prefill_variant_chunk={int(stats.get('prefill_variant_chunk', 0) or 0)} "
+            f"prefill_variant_chunk_hit={int(stats.get('prefill_variant_chunk_hit', 0) or 0)} "
+            f"prefill_variant_chunk_missing={int(stats.get('prefill_variant_chunk_missing', 0) or 0)} "
+            f"prefill_variant_chunk_no_storage={int(stats.get('prefill_variant_chunk_no_storage', 0) or 0)} "
+            f"prefill_variant_chunk_no_output={int(stats.get('prefill_variant_chunk_no_output', 0) or 0)} "
+            f"prefill_variant_stateful_disabled={int(stats.get('prefill_variant_stateful_disabled', 0) or 0)} "
+            f"engine_full_prefill_seed_attempt={int(stats.get('engine_full_prefill_seed_attempt', 0) or 0)} "
+            f"engine_full_prefill_seed={int(stats.get('engine_full_prefill_seed', 0) or 0)} "
+            f"engine_full_prefill_seed_miss={int(stats.get('engine_full_prefill_seed_miss', 0) or 0)} "
+            f"native_prefill_no_logits={int(stats.get('native_prefill_no_logits', 0) or 0)} "
+            f"native_prefill_last_logits={int(stats.get('native_prefill_last_logits', 0) or 0)} "
             f"mtp_verify={mtp_verify} "
             f"mtp_variant_attempt={int(stats.get('mtp_variant_attempt', 0) or 0)} "
             f"mtp_variant_hit={variant_hits}({mtp_variant_pct:.1f}%) "
@@ -1645,6 +2053,189 @@ def _ensure_cache_capacity(cache: Any, required: int) -> tuple[bool, str | None]
     return True, None
 
 
+def _prefill_kv_shape_from_config(model: Any, seq_len: int) -> tuple[int, int, int] | None:
+    """Return (n_kv_heads, k_head_dim, v_head_dim) for cache preallocation.
+
+    MLX allocates an empty KVCache lazily from the first K/V tensors passed to
+    `update_and_fetch`. FuseKit's prefill variant writes K/V directly into the
+    cache, so the host must create the same storage before dispatch. The shape
+    comes from semantic config fields, not model names.
+    """
+    fk_dir = getattr(model, "_fk_dir", None)
+    if fk_dir is None:
+        return None
+    cfg = _read_json_file(Path(fk_dir).parent / "config.json") or {}
+    cfg = cfg.get("text_config", cfg)
+    try:
+        hidden = int(cfg["hidden_size"])
+        n_heads = int(cfg["num_attention_heads"])
+        n_kv_heads = int(cfg.get("num_key_value_heads") or n_heads)
+    except Exception:
+        return None
+    if n_heads <= 0 or n_kv_heads <= 0:
+        return None
+    head_dim = int(cfg.get("head_dim") or (hidden // n_heads))
+    if head_dim <= 0:
+        return None
+    v_head_dim = int(cfg.get("v_head_dim") or cfg.get("value_head_dim") or head_dim)
+    return n_kv_heads, head_dim, v_head_dim
+
+
+def _prefill_activation_dtype(model: Any):
+    import mlx.core as mx
+
+    fk_dir = getattr(model, "_fk_dir", None)
+    cfg = {}
+    root_cfg = {}
+    if fk_dir is not None:
+        root_cfg = _read_json_file(Path(fk_dir).parent / "config.json") or {}
+        cfg = root_cfg.get("text_config", root_cfg)
+    # Hybrid linear-attention models keep prefill/full-attention state in
+    # the model activation dtype even when weights are quantized. Plain
+    # qwen2-style quantized models still materialize KV as fp16, so keep
+    # the older quantized-linear rule for configs without linear attention.
+    has_linear_attention = any(
+        str(t) == "linear_attention" for t in cfg.get("layer_types", []) or []
+    )
+    if _model_uses_quantized_linear(model) and not has_linear_attention:
+        return mx.float16
+    dtype_name = (
+        cfg.get("torch_dtype")
+        or cfg.get("dtype")
+        or root_cfg.get("torch_dtype")
+        or root_cfg.get("dtype")
+    )
+    if dtype_name in ("bfloat16", "bf16"):
+        return mx.bfloat16
+    if dtype_name in ("float32", "fp32"):
+        return mx.float32
+    return mx.float16 if root_cfg.get("quantization") is not None else mx.bfloat16
+
+
+def _dtype_from_config_name(name: Any, default: Any):
+    import mlx.core as mx
+
+    if name in ("bfloat16", "bf16"):
+        return mx.bfloat16
+    if name in ("float16", "fp16", "half"):
+        return mx.float16
+    if name in ("float32", "fp32"):
+        return mx.float32
+    return default
+
+
+def _prefill_arrays_cache_spec_from_config(
+    model: Any,
+) -> tuple[tuple[int, int, int], tuple[int, int, int, int], Any, Any] | None:
+    """Return ArraysCache zero-state shapes for linear-attention layers.
+
+    The layout is config-semantic:
+      cache[0] convolution window: [B, conv_kernel - 1, qkv_width]
+      cache[1] recurrent state:    [B, value_heads, value_dim, key_dim]
+
+    This covers Qwen3.5/Next-style gated delta linear attention without a
+    model-name table.
+    """
+    fk_dir = getattr(model, "_fk_dir", None)
+    if fk_dir is None:
+        return None
+    root_cfg = _read_json_file(Path(fk_dir).parent / "config.json") or {}
+    cfg = root_cfg.get("text_config", root_cfg)
+    layer_types = cfg.get("layer_types", []) or []
+    if not any(str(t) == "linear_attention" for t in layer_types):
+        return None
+    try:
+        conv_kernel = int(cfg["linear_conv_kernel_dim"])
+        key_heads = int(cfg["linear_num_key_heads"])
+        value_heads = int(cfg["linear_num_value_heads"])
+        key_dim = int(cfg["linear_key_head_dim"])
+        value_dim = int(cfg["linear_value_head_dim"])
+    except Exception:
+        return None
+    if min(conv_kernel, key_heads, value_heads, key_dim, value_dim) <= 0:
+        return None
+
+    conv_width = 2 * key_heads * key_dim + value_heads * value_dim
+    conv_shape = (1, max(conv_kernel - 1, 1), conv_width)
+    state_shape = (1, value_heads, value_dim, key_dim)
+    act_dtype = _dtype_from_config_name(
+        cfg.get("torch_dtype")
+        or cfg.get("dtype")
+        or root_cfg.get("torch_dtype")
+        or root_cfg.get("dtype"),
+        _prefill_activation_dtype(model),
+    )
+    state_dtype = _dtype_from_config_name(cfg.get("mamba_ssm_dtype"), None)
+    if state_dtype is None:
+        import mlx.core as mx
+
+        state_dtype = mx.float32
+    return conv_shape, state_shape, act_dtype, state_dtype
+
+
+def _prime_empty_kv_cache_for_prefill(model: Any, cache: Any, required: int) -> None:
+    """Allocate empty KV cache storage for a compiled prefill variant.
+
+    This mirrors MLX KVCache/QuantizedKVCache first-use allocation without
+    calling the model once natively. It is intentionally cache-type based:
+    unsupported cache classes remain untouched and therefore fall through to
+    the existing native path.
+    """
+    if cache is None or required <= 0 or _cache_has_storage(cache):
+        return
+    shape = _prefill_kv_shape_from_config(model, required)
+    if shape is None:
+        return
+
+    import mlx.core as mx
+
+    n_kv_heads, k_head_dim, v_head_dim = shape
+    dtype = _prefill_activation_dtype(model)
+    arrays_spec = _prefill_arrays_cache_spec_from_config(model)
+    arrays = []
+    saw = False
+    for c in cache:
+        if type(c).__name__ == "ArraysCache" and arrays_spec is not None:
+            conv_shape, state_shape, conv_dtype, state_dtype = arrays_spec
+            cur = getattr(c, "cache", None)
+            if isinstance(cur, list) and len(cur) >= 2 and (cur[0] is None or cur[1] is None):
+                cur[0] = mx.zeros(conv_shape, dtype=conv_dtype)
+                cur[1] = mx.zeros(state_shape, dtype=state_dtype)
+                arrays.extend([cur[0], cur[1]])
+                saw = True
+            continue
+        if getattr(c, "keys", None) is not None or getattr(c, "values", None) is not None:
+            continue
+        name = type(c).__name__
+        step = int(getattr(c, "step", 256) or 256)
+        capacity = ((required + step - 1) // step) * step
+        if name == "KVCache":
+            c.keys = mx.zeros((1, n_kv_heads, capacity, k_head_dim), dtype=dtype)
+            c.values = mx.zeros((1, n_kv_heads, capacity, v_head_dim), dtype=dtype)
+            arrays.extend([c.keys, c.values])
+            saw = True
+        elif name == "QuantizedKVCache":
+            bits = int(getattr(c, "bits", 8) or 8)
+            group_size = int(getattr(c, "group_size", 64) or 64)
+            el_per_int = 8 * mx.uint32.size // bits
+            base = (1, n_kv_heads, capacity)
+
+            def init_quant(dim: int):
+                return (
+                    mx.zeros((*base, dim // el_per_int), dtype=mx.uint32),
+                    mx.zeros((*base, dim // group_size), dtype=dtype),
+                    mx.zeros((*base, dim // group_size), dtype=dtype),
+                )
+
+            c.keys = init_quant(k_head_dim)
+            c.values = init_quant(v_head_dim)
+            arrays.extend(_cache_storage_arrays(c.keys))
+            arrays.extend(_cache_storage_arrays(c.values))
+            saw = True
+    if saw:
+        mx.eval(arrays)
+
+
 # ---------------------------------------------------------------------
 # DLPack helper — extract the host-visible buffer pointer from mx.array
 # ---------------------------------------------------------------------
@@ -1780,7 +2371,11 @@ class FusekitWrapper:
         self.__dict__["_fk_manifest"] = _read_task_graph(fusekit_dir)
         compile_manifest = _read_manifest(fusekit_dir)
         mtp_variants = _manifest_mtp_variant_names(compile_manifest)
+        prefill_variants = _manifest_prefill_variant_names(compile_manifest)
         stateful_mtp_graph = _task_graph_has_stateful_mtp(self._fk_manifest)
+        stateful_prefill_variants = _stateful_prefill_variant_names(
+            self._fk_dir, prefill_variants
+        )
         stateful_mtp_mn_ok = (
             not stateful_mtp_graph
             or _env_flag("FUSEKIT_EXPERIMENTAL_STATEFUL_MTP_MN_VARIANT")
@@ -1788,8 +2383,15 @@ class FusekitWrapper:
         )
         self.__dict__["_fk_compile_manifest"] = compile_manifest
         self.__dict__["_fk_mtp_variant_names"] = mtp_variants
+        self.__dict__["_fk_prefill_variant_names"] = prefill_variants
+        self.__dict__["_fk_stateful_prefill_variants"] = stateful_prefill_variants
         self.__dict__["_fk_has_mtp_variants"] = bool(mtp_variants)
+        self.__dict__["_fk_has_prefill_variants"] = bool(prefill_variants)
         self.__dict__["_fk_stateful_mtp_graph"] = stateful_mtp_graph
+        self.__dict__["_fk_prefill_variant_auto"] = (
+            bool(prefill_variants)
+            and not _env_flag("FUSEKIT_DISABLE_PREFILL_VARIANT_AUTO")
+        )
         # Native-MTP verification calls the backbone with return_hidden=True.
         # Stateful ArraysCache/GatedDelta graphs use compiled M=N variants by
         # default now that rollback scratch aliasing is guarded in dispatch.py.
@@ -1801,15 +2403,14 @@ class FusekitWrapper:
             and not _env_flag("FUSEKIT_DISABLE_MTP_SINGLE_BACKBONE_AUTO")
         )
         # MTP verification feeds logits into speculative acceptance. The
-        # compiled M=N kernels are useful for profiling, but their custom
-        # qMV/GDN reduction order is not yet acceptance-equivalent to native
-        # oMLX under non-greedy sampling. Keep them available as an explicit
-        # opt-in while the default path preserves raw oMLX MTP semantics.
+        # compiled M=N verifier is kept opt-in: it is useful for profiling and
+        # future small-M kernels, but current oMLX native/split verification is
+        # faster on the tested MTP models and avoids extra state drift risk.
         self.__dict__["_fk_mtp_variant_auto"] = (
             bool(mtp_variants)
+            and _env_flag("FUSEKIT_AUTO_MTP_MN_VARIANT")
             and stateful_mtp_mn_ok
             and not _env_flag("FUSEKIT_DISABLE_MTP_MN_VARIANT")
-            and _env_flag("FUSEKIT_AUTO_MTP_MN_VARIANT")
         )
         self.__dict__["_fk_native_handle"] = native_handle
         self.__dict__["_fk_dispatcher_info"] = dispatcher_info or ""
@@ -1825,7 +2426,137 @@ class FusekitWrapper:
         self.__dict__["_fk_dispatch_stats"] = {} if _env_flag("FUSEKIT_TRACE_DISPATCH_STATS") else None
         _register_dispatch_stats_printer(self)
 
+    def _try_native_prefill_no_logits(self, args, kwargs):
+        """Run the transformer backbone for a prefill chunk and skip LM head.
+
+        mlx-lm's generation loop discards logits for all prompt chunks except
+        the final prompt token. When a FuseKit caller marks such a chunk with
+        `_fusekit_prefill_no_logits=True`, we can preserve cache mutation while
+        avoiding the tied embedding / lm_head projection. The candidate
+        backbone is discovered from common semantic module structure rather
+        than a model-name table; if it is absent, callers fall back unchanged.
+        """
+        if _env_flag("FUSEKIT_DISABLE_NATIVE_PREFILL_NO_LOGITS"):
+            return None
+        if not args or getattr(args[0], "shape", None) is None:
+            return None
+        original = self.__dict__.get("_fk_original")
+        if original is None:
+            return None
+        candidates = []
+        for path in (
+            "model",
+            "language_model.model",
+            "language_model.model.model",
+            "text_model.model",
+        ):
+            cur = original
+            ok = True
+            for seg in path.split("."):
+                try:
+                    cur = getattr(cur, seg)
+                except Exception:
+                    ok = False
+                    break
+            if ok and cur is not original and callable(cur):
+                candidates.append(cur)
+
+        call_kwargs = {}
+        for key in ("cache", "input_embeddings"):
+            if key in kwargs:
+                call_kwargs[key] = kwargs[key]
+        for candidate in candidates:
+            try:
+                out = candidate(args[0], **call_kwargs)
+            except TypeError:
+                try:
+                    out = candidate(args[0], kwargs.get("cache"))
+                except Exception:
+                    continue
+            except Exception:
+                continue
+            if isinstance(out, tuple):
+                out = out[0]
+            if getattr(out, "shape", None) is None:
+                continue
+            import mlx.core as mx
+
+            mx.eval(out)
+            return mx.array([[0]], dtype=mx.uint32)
+        return None
+
+    def _prefill_variant_chunk_plan(self, seq_len: int) -> list[int] | None:
+        if seq_len <= 1 or not _prefill_variant_requested(self, seq_len):
+            return None
+        plan: list[int] = []
+        remaining = seq_len
+        while remaining > 0:
+            m = _select_prefill_variant_m(self, remaining)
+            if m is None or m <= 0:
+                return None
+            plan.append(m)
+            remaining -= m
+        return plan if len(plan) > 1 else None
+
+    def _try_run_prefill_variant_chunks(self, inputs, cache, plan, stats):
+        if cache is None or not plan:
+            return None
+        try:
+            seq_len = int(inputs.shape[1])
+        except Exception:
+            return None
+        if sum(plan) != seq_len:
+            return None
+
+        dispatchers = []
+        for m in plan:
+            dispatcher = self._get_prefill_variant_dispatcher(m)
+            if dispatcher is None:
+                if stats is not None:
+                    stats["prefill_variant_chunk_missing"] = (
+                        stats.get("prefill_variant_chunk_missing", 0) + 1
+                    )
+                return None
+            dispatchers.append((m, dispatcher))
+
+        _prime_empty_kv_cache_for_prefill(self, cache, seq_len)
+        if not _cache_has_storage(cache):
+            if stats is not None:
+                stats["prefill_variant_chunk_no_storage"] = (
+                    stats.get("prefill_variant_chunk_no_storage", 0) + 1
+                )
+            return None
+
+        if stats is not None:
+            stats["prefill_variant_chunk"] = stats.get("prefill_variant_chunk", 0) + len(plan)
+
+        offset = 0
+        last_out = None
+        for m, dispatcher in dispatchers:
+            chunk = inputs[:, offset : offset + m]
+            last_out = dispatcher.try_run(
+                chunk,
+                cache,
+                return_hidden=False,
+                n_confirmed=0,
+                prefill_no_logits=True,
+            )
+            if last_out is None:
+                if stats is not None:
+                    stats["prefill_variant_chunk_no_output"] = (
+                        stats.get("prefill_variant_chunk_no_output", 0) + 1
+                    )
+                raise RuntimeError(
+                    f"fusekit prefill chunk m={m} returned no output after dispatch started"
+                )
+            offset += m
+
+        if stats is not None:
+            stats["prefill_variant_chunk_hit"] = stats.get("prefill_variant_chunk_hit", 0) + 1
+        return last_out
+
     def __call__(self, *args, **kwargs):
+        prefill_no_logits = bool(kwargs.pop("_fusekit_prefill_no_logits", False))
         self._log_call(args, kwargs)
         # Decode fast-path: only fires for L=1 inputs with a cache.
         # Prefill and the first (cache-empty) call land on the
@@ -1834,6 +2565,15 @@ class FusekitWrapper:
         n_confirmed = int(kwargs.get("n_confirmed", 0) or 0)
         mtp_active = _model_has_active_mtp(self)
         seq_len = int(args[0].shape[1]) if args and getattr(args[0], "shape", None) is not None and len(args[0].shape) == 2 else 0
+        if (
+            not prefill_no_logits
+            and _ENGINE_EXTERNAL_PREFILL_NO_LOGITS_CURRENT
+            and seq_len > 1
+            and not return_hidden
+            and n_confirmed == 0
+            and kwargs.get("cache") is not None
+        ):
+            prefill_no_logits = True
         mtp_backbone_ok = (
             (
                 _env_flag("FUSEKIT_MTP_SINGLE_BACKBONE")
@@ -1862,9 +2602,53 @@ class FusekitWrapper:
                 stats["single_decode"] = stats.get("single_decode", 0) + 1
             if mtp_verify_call:
                 stats["mtp_verify"] = stats.get("mtp_verify", 0) + 1
-        return_hidden_dispatch_ok = not return_hidden or single_decode_call or mtp_verify_call
+        prefill_variant_name = f"prefill_m{seq_len}"
+        stateful_prefill_disabled = (
+            prefill_variant_name
+            in self.__dict__.get("_fk_stateful_prefill_variants", set())
+        )
+        prefill_variant_call = (
+            seq_len > 1
+            and prefill_no_logits
+            and not return_hidden
+            and n_confirmed == 0
+            and _prefill_variant_requested(self, seq_len)
+            and prefill_variant_name in self.__dict__.get("_fk_prefill_variant_names", set())
+            and not stateful_prefill_disabled
+        )
+        prefill_chunk_plan = None
+        prefill_chunk_call = False
+        if (
+            prefill_no_logits
+            and seq_len > 1
+            and not return_hidden
+            and n_confirmed == 0
+            and not prefill_variant_call
+            and _env_flag("FUSEKIT_EXPERIMENTAL_PREFILL_CHUNK_VARIANT")
+        ):
+            prefill_chunk_plan = self._prefill_variant_chunk_plan(seq_len)
+            prefill_chunk_call = prefill_chunk_plan is not None
+        if stats is not None and stateful_prefill_disabled:
+            stats["prefill_variant_stateful_disabled"] = (
+                stats.get("prefill_variant_stateful_disabled", 0) + 1
+            )
+        if stats is not None and prefill_variant_call:
+            stats["prefill_variant"] = stats.get("prefill_variant", 0) + 1
+        if stats is not None and prefill_chunk_call:
+            stats["prefill_variant_chunk_call"] = stats.get("prefill_variant_chunk_call", 0) + 1
+        if (prefill_variant_call or prefill_chunk_call) and kwargs.get("cache") is not None:
+            _prime_empty_kv_cache_for_prefill(self, kwargs.get("cache"), seq_len)
+        return_hidden_dispatch_ok = (
+            not return_hidden
+            or single_decode_call
+            or mtp_verify_call
+            or prefill_variant_call
+            or prefill_chunk_call
+        )
         mtp_dispatch_ok = (
             not mtp_active
+            or prefill_variant_call
+            or prefill_chunk_call
             or (
                 return_hidden
                 and (
@@ -1882,7 +2666,7 @@ class FusekitWrapper:
             and args
             and getattr(args[0], "shape", None) is not None
             and len(args[0].shape) == 2
-            and (single_decode_call or mtp_verify_call)
+            and (single_decode_call or mtp_verify_call or prefill_variant_call or prefill_chunk_call)
             and kwargs.get("cache") is not None
             and _cache_has_storage(kwargs.get("cache"))
         ):
@@ -1893,6 +2677,45 @@ class FusekitWrapper:
             try:
                 out = None
                 hit_dispatcher = None
+                if prefill_chunk_call and prefill_chunk_plan is not None:
+                    if stats is not None:
+                        stats["prefill_variant_chunk_attempt"] = (
+                            stats.get("prefill_variant_chunk_attempt", 0) + 1
+                        )
+                    out = self._try_run_prefill_variant_chunks(
+                        args[0],
+                        kwargs.get("cache"),
+                        prefill_chunk_plan,
+                        stats,
+                    )
+                    if out is not None:
+                        if stats is not None:
+                            stats["dispatch_hit"] = stats.get("dispatch_hit", 0) + 1
+                        return out
+                    if out is None and _env_flag("FUSEKIT_STRICT_DISPATCH"):
+                        raise RuntimeError("fusekit prefill chunk variant returned no output")
+                if prefill_variant_call:
+                    if stats is not None:
+                        stats["prefill_variant_attempt"] = stats.get("prefill_variant_attempt", 0) + 1
+                    variant_dispatcher = self._get_prefill_variant_dispatcher(seq_len)
+                    if variant_dispatcher is not None:
+                        out = variant_dispatcher.try_run(
+                            args[0],
+                            kwargs.get("cache"),
+                            return_hidden=False,
+                            n_confirmed=0,
+                            prefill_no_logits=prefill_no_logits,
+                        )
+                        if out is not None:
+                            hit_dispatcher = variant_dispatcher
+                        if stats is not None:
+                            key = "prefill_variant_hit" if out is not None else "prefill_variant_no_output"
+                            stats[key] = stats.get(key, 0) + 1
+                    else:
+                        if stats is not None:
+                            stats["prefill_variant_missing"] = stats.get("prefill_variant_missing", 0) + 1
+                    if out is None and _env_flag("FUSEKIT_STRICT_DISPATCH"):
+                        raise RuntimeError("fusekit prefill variant returned no output")
                 if mtp_verify_call and mtp_mn_ok:
                     if stats is not None:
                         stats["mtp_variant_attempt"] = stats.get("mtp_variant_attempt", 0) + 1
@@ -1919,7 +2742,7 @@ class FusekitWrapper:
                             )
                     if out is None and _env_flag("FUSEKIT_STRICT_DISPATCH"):
                         raise RuntimeError("fusekit MTP M=N variant returned no output")
-                if out is None:
+                if out is None and not prefill_chunk_call:
                     if self._fk_dispatcher is None:
                         from .dispatch import Dispatcher
                         self.__dict__["_fk_dispatcher"] = Dispatcher(
@@ -1964,6 +2787,18 @@ class FusekitWrapper:
                     raise
                 warnings.warn(f"fusekit dispatch failed ({e}); passthrough")
                 self.__dict__["_fk_dispatch_failed"] = True
+        if (
+            prefill_no_logits
+            and seq_len > 1
+            and not return_hidden
+            and n_confirmed == 0
+            and kwargs.get("cache") is not None
+        ):
+            out = self._try_native_prefill_no_logits(args, kwargs)
+            if out is not None:
+                if stats is not None:
+                    stats["native_prefill_no_logits"] = stats.get("native_prefill_no_logits", 0) + 1
+                return out
         if stats is not None:
             stats["native_passthrough"] = stats.get("native_passthrough", 0) + 1
             if mtp_verify_call:
@@ -2086,11 +2921,10 @@ class FusekitWrapper:
             mx.eval(logits, hidden)
         return logits, hidden
 
-    def _get_variant_dispatcher(self, seq_len: int):
+    def _get_named_variant_dispatcher(self, variant_name: str, trace_env: str | None = None):
         root = Path(self._fk_dir)
-        if root.name.startswith("mtp_m"):
+        if root.parent.name == "variants":
             return None
-        variant_name = f"mtp_m{seq_len}"
         cache = self.__dict__["_fk_variant_dispatchers"]
         if variant_name in cache:
             return cache[variant_name]
@@ -2111,13 +2945,25 @@ class FusekitWrapper:
         except Exception as e:
             if _env_flag("FUSEKIT_STRICT_DISPATCH"):
                 raise
-            warnings.warn(f"fusekit: MTP variant {variant_name} unavailable ({e})")
+            warnings.warn(f"fusekit: variant {variant_name} unavailable ({e})")
             return None
         self.__dict__["_fk_variant_handles"][variant_name] = handle
         cache[variant_name] = dispatcher
-        if os.environ.get("FUSEKIT_TRACE_MTP_MN"):
+        if trace_env and os.environ.get(trace_env):
             print(f"[fusekit] loaded variant {variant_name} -> {variant_dir}", file=sys.stderr)
         return dispatcher
+
+    def _get_variant_dispatcher(self, seq_len: int):
+        return self._get_named_variant_dispatcher(
+            f"mtp_m{seq_len}",
+            "FUSEKIT_TRACE_MTP_MN",
+        )
+
+    def _get_prefill_variant_dispatcher(self, seq_len: int):
+        return self._get_named_variant_dispatcher(
+            f"prefill_m{seq_len}",
+            "FUSEKIT_TRACE_PREFILL",
+        )
 
     def _log_call(self, args, kwargs) -> None:
         remaining = self.__dict__["_fk_log_remaining"]
@@ -2243,7 +3089,7 @@ def _read_manifest(fusekit_dir: str) -> dict:
     return data if isinstance(data, dict) else {}
 
 
-def _manifest_mtp_variant_names(manifest: dict) -> set[str]:
+def _manifest_variant_names_with_prefix(manifest: dict, prefix: str) -> set[str]:
     variants = manifest.get("variants", []) if isinstance(manifest, dict) else []
     if not isinstance(variants, list):
         return set()
@@ -2252,13 +3098,73 @@ def _manifest_mtp_variant_names(manifest: dict) -> set[str]:
         if not isinstance(variant, dict):
             continue
         name = str(variant.get("name", ""))
-        if name.startswith("mtp_m"):
+        if name.startswith(prefix):
             names.add(name)
     return names
 
 
+def _manifest_mtp_variant_names(manifest: dict) -> set[str]:
+    return _manifest_variant_names_with_prefix(manifest, "mtp_m")
+
+
+def _manifest_prefill_variant_names(manifest: dict) -> set[str]:
+    return _manifest_variant_names_with_prefix(manifest, "prefill_m")
+
+
+def _prefill_variant_auto_max_m(model: Any) -> int:
+    """Largest prefill variant used automatically.
+
+    M=512/M=1024 variants use the block-NAX SDPA emitter, so the automatic path
+    can keep the full prompt graph for medium/long prefill instead of falling
+    back to the native no-logits path. The selector still requires the compiled
+    variant to exist in the manifest.
+    """
+    _ = model
+    return 1024
+
+
+def _prefill_variant_requested(model: Any, seq_len: int) -> bool:
+    if seq_len <= 1:
+        return False
+    if _env_flag("FUSEKIT_FORCE_PREFILL_VARIANT"):
+        return True
+    requested = bool(getattr(model, "_fk_prefill_variant_auto", False)) or _env_flag(
+        "FUSEKIT_USE_PREFILL_VARIANT"
+    )
+    return requested and seq_len <= _prefill_variant_auto_max_m(model)
+
+
+def _select_prefill_variant_m(model: Any, limit: int) -> int | None:
+    if limit <= 1:
+        return None
+    if not _prefill_variant_requested(model, limit):
+        return None
+    names = getattr(model, "_fk_prefill_variant_names", None)
+    if not names:
+        return None
+    disabled = getattr(model, "_fk_stateful_prefill_variants", set()) or set()
+    best = 0
+    for name in names:
+        if not isinstance(name, str) or not name.startswith("prefill_m"):
+            continue
+        if name in disabled:
+            continue
+        try:
+            m = int(name[len("prefill_m"):])
+        except ValueError:
+            continue
+        if m <= limit and m > best:
+            best = m
+    return best or None
+
+
 def _task_graph_has_stateful_mtp(task_graph: dict) -> bool:
     """Whether M=N MTP verify must preserve recurrent ArraysCache state."""
+    return _task_graph_has_stateful_recurrence(task_graph)
+
+
+def _task_graph_has_stateful_recurrence(task_graph: dict) -> bool:
+    """Whether a graph mutates recurrent state that must be sequenced exactly."""
     tasks = task_graph.get("tasks", []) if isinstance(task_graph, dict) else []
     if not isinstance(tasks, list):
         return False
@@ -2269,6 +3175,28 @@ def _task_graph_has_stateful_mtp(task_graph: dict) -> bool:
         if "gated_delta" in kernel or "arrays_cache_shift_append" in kernel:
             return True
     return False
+
+
+def _stateful_prefill_variant_names(fusekit_dir: Path, names: set[str]) -> set[str]:
+    """Find prefill variants that cannot be used as a full-sequence graph yet.
+
+    Linear-attention/GDN prefill needs a real recurrence emitter over the M
+    rows. A decode-shape shift/append graph is correct for one token but wrong
+    when run as prefill_mN, so disable those variants by semantic task content.
+    """
+    if not names:
+        return set()
+    root = Path(fusekit_dir)
+    if root.parent.name == "variants":
+        root = root.parent.parent
+    disabled: set[str] = set()
+    for name in names:
+        if not isinstance(name, str):
+            continue
+        task_graph = _read_task_graph(str(root / "variants" / name))
+        if _task_graph_has_stateful_recurrence(task_graph):
+            disabled.add(name)
+    return disabled
 
 
 # ---------------------------------------------------------------------
@@ -2300,6 +3228,7 @@ _GENERATE_PATCHED = False
 _ENGINE_PATCHED = False
 _OMLX_SCHEDULER_PATCHED = False
 _ENGINE_SKIP_LOGPROBS_CURRENT_STEP = False
+_ENGINE_EXTERNAL_PREFILL_NO_LOGITS_CURRENT = False
 
 
 def _extra_tensor_files_for_model_glob(pathname: Any) -> list[str]:
@@ -2658,9 +3587,19 @@ def _wrap_generation_batch(module) -> None:
     if getattr(cls, "_fk_engine_fast_patched", False):
         return
     original_step = cls._step
+    original_next = getattr(cls, "next", None)
+    original_extend = getattr(cls, "extend", None)
+    original_filter = getattr(cls, "filter", None)
     batch_cls = getattr(module, "BatchGenerator", None)
+    prompt_cls = getattr(module, "PromptProcessingBatch", None)
     original_next_generated = (
         getattr(batch_cls, "next_generated", None) if batch_cls is not None else None
+    )
+    original_prompt = (
+        getattr(prompt_cls, "prompt", None) if prompt_cls is not None else None
+    )
+    original_generate = (
+        getattr(prompt_cls, "generate", None) if prompt_cls is not None else None
     )
 
     def _engine_style() -> str:
@@ -2735,6 +3674,11 @@ def _wrap_generation_batch(module) -> None:
             return False
         if _env_flag("FUSEKIT_DISABLE_GPU_ARGMAX_TOKENS"):
             return False
+        # This flag is entered only by greedy-argmax call sites. The
+        # dispatcher still filters the concrete task to head kernels
+        # with emitted direct-argmax variants, so this must not be
+        # quantization-specific: bf16 FinalRmsNormLmHead can also
+        # avoid the logits write/read round trip.
         return _is_engine_fast_eligible(self)
 
     def _engine_needs_direct_head_rebuild(self) -> bool:
@@ -3067,6 +4011,147 @@ def _wrap_generation_batch(module) -> None:
         self._fk_engine_queue = history[1:]
         return True
 
+    def _engine_profile_points() -> set[int]:
+        raw = os.environ.get("FUSEKIT_PROFILE_KERNELS_AT", "")
+        points: set[int] = set()
+        if not raw:
+            return points
+        for part in raw.replace(",", " ").split():
+            try:
+                points.add(int(part))
+            except ValueError:
+                pass
+        return points
+
+    def _run_engine_profile_step(self, inputs, mx) -> bool:
+        points = _engine_profile_points()
+        if not points:
+            return False
+        queue = getattr(self, "_fk_engine_queue", None) or []
+        if queue:
+            return False
+        try:
+            token_index = int(self._num_tokens[0])
+        except Exception:
+            return False
+        if token_index not in points:
+            return False
+        if not _is_engine_fast_eligible(self):
+            return False
+
+        model = self.model
+        inner = model._fk_original
+        dispatcher = getattr(model, "_fk_dispatcher", None)
+        fk = getattr(inner, "_fk_lm", None)
+        if dispatcher is None or fk is None:
+            return False
+
+        remaining = int(self.max_tokens[0]) - token_index
+        ok, reason, _capacity_changed = _ensure_engine_full_capacity(self, remaining)
+        if not ok:
+            if os.environ.get("FUSEKIT_DBG_ENGINE_CHUNK"):
+                print(
+                    "[fusekit-engine-profile-at-miss] "
+                    f"token_index={token_index} reason=capacity:{reason}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+            return False
+
+        offset = _engine_cache_offset(self.prompt_cache)
+        if offset is None:
+            return False
+        print(
+            "[fusekit-engine-profile-at] "
+            f"token_index={token_index} cache_offset={offset}",
+            flush=True,
+        )
+        dispatcher._profile_kernels_once = True
+        dispatcher._profile_kernels_skip = 0
+        dispatcher._profile_context = {
+            "token_index": int(token_index),
+            "cache_offset": int(offset),
+        }
+        direct_head = (
+            getattr(inner, "_fk_lm", None) is not None
+            and _engine_direct_head_argmax_enabled(self)
+        )
+        restore_direct = _direct_head_argmax_scope(model, direct_head)
+        try:
+            logits = model(inputs[:, None], cache=self.prompt_cache)
+        finally:
+            restore_direct()
+
+        dispatches = getattr(dispatcher, "_last_dispatches", None)
+        if fk is not None and "next_token_view" in fk and dispatches:
+            next_token = int(fk["next_token_view"][0])
+            self._next_tokens = mx.array([next_token], dtype=inputs.dtype)
+        else:
+            if isinstance(logits, tuple):
+                logits = logits[0]
+            next_token = mx.argmax(logits[:, -1, :], axis=-1).astype(inputs.dtype)
+            mx.eval(next_token)
+            self._next_tokens = next_token
+        self._next_logprobs = [None]
+        return True
+
+    def _patched_prompt(self, tokens):
+        mx = __import__("mlx.core", fromlist=["core"])
+        debug_prefill = os.environ.get("FUSEKIT_DBG_ENGINE_PREFILL")
+        if debug_prefill:
+            print(
+                "[fusekit-engine-prefill] "
+                f"uids={len(getattr(self, 'uids', []) or [])} "
+                f"model_wrapped={getattr(self.model, '_fk_original', None) is not None} "
+                f"disable={_env_flag('FUSEKIT_DISABLE_ENGINE_PREFILL_NO_LOGITS')}",
+                file=sys.stderr,
+                flush=True,
+            )
+        if (
+            original_prompt is None
+            or _env_flag("FUSEKIT_DISABLE_ENGINE_PREFILL_NO_LOGITS")
+            or getattr(self.model, "_fk_original", None) is None
+        ):
+            return original_prompt(self, tokens)
+        if len(self.uids) != len(tokens):
+            raise ValueError("The batch length doesn't match the number of inputs")
+        if not tokens:
+            return
+
+        # Same cache/token bookkeeping as mlx-lm, but prompt chunks are marked
+        # no-logits because their LM-head output is discarded by the engine.
+        for sti, ti in zip(self.tokens, tokens):
+            sti += ti
+
+        lengths = [len(p) for p in tokens]
+        max_length = max(lengths)
+        padding = [max_length - l for l in lengths]
+        max_padding = max(padding)
+
+        if max_padding > 0:
+            tokens = module._right_pad_prompts(tokens, max_length=max_length)
+            for c in self.prompt_cache:
+                c.prepare(lengths=lengths, right_padding=padding)
+        else:
+            tokens = mx.array(tokens)
+
+        while tokens.shape[1] > 0:
+            n_to_process = min(self.prefill_step_size, tokens.shape[1])
+            self.model(
+                tokens[:, :n_to_process],
+                cache=self.prompt_cache,
+                _fusekit_prefill_no_logits=True,
+            )
+            mx.eval([c.state for c in self.prompt_cache])
+            mx.clear_cache()
+            tokens = tokens[:, n_to_process:]
+
+        if max_padding > 0:
+            for c in self.prompt_cache:
+                c.finalize()
+            mx.eval([c.state for c in self.prompt_cache])
+            mx.clear_cache()
+
     def _patched_step(self):
         mx = __import__("mlx.core", fromlist=["core"])
         _finish_engine_async(self, mx)
@@ -3081,7 +4166,7 @@ def _wrap_generation_batch(module) -> None:
         inputs = self._current_tokens
 
         if not _serve_engine_queue(self, inputs, mx):
-            if not _run_engine_chunk(self, inputs, mx):
+            if not _run_engine_profile_step(self, inputs, mx) and not _run_engine_chunk(self, inputs, mx):
                 if not _submit_engine_async(self, inputs):
                     # Calls FusekitWrapper.__call__, which advances the live
                     # cache by one token and writes the next greedy token into
@@ -3141,6 +4226,104 @@ def _wrap_generation_batch(module) -> None:
         for sti, ti in zip(self.tokens, out_tokens):
             sti.append(ti)
         return out_tokens, self._current_logprobs
+
+    def _patch_seed_lists_after_extend(self, batch, old_len: int) -> None:
+        if original_extend is None:
+            return
+        before_tokens = list(getattr(self, "_fk_seeded_first_tokens", [None] * old_len))
+        before_lps = list(getattr(self, "_fk_seeded_first_logprobs", [None] * old_len))
+        add_tokens = list(
+            getattr(batch, "_fk_seeded_first_tokens", [None] * len(getattr(batch, "uids", []) or []))
+        )
+        add_lps = list(
+            getattr(batch, "_fk_seeded_first_logprobs", [None] * len(getattr(batch, "uids", []) or []))
+        )
+        merged_tokens = before_tokens + add_tokens
+        merged_lps = before_lps + add_lps
+        if any(t is not None for t in merged_tokens):
+            self.__dict__["_fk_seeded_first_tokens"] = merged_tokens
+            self.__dict__["_fk_seeded_first_logprobs"] = merged_lps
+        else:
+            self.__dict__.pop("_fk_seeded_first_tokens", None)
+            self.__dict__.pop("_fk_seeded_first_logprobs", None)
+
+    def _patched_extend(self, batch):
+        old_len = len(getattr(self, "uids", []) or [])
+        result = original_extend(self, batch)
+        _patch_seed_lists_after_extend(self, batch, old_len)
+        return result
+
+    def _patched_next(self):
+        seeded_tokens = getattr(self, "_fk_seeded_first_tokens", None)
+        if (
+            original_next is None
+            or not seeded_tokens
+            or len(seeded_tokens) != len(getattr(self, "uids", []) or [])
+            or not all(t is not None for t in seeded_tokens)
+        ):
+            return original_next(self)
+
+        seeded_logprobs = list(
+            getattr(self, "_fk_seeded_first_logprobs", [None] * len(seeded_tokens))
+        )
+        keep = []
+        responses = []
+        for i, token in enumerate(seeded_tokens):
+            finish_reason = None
+            match_sequence = None
+            current_state = None
+            self._num_tokens[i] += 1
+            if self._num_tokens[i] >= self.max_tokens[i]:
+                finish_reason = "length"
+
+            self._matcher_states[i], match_sequence, current_state = (
+                self.state_machines[i].match(self._matcher_states[i], int(token))
+            )
+            if match_sequence is not None and current_state is None:
+                finish_reason = "stop"
+
+            if finish_reason is None:
+                keep.append(i)
+                prompt_cache = None
+                all_tokens = None
+            else:
+                prompt_cache = self.extract_cache(i)
+                all_tokens = self.tokens[i]
+
+            responses.append(
+                self.Response(
+                    uid=self.uids[i],
+                    token=int(token),
+                    logprobs=seeded_logprobs[i] if i < len(seeded_logprobs) else None,
+                    finish_reason=finish_reason,
+                    current_state=current_state,
+                    match_sequence=match_sequence,
+                    prompt_cache=prompt_cache,
+                    all_tokens=all_tokens,
+                )
+            )
+
+        self.__dict__.pop("_fk_seeded_first_tokens", None)
+        self.__dict__.pop("_fk_seeded_first_logprobs", None)
+        if len(keep) < len(self.uids) and original_filter is not None:
+            original_filter(self, keep)
+        return responses
+
+    def _patched_generate(self, tokens):
+        generation = original_generate(self, tokens)
+        if not tokens or not all(
+            isinstance(t, _FusekitSeededTokenList)
+            and hasattr(t, "_fusekit_seeded_first_token")
+            for t in tokens
+        ):
+            return generation
+        generation.__dict__["_fk_seeded_first_tokens"] = [
+            int(getattr(t, "_fusekit_seeded_first_token")) for t in tokens
+        ]
+        generation.__dict__["_fk_seeded_first_logprobs"] = [
+            getattr(t, "_fusekit_seeded_first_logprobs", None) for t in tokens
+        ]
+        return generation
 
     def _patched_next_generated(self):
         engine_limit = _engine_drain_limit()
@@ -3220,6 +4403,16 @@ def _wrap_generation_batch(module) -> None:
             return responses
 
     cls._step = _patched_step
+    if original_next is not None:
+        cls.next = _patched_next
+    if original_extend is not None:
+        cls.extend = _patched_extend
+    if prompt_cls is not None and original_prompt is not None:
+        prompt_cls.prompt = _patched_prompt
+        prompt_cls._fk_prefill_no_logits_patched = True
+    if prompt_cls is not None and original_generate is not None:
+        prompt_cls.generate = _patched_generate
+        prompt_cls._fk_full_prefill_seed_patched = True
     if batch_cls is not None and original_next_generated is not None:
         batch_cls.next_generated = _patched_next_generated
     cls._fk_engine_fast_patched = True
@@ -3235,9 +4428,57 @@ def _wrap_omlx_scheduler(module) -> None:
     """
     global _OMLX_SCHEDULER_PATCHED, _ENGINE_SKIP_LOGPROBS_CURRENT_STEP
     _patch_omlx_mtp_sampler_accept_cache(scheduler_module=module)
-    if _OMLX_SCHEDULER_PATCHED or not hasattr(module, "Scheduler"):
+    if not hasattr(module, "Scheduler"):
         return
-    original = module.Scheduler.step
+    scheduler_cls = module.Scheduler
+    if (
+        hasattr(scheduler_cls, "_do_external_prefill")
+        and not getattr(scheduler_cls, "_fk_external_prefill_no_logits_patched", False)
+    ):
+        original_external_prefill = scheduler_cls._do_external_prefill
+
+        def _patched_external_prefill(self, *args, **kwargs):
+            global _ENGINE_EXTERNAL_PREFILL_NO_LOGITS_CURRENT
+            model = getattr(self, "model", None)
+            active = (
+                getattr(model, "_fk_original", None) is not None
+                and not _env_flag("FUSEKIT_DISABLE_ENGINE_PREFILL_NO_LOGITS")
+            )
+            if active:
+                request = args[0] if len(args) >= 1 else kwargs.get("request")
+                tokens = args[1] if len(args) >= 2 else kwargs.get("tokens")
+                existing_cache = args[2] if len(args) >= 3 else kwargs.get("existing_cache")
+                vlm_embeds = kwargs.get("vlm_embeds")
+                if request is not None and isinstance(tokens, list):
+                    stats = getattr(model, "_fk_dispatch_stats", None)
+                    seeded = _engine_full_prefill_seed_candidate(
+                        self,
+                        request,
+                        tokens,
+                        existing_cache,
+                        vlm_embeds,
+                        stats,
+                    )
+                    if seeded is not None:
+                        if stats is not None:
+                            stats["engine_full_prefill_seed"] = (
+                                stats.get("engine_full_prefill_seed", 0) + 1
+                            )
+                        return seeded
+            prev = _ENGINE_EXTERNAL_PREFILL_NO_LOGITS_CURRENT
+            if active:
+                _ENGINE_EXTERNAL_PREFILL_NO_LOGITS_CURRENT = True
+            try:
+                return original_external_prefill(self, *args, **kwargs)
+            finally:
+                _ENGINE_EXTERNAL_PREFILL_NO_LOGITS_CURRENT = prev
+
+        scheduler_cls._do_external_prefill = _patched_external_prefill
+        scheduler_cls._fk_external_prefill_no_logits_patched = True
+
+    if _OMLX_SCHEDULER_PATCHED:
+        return
+    original = scheduler_cls.step
 
     def _patched_scheduler_step(self, *args, **kwargs):
         global _ENGINE_SKIP_LOGPROBS_CURRENT_STEP
@@ -3297,7 +4538,7 @@ def _wrap_omlx_scheduler(module) -> None:
             # scheduler decision visible; the next Scheduler.step overwrites it
             # before a request with logprobs can enter the fast path.
 
-    module.Scheduler.step = _patched_scheduler_step
+    scheduler_cls.step = _patched_scheduler_step
     _OMLX_SCHEDULER_PATCHED = True
 
 
@@ -3362,18 +4603,45 @@ def _fast_generate_step(prompt, model, inner, kw, _orig):
         prompt_processed_tokens = 0
         prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
         with mx.stream(generation_stream):
-            while total_prompt_tokens - prompt_processed_tokens > 1:
-                remaining = (total_prompt_tokens - prompt_processed_tokens) - 1
-                n_to_process = min(prefill_step_size, remaining)
-                model(p[:n_to_process][None], cache=prompt_cache)
-                quantize_cache()
-                mx.eval([c.state for c in prompt_cache])
-                prompt_processed_tokens += n_to_process
+            logits = _try_full_prefill_last_logits(model, p, prompt_cache)
+            if logits is not None:
+                stats = getattr(model, "_fk_dispatch_stats", None)
+                if stats is not None:
+                    stats["native_prefill_last_logits"] = (
+                        stats.get("native_prefill_last_logits", 0) + 1
+                    )
+                prompt_processed_tokens = total_prompt_tokens
                 prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
-                p = p[n_to_process:]
-                mx.clear_cache()
+            else:
+                while total_prompt_tokens - prompt_processed_tokens > 1:
+                    remaining = (total_prompt_tokens - prompt_processed_tokens) - 1
+                    n_to_process = min(prefill_step_size, remaining)
+                    prefill_m = _select_prefill_variant_m(model, n_to_process)
+                    if prefill_m == n_to_process or (
+                        prefill_m is not None
+                        and _env_flag("FUSEKIT_EXPERIMENTAL_PREFILL_CHUNK_VARIANT")
+                    ):
+                        n_to_process = prefill_m
+                    prefill_tokens = p[:n_to_process]
+                    prefill_tokens, padded_prefill_extra = _pad_prefill_tokens_if_safe(
+                        prefill_tokens,
+                        prompt_cache,
+                        model,
+                    )
+                    model(
+                        prefill_tokens[None],
+                        cache=prompt_cache,
+                        _fusekit_prefill_no_logits=True,
+                    )
+                    _trim_prompt_cache_in_place(prompt_cache, padded_prefill_extra)
+                    quantize_cache()
+                    mx.eval([c.state for c in prompt_cache])
+                    prompt_processed_tokens += n_to_process
+                    prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
+                    p = p[n_to_process:]
+                    mx.clear_cache()
 
-            logits = model(p[None], cache=prompt_cache)
+                logits = model(p[None], cache=prompt_cache)
             quantize_cache()
             mx.eval(logits, [c.state for c in prompt_cache])
         last_logits = logits[:, -1, :]

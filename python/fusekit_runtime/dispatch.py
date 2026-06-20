@@ -257,6 +257,9 @@ class Dispatcher:
 
         self._model = model
         self._dir = Path(fusekit_dir)
+        self._variant_name = (
+            self._dir.name if self._dir.parent.name == "variants" else ""
+        )
         self._model_root = _model_root_from_fusekit_dir(self._dir)
         self._handle = handle
         self._mx = mx
@@ -309,12 +312,9 @@ class Dispatcher:
         if (
             _config_uses_mla_attention(cfg)
             and not force_unsupported_graph
-            and not _env_flag("FUSEKIT_ENABLE_MLA_DISPATCH")
+            and _env_flag("FUSEKIT_DISABLE_MLA_DISPATCH")
         ):
-            msg = (
-                "decode graph uses MLA attention state, but MLA q_nope/q_pe "
-                "and asymmetric KV cache bindings are not fully lowered"
-            )
+            msg = "decode graph uses MLA attention state and MLA dispatch is disabled"
             self._fk_unsupported_graph = (
                 f"{self._fk_unsupported_graph}; {msg}"
                 if self._fk_unsupported_graph
@@ -428,6 +428,24 @@ class Dispatcher:
                 roles.append(role)
             return roles
 
+        def _shape_numel(shape) -> int:
+            n = 1
+            for dim in shape or []:
+                n *= int(dim)
+            return n
+
+        def _is_aliasable_shape_view(k: str) -> bool:
+            return any(
+                name in k
+                for name in (
+                    "fusekit_op_reshape_",
+                    "fusekit_op_flatten_",
+                    "fusekit_op_unflatten_",
+                    "fusekit_op_squeeze_",
+                    "fusekit_op_expanddims_",
+                )
+            )
+
         for t in self._decode_tasks:
             k = t["kernel"]
             li = t.get("layer_idx")
@@ -437,6 +455,11 @@ class Dispatcher:
                 self._layer_scratch_id[("k_buf", li)] = outs[1]
                 self._layer_scratch_id[("v_buf", li)] = outs[2]
             elif "fusekit_sdpa_decode_" in k and li is not None and len(outs) == 1:
+                self._layer_scratch_id[("sdpa_buf", li)] = outs[0]
+                ins = [b for b in t.get("inputs", []) if b.get("role") == "scratch"]
+                if ins:
+                    self._layer_scratch_id.setdefault(("q_buf", li), ins[0]["scratch_id"])
+            elif "fusekit_op_scaleddotproductattention_" in k and li is not None and len(outs) == 1:
                 self._layer_scratch_id[("sdpa_buf", li)] = outs[0]
                 ins = [b for b in t.get("inputs", []) if b.get("role") == "scratch"]
                 if ins:
@@ -471,6 +494,15 @@ class Dispatcher:
                         self._layer_scratch_id[(role, li)] = sid
                     elif role in ("h_attn", "out_buf"):
                         self._layer_scratch_id[(role, li)] = sid
+            elif "fusekit_rope_q_decode_" in k and li is not None:
+                ins = [b["scratch_id"] for b in t.get("inputs", []) if b.get("role") == "scratch"]
+                if ins:
+                    self._layer_scratch_id[("q_buf", li)] = ins[0]
+            elif "fusekit_rope_kv_cache_store_decode_" in k and li is not None:
+                ins = [b["scratch_id"] for b in t.get("inputs", []) if b.get("role") == "scratch"]
+                if len(ins) >= 2:
+                    self._layer_scratch_id[("k_buf", li)] = ins[0]
+                    self._layer_scratch_id[("v_buf", li)] = ins[1]
             elif "fusekit_op_add_" in k and li is not None and len(outs) == 1:
                 out_shapes = [tuple(b.get("shape", []))
                               for b in t["outputs"] if b["role"] == "scratch"]
@@ -658,6 +690,28 @@ class Dispatcher:
                         if b.get("role") == "scratch"]
                 if outs:
                     self._layer_scratch_id[("q_buf", li)] = outs[0]
+
+        for t in self._tg["tasks"]:
+            k = t["kernel"]
+            if not _is_aliasable_shape_view(k):
+                continue
+            ins = [b for b in t.get("inputs", []) if b.get("role") == "scratch"]
+            outs = [b for b in t.get("outputs", []) if b.get("role") == "scratch"]
+            if len(ins) != 1 or len(outs) != 1:
+                continue
+            src = ins[0]
+            dst = outs[0]
+            src_sid = src.get("scratch_id")
+            dst_sid = dst.get("scratch_id")
+            if src_sid is None or dst_sid is None or src_sid == dst_sid:
+                continue
+            if src.get("dtype") != dst.get("dtype"):
+                continue
+            if _shape_numel(src.get("shape")) != _shape_numel(dst.get("shape")):
+                continue
+            while src_sid in self._scratch_alias:
+                src_sid = self._scratch_alias[src_sid]
+            self._scratch_alias[dst_sid] = src_sid
 
         self._validate_decode_graph()
 
@@ -865,10 +919,8 @@ class Dispatcher:
 
         The Python dispatcher can only execute decode pipelines whose
         semantic scratch roles have been reconstructed from the task graph.
-        Architectures such as DeepSeek MLA currently lower SDPA/cache inputs
-        through additional split/view/pointwise tasks, so pretending they are
-        standard Q/K/V scratch buffers would be incorrect. Fall back before
-        building the ICB instead of raising from a missing dictionary key.
+        Fall back before building the ICB instead of raising from a missing
+        dictionary key.
         """
         missing = []
         seen = set()
@@ -1099,7 +1151,12 @@ class Dispatcher:
                     skipped_bytes += nbytes
                     continue
                 use_native_scratch = not _env_flag("FUSEKIT_DISABLE_NATIVE_SCRATCH")
-                if self._active_m > 1 and not _env_flag("FUSEKIT_ENABLE_MTP_NATIVE_SCRATCH"):
+                is_prefill_variant = self._variant_name.startswith("prefill_m")
+                if (
+                    self._active_m > 1
+                    and not is_prefill_variant
+                    and not _env_flag("FUSEKIT_ENABLE_MTP_NATIVE_SCRATCH")
+                ):
                     use_native_scratch = False
                 if "FUSEKIT_ENABLE_NATIVE_SCRATCH" in os.environ:
                     use_native_scratch = _env_flag("FUSEKIT_ENABLE_NATIVE_SCRATCH")
@@ -1299,14 +1356,13 @@ class Dispatcher:
             return False
         if _env_flag("FUSEKIT_DISABLE_GPU_ARGMAX_TOKENS"):
             return False
-        if not _env_flag("FUSEKIT_FORCE_DIRECT_HEAD_ARGMAX"):
-            min_hidden_raw = os.environ.get("FUSEKIT_DIRECT_HEAD_ARGMAX_MIN_HIDDEN", "0")
-            try:
-                min_hidden = max(0, int(min_hidden_raw))
-            except Exception:
-                min_hidden = 0
-            if int(getattr(self, "_hidden", 0) or 0) < min_hidden:
-                return False
+        min_hidden_raw = os.environ.get("FUSEKIT_DIRECT_HEAD_ARGMAX_MIN_HIDDEN", "0")
+        try:
+            min_hidden = max(0, int(min_hidden_raw))
+        except Exception:
+            min_hidden = 0
+        if int(getattr(self, "_hidden", 0) or 0) < min_hidden:
+            return False
         return True
 
     def _is_direct_mtp_head_qmm_task(self, t, kernel: str, layer_idx) -> bool:
@@ -1325,6 +1381,66 @@ class Dispatcher:
             return False
         shape = outs[0].get("shape") or []
         return bool(shape) and int(shape[-1]) == int(self._vocab)
+
+    def _active_rows_before_last(self, shape) -> int:
+        dims = [max(1, int(x)) for x in (shape or [])]
+        if not dims:
+            return 1
+        if len(dims) >= 3:
+            suffix = 1
+            for d in dims[2:-1]:
+                suffix *= d
+            return max(1, int(self._active_m)) * max(1, suffix)
+        rows = 1
+        for d in dims[:-1]:
+            rows *= d
+        return max(1, rows)
+
+    def _final_head_quant_bits(self, t) -> int | None:
+        hidden = max(1, int(getattr(self, "_hidden", 1) or 1))
+        for b in t.get("inputs", []):
+            if b.get("role_name") != "W_lm_head":
+                continue
+            if b.get("dtype") != "uint32":
+                return None
+            shape = b.get("shape") or []
+            if len(shape) < 2:
+                return None
+            packed = max(1, int(shape[-1]))
+            if hidden % packed != 0:
+                return None
+            pack_factor = hidden // packed
+            if pack_factor <= 0 or 32 % pack_factor != 0:
+                return None
+            bits = 32 // pack_factor
+            return bits if bits in (2, 3, 4, 5, 6, 8) else None
+        return None
+
+    def _direct_final_head_argmax_groups(self, t, tx: int) -> int:
+        hidden = max(1, int(getattr(self, "_hidden", 1) or 1))
+        vocab = max(1, int(getattr(self, "_vocab", 1) or 1))
+        bits = self._final_head_quant_bits(t)
+        if bits is None and hidden >= 2048 and vocab >= 131_072:
+            default_tgs = 128
+        elif bits == 4 and hidden <= 1024:
+            default_tgs = 128
+        elif bits == 4 and hidden <= 4096:
+            # Keep runtime dispatch aligned with the generated
+            # FinalRmsNormLmHead q4 mid-size rule. The kernel bakes this
+            # value into TGS_PER_ROW; over-dispatching here only launches
+            # early-return TGs and adds L512 overhead.
+            default_tgs = 32
+        elif bits == 8 and 2048 <= hidden <= 4096:
+            default_tgs = 32
+        else:
+            default_tgs = 64
+        try:
+            target_tgs = max(1, int(os.environ.get("FUSEKIT_FINAL_LM_HEAD_TGS", default_tgs)))
+        except Exception:
+            target_tgs = default_tgs
+        sgs_per_tg = max(1, int(tx) // 32)
+        max_useful = max(1, (vocab + sgs_per_tg - 1) // sgs_per_tg)
+        return max(1, min(target_tgs, max_useful))
 
     def _qmv_argmax_scratch_binding(self, n_groups: int) -> tuple[int, int]:
         key = (max(1, int(self._active_m)), max(1, int(n_groups)))
@@ -1917,7 +2033,7 @@ class Dispatcher:
             return (self._array_ptr(obj), obj.nbytes)
         raise ValueError(f"unknown extra binding role: {role}")
 
-    def _buf_for_binding(self, b, layer_idx_for_input: int, cache=None):
+    def _buf_for_binding(self, b, layer_idx_for_input: int, cache=None, task=None):
         if b["role"] == "scratch":
             sid = b["scratch_id"]
             arrays_key = (sid, layer_idx_for_input)
@@ -1964,6 +2080,39 @@ class Dispatcher:
         if path:
             arr = self._resolve_path(path)
             return (self._array_ptr(arr), arr.nbytes)
+        if layer_idx_for_input is not None and b.get("role_name") == "in":
+            shape = tuple(int(x) for x in (b.get("shape") or []) if int(x) >= 0)
+            dtype = b.get("dtype")
+
+            def numel(xs):
+                total = 1
+                for x in xs:
+                    total *= max(1, int(x))
+                return total
+
+            # Some dense/bf16 prefill traces leave Q/K/V bridge views as
+            # anonymous trace tensors even though the semantic producer has
+            # already materialized layer_scratch.{q,k,v}_buf. Bind those
+            # shape-equivalent no-source externals back to the semantic
+            # scratch instead of forcing a native fallback.
+            if shape:
+                for name in ("v_buf", "k_buf", "q_buf"):
+                    sid = self._layer_scratch_id.get((name, layer_idx_for_input))
+                    if sid is None:
+                        continue
+                    sid = self._scratch_alias.get(sid, sid)
+                    if sid >= len(self._scratch_specs):
+                        continue
+                    spec = self._scratch_specs[sid]
+                    spec_shape = tuple(int(x) for x in spec.get("shape", []))
+                    if (
+                        dtype == spec.get("dtype")
+                        and spec_shape
+                        and numel(shape) == numel(spec_shape)
+                        and shape[-1] == spec_shape[-1]
+                    ):
+                        arr = self._scratch_buf(sid)
+                        return (self._array_ptr(arr), arr.nbytes)
         if b.get("scalar"):
             arr = self._scalar_arrays[b["tensor_id"]]
             return (self._array_ptr(arr), max(1, arr.nbytes))
@@ -1984,7 +2133,7 @@ class Dispatcher:
         q_buf = (
             self._resolve_extra("layer_scratch.q_buf", li, cache)
             if slot0_extra
-            else self._buf_for_binding(t["inputs"][0], li, cache)
+            else self._buf_for_binding(t["inputs"][0], li, cache, t)
         )
         bufs = [
             q_buf,
@@ -1999,7 +2148,7 @@ class Dispatcher:
         ]
         # sdpa_out from t["outputs"] (Stage 1 trace output)
         for b in t["outputs"]:
-            bufs.append(self._buf_for_binding(b, li, cache))
+            bufs.append(self._buf_for_binding(b, li, cache, t))
         roles = {eb.get("role") for eb in t.get("extra_bindings", [])}
         if "global_scratch.sdpa_partials" in roles:
             bufs.append(self._resolve_extra("global_scratch.sdpa_partials", li, cache))
@@ -2038,9 +2187,9 @@ class Dispatcher:
         kp, ks, kb = c.keys
         vp, vs, vb = c.values
         return [
-            self._buf_for_binding(t["inputs"][0], li, cache),
-            self._buf_for_binding(t["inputs"][1], li, cache),
-            self._buf_for_binding(t["inputs"][2], li, cache),
+            self._buf_for_binding(t["inputs"][0], li, cache, t),
+            self._buf_for_binding(t["inputs"][1], li, cache, t),
+            self._buf_for_binding(t["inputs"][2], li, cache, t),
             (self._array_ptr(kp), kp.nbytes),
             (self._array_ptr(ks), ks.nbytes),
             (self._array_ptr(kb), kb.nbytes),
@@ -2062,8 +2211,8 @@ class Dispatcher:
         c = cache[li]
         kp, ks, kb = c.keys
         vp, vs, vb = c.values
-        bufs = [self._buf_for_binding(b, li, cache) for b in t.get("inputs", [])]
-        bufs.extend(self._buf_for_binding(b, li, cache) for b in t.get("outputs", []))
+        bufs = [self._buf_for_binding(b, li, cache, t) for b in t.get("inputs", [])]
+        bufs.extend(self._buf_for_binding(b, li, cache, t) for b in t.get("outputs", []))
         bufs.extend([
             (self._array_ptr(kp), kp.nbytes),
             (self._array_ptr(ks), ks.nbytes),
@@ -2103,11 +2252,11 @@ class Dispatcher:
             ctypes.c_int32.from_address(self._gated_delta_t_ptr).value = self._active_m
         bufs = []
         for b in t["inputs"][:5]:
-            bufs.append(self._buf_for_binding(b, li, cache))
+            bufs.append(self._buf_for_binding(b, li, cache, t))
         bufs.append((self._array_ptr(state), state.nbytes))
         bufs.append((self._gated_delta_t_ptr, 4))
         # y output remains a normal scratch; state_out aliases state_in.
-        bufs.append(self._buf_for_binding(t["outputs"][0], li, cache))
+        bufs.append(self._buf_for_binding(t["outputs"][0], li, cache, t))
         bufs.append((self._array_ptr(state), state.nbytes))
         if self._active_m > 1:
             mid = self._arrays_cache_rollback_arr(li, 1, cache)
@@ -2192,7 +2341,7 @@ class Dispatcher:
         slots = {}
         for slot in range(n_inputs):
             if slot not in extras:
-                slots[slot] = self._buf_for_binding(t["inputs"][slot], x_li, cache)
+                slots[slot] = self._buf_for_binding(t["inputs"][slot], x_li, cache, t)
         for slot, role in extras.items():
             slots[int(slot)] = self._resolve_extra(role, li, cache)
 
@@ -2225,7 +2374,7 @@ class Dispatcher:
                     continue
             while output_cursor in slots:
                 output_cursor += 1
-            slots[output_cursor] = self._buf_for_binding(out_b, x_li, cache)
+            slots[output_cursor] = self._buf_for_binding(out_b, x_li, cache, t)
             output_cursor += 1
 
         if not slots:
@@ -2381,7 +2530,7 @@ class Dispatcher:
             direct_head_argmax = self._is_direct_mtp_head_qmm_task(t, kernel, li)
             if direct_head_argmax:
                 bufs = [
-                    self._buf_for_binding(b, x_li, cache)
+                    self._buf_for_binding(b, x_li, cache, t)
                     for b in t.get("inputs", [])
                 ]
             elif "gated_delta_step" in kernel and li is not None:
@@ -2542,8 +2691,11 @@ class Dispatcher:
                 continue
             if direct_head_argmax:
                 if kernel.startswith("fusekit_final_rmsnorm_lm_head_"):
-                    total_tgs = max(1, (int(gx) + max(1, int(tx)) - 1) // max(1, int(tx)))
-                    n_groups = max(1, total_tgs // max(1, int(self._active_m)))
+                    n_groups = self._direct_final_head_argmax_groups(t, int(tx))
+                    active_rows = self._active_rows_before_last(
+                        (t.get("inputs") or [{}])[0].get("shape", [])
+                    )
+                    gx, gy, gz = max(1, active_rows) * n_groups * int(tx), 1, 1
                 else:
                     n_groups = max(1, (int(gy) + max(1, int(ty)) - 1) // max(1, int(ty)))
                 scratch = self._qmv_argmax_scratch_binding(n_groups)
@@ -2708,6 +2860,10 @@ class Dispatcher:
             return "qmv_fanout"
         if kernel.startswith("fusekit_qmv_swiglu_"):
             return "qmv_swiglu"
+        if kernel.startswith("fusekit_routed_qmv_swiglu_"):
+            return "routed_qmv_swiglu"
+        if kernel.startswith("fusekit_routed_qmv_reduce_"):
+            return "routed_qmv_reduce"
         if kernel.startswith("fusekit_linear_residual_"):
             return "linear_residual"
         if "fusekit_chain_" in kernel:
@@ -3103,7 +3259,15 @@ class Dispatcher:
 
     # ── per-step entry point ────────────────────────────────────
 
-    def try_run(self, inputs, cache, *, return_hidden: bool = False, n_confirmed: int = 0):
+    def try_run(
+        self,
+        inputs,
+        cache,
+        *,
+        return_hidden: bool = False,
+        n_confirmed: int = 0,
+        prefill_no_logits: bool = False,
+    ):
         """Run one decode step if the input shape and cache state are
         compatible with the ICB. Returns the logits as a (1, 1, vocab)
         mx.array, or `None` to signal the caller should fall back."""
@@ -3118,7 +3282,20 @@ class Dispatcher:
             and _env_flag("FUSEKIT_USE_MTP_MN_VARIANT")
             and not _env_flag("FUSEKIT_DISABLE_MTP_MN_VARIANT")
         ):
-            return self._try_run_multi(inputs, cache, return_hidden=True)
+            return self._try_run_multi(inputs, cache, return_hidden=True, speculative=True)
+        if (
+            self._active_m > 1
+            and inputs.shape[1] == self._active_m
+            and not return_hidden
+            and n_confirmed == 0
+        ):
+            return self._try_run_multi(
+                inputs,
+                cache,
+                return_hidden=False,
+                speculative=False,
+                prefill_no_logits=prefill_no_logits,
+            )
         if (
             inputs.shape[1] == 2
             and return_hidden
@@ -3138,10 +3315,91 @@ class Dispatcher:
                 return True
         return False
 
-    def _try_run_multi(self, inputs, cache, *, return_hidden: bool = False):
+    def _prefill_no_logits_dispatch_count(self) -> int | None:
+        labels = self._last_dispatch_labels or []
+        for i, label in enumerate(labels):
+            kernel = str(label.get("kernel", "")) if isinstance(label, dict) else ""
+            if (
+                kernel.startswith("fusekit_final_rmsnorm_lm_head_")
+                or kernel.startswith("fusekit_argmax_logits_")
+                or kernel == "fusekit_history_capture"
+            ):
+                return i
+        return len(labels) if labels else None
+
+    def _execute_icb(
+        self,
+        icb_id: int,
+        *,
+        count: int | None = None,
+        profile_m: int | None = None,
+    ) -> None:
+        if count is not None and count <= 0:
+            raise RuntimeError(f"invalid fusekit ICB dispatch count: {count}")
+        if count is not None and not hasattr(self._rt, "execute_icb_range"):
+            raise RuntimeError("native runtime lacks execute_icb_range")
+
+        target_m = self._profile_kernels_target_m
+        profiled = self._profile_kernels_once and (
+            target_m <= 0 or (profile_m is not None and target_m == profile_m)
+        )
+        if profiled:
+            if self._profile_kernels_skip > 0:
+                self._profile_kernels_skip -= 1
+                if count is None:
+                    self._rt.execute_icb(self._handle, icb_id)
+                else:
+                    self._rt.execute_icb_range(self._handle, icb_id, 0, count)
+            else:
+                self._profile_kernels_once = False
+                self._execute_profiled_once(count=count)
+            return
+
+        if self._profile_icb_remaining > 0:
+            self._profile_icb_remaining -= 1
+            started = time.perf_counter()
+            if count is None:
+                gpu_s = float(self._rt.execute_icb(self._handle, icb_id))
+                kernel_count = len(self._last_dispatches or [])
+            else:
+                gpu_s = float(self._rt.execute_icb_range(self._handle, icb_id, 0, count))
+                kernel_count = count
+            cpu_s = time.perf_counter() - started
+            gap_s = max(cpu_s - gpu_s, 0.0)
+            print(
+                "[fusekit-icb-profile] "
+                f"active_m={profile_m or self._active_m} "
+                f"cpu_us={cpu_s * 1_000_000.0:.2f} "
+                f"gpu_us={gpu_s * 1_000_000.0:.2f} "
+                f"gap_us={gap_s * 1_000_000.0:.2f} "
+                f"kernels={kernel_count}",
+                flush=True,
+            )
+            return
+
+        if count is None:
+            self._rt.execute_icb(self._handle, icb_id)
+        else:
+            self._rt.execute_icb_range(self._handle, icb_id, 0, count)
+
+    def _try_run_multi(
+        self,
+        inputs,
+        cache,
+        *,
+        return_hidden: bool = False,
+        speculative: bool = True,
+        prefill_no_logits: bool = False,
+    ):
+        trace_prefill = prefill_no_logits and os.environ.get("FUSEKIT_TRACE_PREFILL")
+        def trace_return(reason: str):
+            if trace_prefill:
+                print(f"[fusekit-prefill] multi no-output: {reason}", flush=True)
+            return None
+
         m = int(inputs.shape[1])
         if m != self._active_m:
-            return None
+            return trace_return(f"active_m mismatch input={m} graph={self._active_m}")
         # For MTP verify calls with n_confirmed=1 the engine needs the
         # recurrent ArraysCache state after the confirmed first token,
         # regardless of how many speculative rows were evaluated. The
@@ -3149,15 +3407,18 @@ class Dispatcher:
         # post-row-0 state, so the same rollback semantic works for
         # M=2 and larger M variants.
         if self._fk_unsupported_graph:
-            return None
+            return trace_return(f"unsupported graph: {self._fk_unsupported_graph}")
         if self._fk_unsupported_cache or self._fk_dense_bf16_disabled:
-            return None
+            return trace_return(
+                f"unsupported cache={self._fk_unsupported_cache} "
+                f"dense_bf16_disabled={self._fk_dense_bf16_disabled}"
+            )
         c0 = next((c for c in cache if hasattr(c, "offset")), None)
         if c0 is None:
-            return None
+            return trace_return("cache has no offset-bearing entry")
         o = self._cache_decode_offset(c0)
         if o is None:
-            return None
+            return trace_return("cache offset unavailable")
         ok, reason = _ensure_cache_capacity(cache, o + m)
         if not ok:
             if _env_flag("FUSEKIT_STRICT_DISPATCH"):
@@ -3165,10 +3426,15 @@ class Dispatcher:
                     "fusekit: cannot guarantee KV cache capacity for "
                     f"M={m} decode offset {o} ({reason})"
                 )
-            return None
+            return trace_return(f"cache capacity failed: {reason}")
         icb_id = self._ensure_icb(cache)
         if icb_id is None:
-            return None
+            return trace_return("ICB unavailable")
+        no_logits_count = None
+        if prefill_no_logits:
+            no_logits_count = self._prefill_no_logits_dispatch_count()
+            if no_logits_count is None:
+                return trace_return("no prefill no-logits cut point")
 
         mx = self._mx
         flat = inputs.flatten().astype(mx.uint32)
@@ -3190,7 +3456,7 @@ class Dispatcher:
         ).value = o + 1
         keys_repr = c0.keys[0] if isinstance(c0.keys, (tuple, list)) else c0.keys
         if keys_repr is None:
-            return None
+            return trace_return("KV keys unavailable")
         ctypes.c_uint32.from_address(
             self._uniform_ptrs[("layer_capacity", None)]
         ).value = keys_repr.shape[2]
@@ -3198,7 +3464,7 @@ class Dispatcher:
             ctypes.c_uint32.from_address(ptr).value = 0
         prof_state = self._profile_mtp_state and self._active_m > 1
         prof_t0 = time.perf_counter() if prof_state else 0.0
-        if self._active_m > 1:
+        if self._active_m > 1 and speculative:
             for li, c in enumerate(cache):
                 if type(c).__name__ == "ArraysCache":
                     for idx in range(len(getattr(c, "cache", []))):
@@ -3207,35 +3473,14 @@ class Dispatcher:
         self._advance_decode_cache(cache, o + m, steps=m)
         prof_t2 = time.perf_counter() if prof_state else 0.0
         prof_exec0 = time.perf_counter() if prof_state else 0.0
-        if self._profile_kernels_once and (
-            self._profile_kernels_target_m <= 0 or self._profile_kernels_target_m == m
-        ):
-            if self._profile_kernels_skip > 0:
-                self._profile_kernels_skip -= 1
-                self._rt.execute_icb(self._handle, icb_id)
-            else:
-                self._profile_kernels_once = False
-                self._execute_profiled_once()
-        elif self._profile_icb_remaining > 0:
-            self._profile_icb_remaining -= 1
-            started = time.perf_counter()
-            gpu_s = float(self._rt.execute_icb(self._handle, icb_id))
-            cpu_s = time.perf_counter() - started
-            gap_s = max(cpu_s - gpu_s, 0.0)
-            print(
-                "[fusekit-icb-profile] "
-                f"active_m={m} "
-                f"cpu_us={cpu_s * 1_000_000.0:.2f} "
-                f"gpu_us={gpu_s * 1_000_000.0:.2f} "
-                f"gap_us={gap_s * 1_000_000.0:.2f} "
-                f"kernels={len(self._last_dispatches or [])}",
-                flush=True,
-            )
-        else:
-            self._rt.execute_icb(self._handle, icb_id)
+        self._execute_icb(icb_id, count=no_logits_count, profile_m=m)
         prof_exec1 = time.perf_counter() if prof_state else 0.0
+        if prefill_no_logits:
+            self.last_argmax_tokens = None
+            return mx.array([[0]], dtype=mx.uint32)
         self.last_argmax_tokens = self._read_next_tokens(m)
-        self._set_mtp_rollback_state(cache)
+        if speculative:
+            self._set_mtp_rollback_state(cache)
         if prof_state:
             prof_t3 = time.perf_counter()
             print(
@@ -3348,52 +3593,82 @@ class Dispatcher:
         if icb_id is None:
             return None
         mx = self._mx
-        flat = inputs.flatten().astype(mx.uint32)
-        mx.eval(flat)
+        native_step_sync = getattr(self._rt, "step_decode_shared_state_sync", None)
+        use_native_step_sync = (
+            native_step_sync is not None
+            and not self._profile_kernels_once
+            and self._profile_icb_remaining <= 0
+            and not os.environ.get("FUSEKIT_DISABLE_NATIVE_STEP_SYNC")
+        )
         if self._host_embed_lookup:
             row = self._embed_module(inputs).reshape((self._hidden,)).astype(self._act_dt)
             mx.eval(row)
             ctypes.memmove(self._array_ptr(self._x_in), self._array_ptr(row), row.nbytes)
-        # token_id_in aliases next_token_out — seed the buffer the
-        # GPU chain reads from.
-        ctypes.memmove(
-            self._uniform_ptrs[("next_token_out", None)],
-            self._array_ptr(flat), 4,
-        )
-        # Init the on-GPU counters the ICB's step_init/history_capture
-        # kernels advance: step_counter holds the offset where THIS
-        # step's K/V will land; hist_counter is reset each call so
-        # try_run doesn't accumulate past history[0].
-        ctypes.c_uint32.from_address(self._step_counter_ptr).value = o
-        ctypes.c_uint32.from_address(self._hist_counter_ptr).value = 0
-        # Seed the shared uniforms on the host as well as via
-        # step_init. Some trace-preserved decode ops (notably
-        # standalone RoPE) read the offset very early in the ICB; a
-        # single shared host write avoids relying on GPU-side uniform
-        # propagation for correctness while keeping the per-layer
-        # fanout collapsed.
-        ctypes.c_uint32.from_address(
-            self._uniform_ptrs[("layer_offset", None)]
-        ).value = o
-        ctypes.c_uint32.from_address(
-            self._uniform_ptrs[("layer_kv_len", None)]
-        ).value = o + 1
+        if not use_native_step_sync:
+            flat = inputs.flatten().astype(mx.uint32)
+            mx.eval(flat)
+            # token_id_in aliases next_token_out — seed the buffer the
+            # GPU chain reads from.
+            ctypes.memmove(
+                self._uniform_ptrs[("next_token_out", None)],
+                self._array_ptr(flat), 4,
+            )
+            # Init the on-GPU counters the ICB's step_init/history_capture
+            # kernels advance: step_counter holds the offset where THIS
+            # step's K/V will land; hist_counter is reset each call so
+            # try_run doesn't accumulate past history[0].
+            ctypes.c_uint32.from_address(self._step_counter_ptr).value = o
+            ctypes.c_uint32.from_address(self._hist_counter_ptr).value = 0
+            # Seed the shared uniforms on the host as well as via
+            # step_init. Some trace-preserved decode ops (notably
+            # standalone RoPE) read the offset very early in the ICB; a
+            # single shared host write avoids relying on GPU-side uniform
+            # propagation for correctness while keeping the per-layer
+            # fanout collapsed.
+            ctypes.c_uint32.from_address(
+                self._uniform_ptrs[("layer_offset", None)]
+            ).value = o
+            ctypes.c_uint32.from_address(
+                self._uniform_ptrs[("layer_kv_len", None)]
+            ).value = o + 1
         # QuantizedKVCache.keys is (packed, scales, biases) tuple; the
         # `capacity` dim is shape[2] of the packed array (same as the
         # bf16 case's c0.keys.shape[2]).
         keys_repr = c0.keys[0] if isinstance(c0.keys, (tuple, list)) else c0.keys
         if keys_repr is None:
             return None
-        ctypes.c_uint32.from_address(
-            self._uniform_ptrs[("layer_capacity", None)]
-        ).value = keys_repr.shape[2]
-        # Reset per-layer barrier counters to 0 so the next ICB execute
-        # starts fresh. GlobalBarrier piece atomic_fetch_adds and spins
-        # until value == tg_count.
-        for ptr in self._barrier_counter_ptrs.values():
-            ctypes.c_uint32.from_address(ptr).value = 0
+        capacity = int(keys_repr.shape[2])
+        if not use_native_step_sync:
+            ctypes.c_uint32.from_address(
+                self._uniform_ptrs[("layer_capacity", None)]
+            ).value = capacity
+            # Reset per-layer barrier counters to 0 so the next ICB execute
+            # starts fresh. GlobalBarrier piece atomic_fetch_adds and spins
+            # until value == tg_count.
+            for ptr in self._barrier_counter_ptrs.values():
+                ctypes.c_uint32.from_address(ptr).value = 0
         self._advance_decode_cache(cache, o + 1)
-        if self._profile_kernels_once and (
+        if use_native_step_sync:
+            try:
+                token = int(inputs.item())
+            except Exception:
+                token = int(mx.array(inputs).reshape(-1)[0].item())
+            native_step_sync(
+                self._handle,
+                icb_id,
+                self._uniform_ptrs[("next_token_out", None)],
+                token,
+                self._uniform_ptrs[("layer_offset", None)],
+                int(o),
+                self._uniform_ptrs[("layer_capacity", None)],
+                capacity,
+                self._uniform_ptrs[("layer_kv_len", None)],
+                int(o + 1),
+                self._step_counter_ptr,
+                self._hist_counter_ptr,
+                list(self._barrier_counter_ptrs.values()),
+            )
+        elif self._profile_kernels_once and (
             self._profile_kernels_target_m <= 0 or self._profile_kernels_target_m == 1
         ):
             if self._profile_kernels_skip > 0:
@@ -3440,7 +3715,7 @@ class Dispatcher:
             return None
         return logits_view, hidden_view
 
-    def _execute_profiled_once(self) -> None:
+    def _execute_profiled_once(self, *, count: int | None = None) -> None:
         """Execute the current decode pipeline one kernel at a time and
         print GPU time by task. This is a ranking profiler: direct
         per-task command buffers are not identical to ICB execution,
@@ -3451,8 +3726,28 @@ class Dispatcher:
             return
         rows = []
         total_gpu_s = 0.0
+        if count is not None:
+            dispatches = dispatches[:count]
+        native_profile = getattr(self._rt, "profile_icb_commands", None)
+        native_times = None
+        if native_profile is not None and self._icb_id is not None:
+            try:
+                native_times = list(native_profile(self._handle, self._icb_id, count))
+            except Exception as e:
+                warnings.warn(
+                    f"fusekit: native ICB profiler failed ({e}); "
+                    "falling back to direct dispatch profiling",
+                    stacklevel=2,
+                )
+                native_times = None
+        if native_times is not None:
+            dispatches = dispatches[: len(native_times)]
         for i, d in enumerate(dispatches):
-            gpu_s = float(self._rt.dispatch_batch(self._handle, [d]))
+            gpu_s = (
+                float(native_times[i])
+                if native_times is not None
+                else float(self._rt.dispatch_batch(self._handle, [d]))
+            )
             total_gpu_s += gpu_s
             kernel, bufs, grid, tg = d
             label = labels[i] if i < len(labels) else {}
@@ -3499,6 +3794,8 @@ class Dispatcher:
         if os.environ.get("FUSEKIT_PROFILE_COMPACT"):
             wanted_kinds = (
                 "qmv_fanout",
+                "routed_qmv_swiglu",
+                "routed_qmv_reduce",
                 "linear_residual",
                 "other",
                 "op:quantizedmatmul",

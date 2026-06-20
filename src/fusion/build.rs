@@ -32,6 +32,7 @@ use crate::fusion::safety::{self, SafetyCheck};
 use crate::graph::{Graph, OpId};
 
 pub fn build_fusions(g: &Graph, meta: ModelMeta) -> Result<FusionGraph> {
+    let prefill_tiled_qmm = std::env::var("FUSEKIT_PREFILL_TILED_QMM").as_deref() == Ok("1");
     let ud = UseDef::build(g);
     let registry = default_registry();
     let mut fusions = Vec::with_capacity(g.ops.len());
@@ -47,6 +48,9 @@ pub fn build_fusions(g: &Graph, meta: ModelMeta) -> Result<FusionGraph> {
         // patterns get a chance when a higher-priority match is
         // rejected (e.g. mlp_block over-budget → fall back to gateup_sw).
         let matched = registry.iter().find_map(|p| {
+            if prefill_tiled_qmm && p.name() == "rmsnorm_qkv" {
+                return None;
+            }
             let m = p.try_match(g, &ud, op.id)?;
             match safety::check(&m, &meta) {
                 SafetyCheck::Accept => Some(m),
@@ -175,7 +179,9 @@ pub fn build_fusions(g: &Graph, meta: ModelMeta) -> Result<FusionGraph> {
                                              // (e.g. tests with stub graphs).
 
     // Retract Single(Quantize) for embed unconditionally; Single(RoPE)
-    // only when the synthetic will supersede it.
+    // only when the synthetic will supersede it. Prefill-tiled QMM
+    // still uses the same semantic RoPE/cache-store primitives; only
+    // Q/K/V projection lowering differs.
     fusions.retain(|f: &Fusion| match &f.kind {
         FusionKind::Single(name) => match name.as_str() {
             "Quantize" => false,
@@ -229,13 +235,6 @@ pub fn build_fusions(g: &Graph, meta: ModelMeta) -> Result<FusionGraph> {
                     layer_hint: Some(crate::graph::LayerTag::Layer(layer)),
                 });
             }
-        } else {
-            // Direction-A graceful fallback. Single(RoPE) ops survive
-            // for codegen via `single::emit_rope`. The KV cache store
-            // path is NOT yet implemented as a trace-driven op (still
-            // requires SliceUpdate recognition); whole-model fallback
-            // through `_fk_dispatch_failed → mlx-lm passthrough` is
-            // the safety net until that lands.
         }
         fusions.push(Fusion {
             id: fusions.len() as u32,
@@ -785,6 +784,75 @@ fn qkv_decode_inputs_by_layer(
         // keeping the first avoids guessing. The later sink pass will
         // only absorb consumers whose input source matches.
         out.entry(layer).or_insert((q, k, v));
+    }
+
+    let producer = |tid: crate::graph::TensorId| -> Option<&crate::graph::Op> {
+        g.tensors
+            .get(tid as usize)?
+            .producer
+            .map(|id| &g.ops[id as usize])
+    };
+    let strip_rope_transpose = |tid: crate::graph::TensorId| -> crate::graph::TensorId {
+        let mut cur = tid;
+        let mut seen = std::collections::HashSet::new();
+        while seen.insert(cur) {
+            let Some(op) = producer(cur) else {
+                break;
+            };
+            if !matches!(
+                op.name.as_str(),
+                "RoPE" | "Transpose" | "AsContiguous" | "Squeeze" | "ExpandDims"
+            ) || op.inputs.is_empty()
+            {
+                break;
+            }
+            cur = op.inputs[0];
+        }
+        cur
+    };
+
+    for fusion in fusions {
+        let FusionKind::Single(name) = &fusion.kind else {
+            continue;
+        };
+        if name != "ScaledDotProductAttention" || fusion.inputs.len() < 3 {
+            continue;
+        }
+        let Some(layer) = fusion_layer_index(g, fusion) else {
+            continue;
+        };
+        if out.contains_key(&layer) {
+            continue;
+        }
+        let q = strip_rope_transpose(fusion.inputs[0].source);
+        let k = strip_rope_transpose(fusion.inputs[1].source);
+        let v = strip_rope_transpose(fusion.inputs[2].source);
+        let q_shape = &g.tensors[q as usize].shape;
+        let k_shape = &g.tensors[k as usize].shape;
+        let v_shape = &g.tensors[v as usize].shape;
+        if q_shape.len() < 3 || k_shape.len() < 3 || v_shape.len() < 3 {
+            continue;
+        }
+        let Some(q_last) = q_shape.last().copied() else {
+            continue;
+        };
+        let Some(k_last) = k_shape.last().copied() else {
+            continue;
+        };
+        let Some(v_last) = v_shape.last().copied() else {
+            continue;
+        };
+        if q_last <= 0 || k_last <= 0 || v_last <= 0 || k_last != v_last {
+            continue;
+        }
+        out.insert(
+            layer,
+            (
+                boundary(g, q, "q"),
+                boundary(g, k, "k"),
+                boundary(g, v, "v"),
+            ),
+        );
     }
     out
 }

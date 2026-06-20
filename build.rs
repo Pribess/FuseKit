@@ -11,6 +11,9 @@
 use std::path::PathBuf;
 
 fn main() {
+    println!("cargo:rerun-if-changed=python/fusekit_runtime/__init__.py");
+    println!("cargo:rerun-if-changed=python/fusekit_runtime/dispatch.py");
+
     // The bundled libpython has its install_name baked to a fake
     // `/install/lib/...` build prefix; the new Apple linker dropped
     // `-Wl,-change`, so we copy the dylib into OUT_DIR and rewrite the
@@ -117,6 +120,8 @@ fn build_python_runtime_native() {
 fn compile_metal_kernels() {
     let metal_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("metal");
     let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").unwrap());
+    let module_cache = out_dir.join("metal-module-cache");
+    std::fs::create_dir_all(&module_cache).expect("create Metal module cache");
 
     let metal_bin = match std::process::Command::new("xcrun")
         .args(["--sdk", "macosx", "--find", "metal"])
@@ -154,6 +159,7 @@ fn compile_metal_kernels() {
         let air = out_dir.join(format!("{stem}.air"));
         let status = std::process::Command::new(&metal_bin)
             .args(["-c", "-O3", "-ffast-math"])
+            .arg(format!("-fmodules-cache-path={}", module_cache.display()))
             .arg(&path)
             .arg("-o")
             .arg(&air)

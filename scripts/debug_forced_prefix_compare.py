@@ -64,14 +64,15 @@ def main() -> int:
     ap.add_argument("model")
     ap.add_argument("--prompt", default="x")
     ap.add_argument("--tokens", required=True, help="comma/space separated forced tokens")
+    ap.add_argument("--mtp", action="store_true")
     ap.add_argument("--stop-after-mismatch", action="store_true")
     args = ap.parse_args()
 
     model, tokenizer = load_text_model(
         _model_path(args.model),
-        model_settings=ModelSettings(mtp_enabled=True),
+        model_settings=ModelSettings(mtp_enabled=args.mtp),
     )
-    model = apply_post_load_transforms(model, ModelSettings(mtp_enabled=True))
+    model = apply_post_load_transforms(model, ModelSettings(mtp_enabled=args.mtp))
     raw_model = getattr(model, "_fk_original", model)
     print(f"[forced-prefix] wrapped={raw_model is not model}", flush=True)
 

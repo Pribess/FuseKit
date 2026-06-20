@@ -334,6 +334,15 @@ fn emit_impl(
     let unroll4 = hidden % 4 == 0 && std::env::var_os("FK_NO_UNROLL4").is_none();
     let bits = quant.map(|q| q.bits).unwrap_or(0);
     let group_size = quant.map(|q| q.group_size).unwrap_or(0);
+    let qmv_tg_helper = is_quant
+        && decode_sinks.is_none()
+        && matches!(crate::target::current_chip(), crate::target::ChipModel::M5)
+        && active_rows <= 1
+        && group_size == 64
+        && bits == 8
+        && crate::codegen::kernels::qmv_fast_block_size(bits)
+            .is_some_and(|block| (hidden as u32).is_multiple_of(block))
+        && hidden >= 2048;
     let emit_dot = |w: &mut MslWriter,
                     acc: &str,
                     weight: &str,
@@ -342,6 +351,12 @@ fn emit_impl(
                     idx: &str,
                     out_dim: u32| {
         if is_quant {
+            if qmv_tg_helper {
+                w.writeln(format_args!(
+                    "{acc} = fusekit_qmv_fast_tg_partial_impl<{t}, {group_size}, {bits}>({weight}, {scales}, {biases}, norm_y, int(HIDDEN), int({idx}), simd_lane);"
+                ));
+                return;
+            }
             // int4 affine dequant inline GEMV using SMEM-resident norm_y
             // as the activation source.
             let packed_words = crate::codegen::kernels::quant_packed_words(hidden as u32, bits);

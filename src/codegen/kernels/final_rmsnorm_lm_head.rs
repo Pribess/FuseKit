@@ -24,6 +24,63 @@ use crate::codegen::msl::MslWriter;
 use crate::fusion::ir::{Fusion, FusionAttrs, FusionKind, ModelMeta};
 use crate::task::ir::PartitionPlan;
 
+fn norm_smem_ty(t: &str, quant: Option<crate::fusion::ir::QuantInfo>) -> &str {
+    let _ = (t, quant);
+    "float"
+}
+
+fn emit_norm_writeback_to_smem_ty(
+    w: &mut MslWriter,
+    hidden: u32,
+    input_var: &str,
+    norm_w_var: &str,
+    act_ty: &str,
+    norm_ty: &str,
+) {
+    if norm_ty == "float" {
+        crate::codegen::kernels::emit_norm_writeback_with_act_ty(
+            w, hidden, input_var, norm_w_var, act_ty,
+        );
+        return;
+    }
+
+    let value = |idx: &str| match act_ty {
+        "bfloat" => format!(
+            "bfloat(({norm_w_var})[{idx}] * bfloat(float(({input_var})[{idx}]) * rms_scale))"
+        ),
+        "half" => {
+            format!("half(({norm_w_var})[{idx}] * half(float(({input_var})[{idx}]) * rms_scale))")
+        }
+        _ => format!(
+            "{norm_ty}(float(({input_var})[{idx}]) * rms_scale * float(({norm_w_var})[{idx}]))"
+        ),
+    };
+
+    let chunk = if hidden.is_multiple_of(8) {
+        8
+    } else if hidden.is_multiple_of(4) {
+        4
+    } else if hidden.is_multiple_of(2) {
+        2
+    } else {
+        1
+    };
+    w.writeln(format_args!("constexpr uint NORM_WB_CHUNK = {chunk}u;"));
+    w.line("constexpr uint NORM_WB_ACTIVE = HIDDEN / NORM_WB_CHUNK;");
+    w.line("for (uint block = tid; block < NORM_WB_ACTIVE; block += tg_size) {");
+    w.push_indent();
+    w.line("uint base = block * NORM_WB_CHUNK;");
+    w.line("for (uint j = 0u; j < NORM_WB_CHUNK; ++j) {");
+    w.push_indent();
+    w.line("uint idx = base + j;");
+    w.writeln(format_args!("norm_y[idx] = {};", value("idx")));
+    w.pop_indent();
+    w.line("}");
+    w.pop_indent();
+    w.line("}");
+    w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
+}
+
 fn emit_quant_lm_head_dot(
     w: &mut MslWriter,
     t: &str,
@@ -40,9 +97,14 @@ fn emit_quant_lm_head_dot(
     };
     let packs_per_thread = if bits == 2 { 1 } else { 2 };
     let block_size = pack_factor * packs_per_thread * 32;
+    let use_explicit_small_q8 =
+        matches!(crate::target::current_chip(), crate::target::ChipModel::M5)
+            && bits == 8
+            && hidden <= 1024;
     let use_mlx_tg_qmv = group_size == 64
         && matches!(bits, 2 | 3 | 4 | 5 | 6 | 8)
-        && hidden % block_size == 0;
+        && hidden % block_size == 0
+        && !use_explicit_small_q8;
     if use_mlx_tg_qmv {
         w.line("#if FUSEKIT_HAVE_MLX_NAX");
         w.push_indent();
@@ -58,7 +120,7 @@ fn emit_quant_lm_head_dot(
     let packed = format!("W_lm_head + v * {packed_words}u");
     let scales = format!("W_lm_head_s + v * (HIDDEN / {group_size}u)");
     let biases = format!("W_lm_head_b + v * (HIDDEN / {group_size}u)");
-    crate::codegen::kernels::emit_int4_gemv_inner_with_unroll2_default(
+    crate::codegen::kernels::emit_int4_gemv_inner_with_options_and_qdot(
         w,
         acc,
         &packed,
@@ -68,6 +130,8 @@ fn emit_quant_lm_head_dot(
         bits,
         group_size,
         crate::codegen::kernels::qgemv_unroll2_default_for_shape(bits, hidden, vocab),
+        false,
+        crate::codegen::kernels::QdotPolicy::Disable,
         |k| format!("norm_y[{k}]"),
     );
 
@@ -102,8 +166,9 @@ pub fn emit(
         .map(|b| crate::target::current_chip().active_rows_before_last(&b.shape))
         .unwrap_or(1)
         .max(1);
-    let is_quant = quant.is_some();
     let t = crate::codegen::kernels::act_ty(meta);
+    let is_quant = quant.is_some();
+    let norm_ty = norm_smem_ty(t, quant);
     let fn_name = function_name(fusion);
 
     w.line(format!(
@@ -152,12 +217,12 @@ pub fn emit(
     w.blank();
 
     // ── Stage 1: RMSNorm into SMEM (per-TG, recomputed each TG) ─
-    w.line("threadgroup float norm_y[HIDDEN];");
+    w.line(format!("threadgroup {norm_ty} norm_y[HIDDEN];"));
     w.line("threadgroup float sum_sq_partial[32];");
     w.blank();
     crate::codegen::kernels::emit_rmsnorm_reduction(w, hidden, "x_row", "sum_sq_partial");
     w.line("float rms_scale = metal::precise::rsqrt(sum_sq_partial[0] / float(HIDDEN) + EPS);");
-    crate::codegen::kernels::emit_norm_writeback_with_act_ty(w, hidden, "x_row", "norm_w", t);
+    emit_norm_writeback_to_smem_ty(w, hidden, "x_row", "norm_w", t, norm_ty);
     w.blank();
 
     // ── Stage 2: GEMV over the TG's slice of vocab ─────────────
@@ -186,31 +251,69 @@ pub fn emit(
         let bits = q.bits;
         let group_size = q.group_size;
         emit_quant_lm_head_dot(w, t, "acc", bits, group_size, hidden, vocab);
+    } else if dense_lm_head_k8_unroll_enabled(hidden, vocab) && hidden % 32 == 0 {
+        w.line(format!(
+            "device const {t}4* W4 = (device const {t}4*)(W_lm_head + v * HIDDEN);"
+        ));
+        w.line(format!(
+            "threadgroup {norm_ty}4* ny4 = (threadgroup {norm_ty}4*)norm_y;"
+        ));
+        w.line("for (uint k4 = simd_lane * 8u; k4 < HIDDEN / 4u; k4 += 256u) {");
+        w.push_indent();
+        w.line("acc += dot(float4(ny4[k4]),     float4(W4[k4]))");
+        w.line("     + dot(float4(ny4[k4+1u]), float4(W4[k4+1u]))");
+        w.line("     + dot(float4(ny4[k4+2u]), float4(W4[k4+2u]))");
+        w.line("     + dot(float4(ny4[k4+3u]), float4(W4[k4+3u]))");
+        w.line("     + dot(float4(ny4[k4+4u]), float4(W4[k4+4u]))");
+        w.line("     + dot(float4(ny4[k4+5u]), float4(W4[k4+5u]))");
+        w.line("     + dot(float4(ny4[k4+6u]), float4(W4[k4+6u]))");
+        w.line("     + dot(float4(ny4[k4+7u]), float4(W4[k4+7u]));");
+        w.pop_indent();
+        w.line("}");
+    } else if dense_lm_head_k4_unroll_enabled(hidden, vocab) && hidden % 16 == 0 {
+        w.line(format!(
+            "device const {t}4* W4 = (device const {t}4*)(W_lm_head + v * HIDDEN);"
+        ));
+        w.line(format!(
+            "threadgroup {norm_ty}4* ny4 = (threadgroup {norm_ty}4*)norm_y;"
+        ));
+        w.line("for (uint k4 = simd_lane * 4u; k4 < HIDDEN / 4u; k4 += 128u) {");
+        w.push_indent();
+        w.line("acc += dot(float4(ny4[k4]),     float4(W4[k4]))");
+        w.line("     + dot(float4(ny4[k4+1u]), float4(W4[k4+1u]))");
+        w.line("     + dot(float4(ny4[k4+2u]), float4(W4[k4+2u]))");
+        w.line("     + dot(float4(ny4[k4+3u]), float4(W4[k4+3u]));");
+        w.pop_indent();
+        w.line("}");
     } else if hidden % 8 == 0 {
         w.line(format!(
             "device const {t}4* W4 = (device const {t}4*)(W_lm_head + v * HIDDEN);"
         ));
-        w.line("threadgroup float4* ny4 = (threadgroup float4*)norm_y;");
+        w.line(format!(
+            "threadgroup {norm_ty}4* ny4 = (threadgroup {norm_ty}4*)norm_y;"
+        ));
         w.line("for (uint k4 = simd_lane * 2u; k4 < HIDDEN / 4u; k4 += 64u) {");
         w.push_indent();
-        w.line("acc += dot(ny4[k4],     float4(W4[k4]))");
-        w.line("     + dot(ny4[k4+1u], float4(W4[k4+1u]));");
+        w.line("acc += dot(float4(ny4[k4]),     float4(W4[k4]))");
+        w.line("     + dot(float4(ny4[k4+1u]), float4(W4[k4+1u]));");
         w.pop_indent();
         w.line("}");
     } else if hidden % 4 == 0 {
         w.line(format!(
             "device const {t}4* W4 = (device const {t}4*)(W_lm_head + v * HIDDEN);"
         ));
-        w.line("threadgroup float4* ny4 = (threadgroup float4*)norm_y;");
+        w.line(format!(
+            "threadgroup {norm_ty}4* ny4 = (threadgroup {norm_ty}4*)norm_y;"
+        ));
         w.line("for (uint k4 = simd_lane; k4 < HIDDEN / 4u; k4 += 32u) {");
         w.push_indent();
-        w.line("acc += dot(ny4[k4], float4(W4[k4]));");
+        w.line("acc += dot(float4(ny4[k4]), float4(W4[k4]));");
         w.pop_indent();
         w.line("}");
     } else {
         w.line("for (uint k = simd_lane; k < HIDDEN; k += 32u) {");
         w.push_indent();
-        w.line("acc += norm_y[k] * float(W_lm_head[v * HIDDEN + k]);");
+        w.line("acc += float(norm_y[k]) * float(W_lm_head[v * HIDDEN + k]);");
         w.pop_indent();
         w.line("}");
     }
@@ -238,12 +341,34 @@ pub fn argmax_finalize_function_name(fusion: &Fusion) -> String {
     format!("{}_argmax_finalize", function_name(fusion))
 }
 
+fn dense_lm_head_k4_unroll_enabled(hidden: u32, vocab: u32) -> bool {
+    matches!(crate::target::current_chip(), crate::target::ChipModel::M5)
+        && hidden >= 2048
+        && vocab >= 131_072
+}
+
+fn dense_lm_head_k8_unroll_enabled(hidden: u32, vocab: u32) -> bool {
+    matches!(crate::target::current_chip(), crate::target::ChipModel::M5)
+        && hidden >= 2048
+        && vocab >= 131_072
+        && hidden.is_multiple_of(32)
+}
+
 fn final_head_target_tgs(meta: &ModelMeta, quant: Option<crate::fusion::ir::QuantInfo>) -> u64 {
     let vocab = meta.vocab_size as u64;
     let chip = crate::target::current_chip();
     let b = chip.budgets();
-    let sgs_per_tg = b.preferred_simdgroups_per_tg.min(b.max_simdgroups_per_tg).max(2) as u64;
+    let sgs_per_tg = b
+        .preferred_simdgroups_per_tg
+        .min(b.max_simdgroups_per_tg)
+        .max(2) as u64;
     let default_tgs = match quant {
+        None if matches!(chip, crate::target::ChipModel::M5)
+            && meta.hidden_size >= 2048
+            && vocab >= 131_072 =>
+        {
+            128
+        }
         Some(q)
             if matches!(chip, crate::target::ChipModel::M5)
                 && q.bits == 4
@@ -253,9 +378,23 @@ fn final_head_target_tgs(meta: &ModelMeta, quant: Option<crate::fusion::ir::Quan
         }
         Some(q)
             if matches!(chip, crate::target::ChipModel::M5)
-                && (q.bits == 4 || (q.bits == 8 && meta.hidden_size >= 2048))
+                && q.bits == 4
                 && meta.hidden_size <= 4096 =>
         {
+            // Mid-size q4 LM heads are memory-streaming dominated, but too
+            // many slices repeat the RMSNorm/vocab reduction overhead. M5
+            // L512 profiles favor 32 slices for this hidden-width class.
+            32
+        }
+        Some(q)
+            if matches!(chip, crate::target::ChipModel::M5)
+                && q.bits == 8
+                && (2048..=4096).contains(&meta.hidden_size) =>
+        {
+            // Mid-size q8 LM heads are dominated by streaming the vocab
+            // matrix, but too many scan slices spend more time in the
+            // per-slice reduction/finalize path. L512 M5 profiles favored 32
+            // slices over 48/64 for this hidden-width class.
             32
         }
         _ => 64,
@@ -287,6 +426,7 @@ fn emit_argmax_pair(
     let n_tgs = final_head_target_tgs(meta, quant);
     let t = crate::codegen::kernels::act_ty(meta);
     let is_quant = quant.is_some();
+    let norm_ty = norm_smem_ty(t, quant);
     let scan_name = argmax_function_name(fusion);
 
     w.line(format!(
@@ -328,11 +468,11 @@ fn emit_argmax_pair(
     w.line(format!("device const {t} *x_row = x + row * HIDDEN;"));
     w.blank();
 
-    w.line("threadgroup float norm_y[HIDDEN];");
+    w.line(format!("threadgroup {norm_ty} norm_y[HIDDEN];"));
     w.line("threadgroup float sum_sq_partial[32];");
     crate::codegen::kernels::emit_rmsnorm_reduction(w, hidden, "x_row", "sum_sq_partial");
     w.line("float rms_scale = metal::precise::rsqrt(sum_sq_partial[0] / float(HIDDEN) + EPS);");
-    crate::codegen::kernels::emit_norm_writeback_with_act_ty(w, hidden, "x_row", "norm_w", t);
+    emit_norm_writeback_to_smem_ty(w, hidden, "x_row", "norm_w", t, norm_ty);
     w.blank();
 
     w.line("uint sgs_per_tg = tg_size / 32u;");
@@ -349,38 +489,80 @@ fn emit_argmax_pair(
         let bits = q.bits;
         let group_size = q.group_size;
         emit_quant_lm_head_dot(w, t, "acc", bits, group_size, hidden, vocab);
+    } else if dense_lm_head_k8_unroll_enabled(hidden, vocab) && hidden % 32 == 0 {
+        w.line(format!(
+            "device const {t}4* W4 = (device const {t}4*)(W_lm_head + v * HIDDEN);"
+        ));
+        w.line(format!(
+            "threadgroup {norm_ty}4* ny4 = (threadgroup {norm_ty}4*)norm_y;"
+        ));
+        w.line("for (uint k4 = simd_lane * 8u; k4 < HIDDEN / 4u; k4 += 256u) {");
+        w.push_indent();
+        w.line("acc += dot(float4(ny4[k4]),     float4(W4[k4]))");
+        w.line("     + dot(float4(ny4[k4+1u]), float4(W4[k4+1u]))");
+        w.line("     + dot(float4(ny4[k4+2u]), float4(W4[k4+2u]))");
+        w.line("     + dot(float4(ny4[k4+3u]), float4(W4[k4+3u]))");
+        w.line("     + dot(float4(ny4[k4+4u]), float4(W4[k4+4u]))");
+        w.line("     + dot(float4(ny4[k4+5u]), float4(W4[k4+5u]))");
+        w.line("     + dot(float4(ny4[k4+6u]), float4(W4[k4+6u]))");
+        w.line("     + dot(float4(ny4[k4+7u]), float4(W4[k4+7u]));");
+        w.pop_indent();
+        w.line("}");
+    } else if dense_lm_head_k4_unroll_enabled(hidden, vocab) && hidden % 16 == 0 {
+        w.line(format!(
+            "device const {t}4* W4 = (device const {t}4*)(W_lm_head + v * HIDDEN);"
+        ));
+        w.line(format!(
+            "threadgroup {norm_ty}4* ny4 = (threadgroup {norm_ty}4*)norm_y;"
+        ));
+        w.line("for (uint k4 = simd_lane * 4u; k4 < HIDDEN / 4u; k4 += 128u) {");
+        w.push_indent();
+        w.line("acc += dot(float4(ny4[k4]),     float4(W4[k4]))");
+        w.line("     + dot(float4(ny4[k4+1u]), float4(W4[k4+1u]))");
+        w.line("     + dot(float4(ny4[k4+2u]), float4(W4[k4+2u]))");
+        w.line("     + dot(float4(ny4[k4+3u]), float4(W4[k4+3u]));");
+        w.pop_indent();
+        w.line("}");
     } else if hidden % 8 == 0 {
         w.line(format!(
             "device const {t}4* W4 = (device const {t}4*)(W_lm_head + v * HIDDEN);"
         ));
-        w.line("threadgroup float4* ny4 = (threadgroup float4*)norm_y;");
+        w.line(format!(
+            "threadgroup {norm_ty}4* ny4 = (threadgroup {norm_ty}4*)norm_y;"
+        ));
         w.line("for (uint k4 = simd_lane * 2u; k4 < HIDDEN / 4u; k4 += 64u) {");
         w.push_indent();
-        w.line("acc += dot(ny4[k4],     float4(W4[k4]))");
-        w.line("     + dot(ny4[k4+1u], float4(W4[k4+1u]));");
+        w.line("acc += dot(float4(ny4[k4]),     float4(W4[k4]))");
+        w.line("     + dot(float4(ny4[k4+1u]), float4(W4[k4+1u]));");
         w.pop_indent();
         w.line("}");
     } else if hidden % 4 == 0 {
         w.line(format!(
             "device const {t}4* W4 = (device const {t}4*)(W_lm_head + v * HIDDEN);"
         ));
-        w.line("threadgroup float4* ny4 = (threadgroup float4*)norm_y;");
+        w.line(format!(
+            "threadgroup {norm_ty}4* ny4 = (threadgroup {norm_ty}4*)norm_y;"
+        ));
         w.line("for (uint k4 = simd_lane; k4 < HIDDEN / 4u; k4 += 32u) {");
         w.push_indent();
-        w.line("acc += dot(ny4[k4], float4(W4[k4]));");
+        w.line("acc += dot(float4(ny4[k4]), float4(W4[k4]));");
         w.pop_indent();
         w.line("}");
     } else {
         w.line("for (uint k = simd_lane; k < HIDDEN; k += 32u) {");
         w.push_indent();
-        w.line("acc += norm_y[k] * float(W_lm_head[v * HIDDEN + k]);");
+        w.line("acc += float(norm_y[k]) * float(W_lm_head[v * HIDDEN + k]);");
         w.pop_indent();
         w.line("}");
     }
     w.line("acc = simd_sum(acc);");
-    w.line("if (simd_lane == 0u && (acc > local_max || (acc == local_max && v < local_idx))) {");
+    // Match the non-direct path: the logits kernel writes `{t}(acc)` and
+    // MLX argmax observes that rounded value. Comparing the full-float
+    // accumulator here can flip near-ties on quantized heads.
+    w.line(format!("float cmp = float({t}(acc));"));
+    w.line("if (simd_lane == 0u && (cmp > local_max || (cmp == local_max && v < local_idx))) {");
     w.push_indent();
-    w.line("local_max = acc;");
+    w.line("local_max = cmp;");
     w.line("local_idx = v;");
     w.pop_indent();
     w.line("}");

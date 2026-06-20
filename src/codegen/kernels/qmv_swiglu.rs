@@ -38,6 +38,140 @@ pub fn emit(
 
     let t = crate::codegen::kernels::act_ty(meta);
     let fn_name = function_name(fusion);
+    if crate::codegen::kernels::qmv_swiglu_prefill_nax(gate, up) {
+        let aligned_n = if gate.out_dim.is_multiple_of(64) {
+            "true"
+        } else {
+            "false"
+        };
+        w.line(format!(
+            "// Fusion #{}: QmvSwiglu qMM_t NAX pair (K={}, M={}, N={}, bits={}, gs={}, tile=64x64x64)",
+            fusion.id, gate.k_dim, gate.active_rows, gate.out_dim, gate.bits, gate.group_size
+        ));
+        w.line(format!("kernel void {fn_name}("));
+        w.push_indent();
+        w.line(format!("device const {t} *x [[buffer(0)]],"));
+        w.line("device const uint *gate_w [[buffer(1)]],");
+        w.line(format!("device const {t} *gate_s [[buffer(2)]],"));
+        w.line(format!("device const {t} *gate_b [[buffer(3)]],"));
+        w.line("device const uint *up_w [[buffer(4)]],");
+        w.line(format!("device const {t} *up_s [[buffer(5)]],"));
+        w.line(format!("device const {t} *up_b [[buffer(6)]],"));
+        w.line(format!("device {t} *out0 [[buffer(7)]],"));
+        w.line("uint3 tgid [[threadgroup_position_in_grid]],");
+        w.line("uint tid [[thread_index_in_threadgroup]],");
+        w.line("uint simd_gid [[simdgroup_index_in_threadgroup]],");
+        w.line("uint simd_lid [[thread_index_in_simdgroup]]");
+        w.pop_indent();
+        w.line(") {");
+        w.push_indent();
+        w.line("#if FUSEKIT_HAVE_MLX_NAX");
+        w.push_indent();
+        w.writeln(format_args!("constexpr int K = {};", gate.k_dim));
+        w.writeln(format_args!("constexpr int N = {};", gate.out_dim));
+        w.writeln(format_args!("constexpr int M = {};", gate.active_rows));
+        w.line(format!(
+            "threadgroup {t} GateWs[64 * (64 + 16 / sizeof({t}))];"
+        ));
+        w.line(format!(
+            "threadgroup {t} UpWs[64 * (64 + 16 / sizeof({t}))];"
+        ));
+        w.writeln(format_args!(
+            "fusekit_qmm_t_swiglu_pair_nax_impl<{t}, {}, {}, {aligned_n}, 64, 64, 64, 2, 2>(",
+            gate.group_size, gate.bits
+        ));
+        w.push_indent();
+        w.line("gate_w, gate_s, gate_b, up_w, up_s, up_b, x, out0, GateWs, UpWs, K, N, M, tgid, tid, simd_gid, simd_lid);");
+        w.pop_indent();
+        w.pop_indent();
+        w.line("#else");
+        w.push_indent();
+        w.line(
+            "static_assert(FUSEKIT_HAVE_MLX_NAX, \"FuseKit QmvSwiglu NAX qMM_t requires MLX Metal headers\");",
+        );
+        w.pop_indent();
+        w.line("#endif");
+        w.pop_indent();
+        w.line("}");
+        w.blank();
+        return Ok(());
+    }
+    if crate::codegen::kernels::qmv_swiglu_prefill_qmmt(gate, up) {
+        let aligned_n = if gate.out_dim.is_multiple_of(32) {
+            "true"
+        } else {
+            "false"
+        };
+        let (bm, bk, bn) = crate::codegen::kernels::qmm_mlx_qmmt_tile(
+            gate.k_dim,
+            gate.out_dim,
+            gate.active_rows,
+            gate.bits,
+        );
+        w.line(format!(
+            "// Fusion #{}: QmvSwiglu qMM_t pair (K={}, M={}, N={}, bits={}, gs={}, tile={}x{}x{})",
+            fusion.id,
+            gate.k_dim,
+            gate.active_rows,
+            gate.out_dim,
+            gate.bits,
+            gate.group_size,
+            bm,
+            bk,
+            bn
+        ));
+        w.line(format!("kernel void {fn_name}("));
+        w.push_indent();
+        w.line(format!("device const {t} *x [[buffer(0)]],"));
+        w.line("device const uint *gate_w [[buffer(1)]],");
+        w.line(format!("device const {t} *gate_s [[buffer(2)]],"));
+        w.line(format!("device const {t} *gate_b [[buffer(3)]],"));
+        w.line("device const uint *up_w [[buffer(4)]],");
+        w.line(format!("device const {t} *up_s [[buffer(5)]],"));
+        w.line(format!("device const {t} *up_b [[buffer(6)]],"));
+        w.line(format!("device {t} *out0 [[buffer(7)]],"));
+        w.line("uint3 tgid [[threadgroup_position_in_grid]],");
+        w.line("uint tid [[thread_index_in_threadgroup]],");
+        w.line("uint simd_gid [[simdgroup_index_in_threadgroup]],");
+        w.line("uint simd_lid [[thread_index_in_simdgroup]]");
+        w.pop_indent();
+        w.line(") {");
+        w.push_indent();
+        w.line("#if FUSEKIT_HAVE_MLX_NAX");
+        w.push_indent();
+        w.writeln(format_args!("constexpr int K = {};", gate.k_dim));
+        w.writeln(format_args!("constexpr int N = {};", gate.out_dim));
+        w.writeln(format_args!("constexpr int M = {};", gate.active_rows));
+        w.line(format!(
+            "threadgroup {t} Xs[{bm} * ({bk} + 16 / sizeof({t}))];"
+        ));
+        w.line(format!(
+            "threadgroup {t} GateWs[{bk} * ({bn} + 16 / sizeof({t}))];"
+        ));
+        w.line(format!(
+            "threadgroup {t} UpWs[{bk} * ({bn} + 16 / sizeof({t}))];"
+        ));
+        w.writeln(format_args!(
+            "fusekit_qmm_t_swiglu_pair_impl<{t}, {}, {}, {aligned_n}, {bm}, {bk}, {bn}>(",
+            gate.group_size, gate.bits
+        ));
+        w.push_indent();
+        w.line("gate_w, gate_s, gate_b, up_w, up_s, up_b, x, out0, Xs, GateWs, UpWs, K, N, M, K, tgid, tid, simd_gid, simd_lid);");
+        w.pop_indent();
+        w.pop_indent();
+        w.line("#else");
+        w.push_indent();
+        w.line(
+            "static_assert(FUSEKIT_HAVE_MLX_NAX, \"FuseKit QmvSwiglu qMM_t requires MLX Metal headers\");",
+        );
+        w.pop_indent();
+        w.line("#endif");
+        w.pop_indent();
+        w.line("}");
+        w.blank();
+        return Ok(());
+    }
+
     let qmv_sgs = crate::codegen::kernels::qmv_fast_simdgroups(
         gate.active_rows,
         gate.bits,

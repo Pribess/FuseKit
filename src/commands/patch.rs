@@ -77,6 +77,7 @@ pub fn run(model: &str, chip: Option<&str>, force: bool) -> Result<()> {
     let requested_active_m = env_u32("FUSEKIT_ACTIVE_M");
     let requested_dense = std::env::var("FUSEKIT_DENSE_MATMUL_MODE")
         .unwrap_or_else(|_| target.chip.dense_matmul_mode().as_str().to_string());
+    let requested_prefill_ms = prefill_variant_active_ms();
     let base = build_compile_graph(&graph, &meta, target, 1)?;
     let base_summary = super::coverage::summarize(&graph, &base.fg, &base.tg);
     super::coverage::print_summary("M=1", &base_summary);
@@ -109,6 +110,46 @@ pub fn run(model: &str, chip: Option<&str>, force: bool) -> Result<()> {
     }
 
     let mut variants = Vec::new();
+    for prefill_m in requested_prefill_ms {
+        let variant_name = format!("prefill_m{prefill_m}");
+        let variant_dir = fusekit_dir.join("variants").join(&variant_name);
+        ui::step(format!("capturing + compiling {variant_name} GEMM variant"));
+        let prefill_raw = loader::capture_with_seq(&m.path, prefill_m)
+            .with_context(|| format!("capture {variant_name} graph"))?;
+        let mut prefill_graph =
+            loader::lower(&prefill_raw).with_context(|| format!("lower {variant_name} graph"))?;
+        crate::layer_tag::infer_layer_tags(&mut prefill_graph);
+        let variant = with_prefill_gemm_codegen(prefill_m, || {
+            build_compile_graph(&prefill_graph, &meta, target, prefill_m)
+        })?;
+        let variant_summary = super::coverage::summarize(&prefill_graph, &variant.fg, &variant.tg);
+        super::coverage::print_summary(&variant_name, &variant_summary);
+        with_prefill_gemm_codegen(prefill_m, || {
+            emit_with_active_m(
+                &prefill_graph,
+                &variant.fg,
+                &variant.tg,
+                &meta,
+                &prefill_raw.params,
+                &variant_dir,
+                target,
+                prefill_m,
+            )
+        })
+        .with_context(|| format!("emit {variant_name} metallib"))?;
+        ui::ok(format!(
+            "wrote {}",
+            variant_dir.join("kernel.metallib").display()
+        ));
+        variants.push(CompileVariant {
+            name: variant_name,
+            path: "variants".to_string() + &format!("/prefill_m{prefill_m}"),
+            active_m: prefill_m,
+            dense_matmul: "auto".to_string(),
+            tasks: variant.tg.tasks.len(),
+            unique_kernels: variant.tg.tasks.len(),
+        });
+    }
     if let Some(max_mtp_m) = mtp_variant_active_m(&meta, &base.fg, requested_active_m) {
         for mtp_m in 2..=max_mtp_m {
             let variant_name = format!("mtp_m{mtp_m}");
@@ -218,6 +259,95 @@ fn env_u32(name: &str) -> Option<u32> {
         .filter(|&n| n >= 1)
 }
 
+fn prefill_variant_active_ms() -> Vec<u32> {
+    if std::env::var("FUSEKIT_DISABLE_PREFILL_VARIANT").as_deref() == Ok("1") {
+        return Vec::new();
+    }
+    let Some(raw) = std::env::var("FUSEKIT_PREFILL_M").ok() else {
+        return Vec::new();
+    };
+    // Prefill variants are full prompt-block contracts, not decode chunk
+    // width knobs. Keep the CLI able to build long variants for profiling;
+    // the runtime auto-selector decides which lengths are promoted.
+    let mut out = raw
+        .split(',')
+        .filter_map(|part| part.trim().parse::<u32>().ok())
+        .filter(|&n| n >= 1)
+        .map(|n| n.clamp(8, 1024))
+        .collect::<Vec<_>>();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+fn with_prefill_gemm_codegen<T>(active_m: u32, f: impl FnOnce() -> Result<T>) -> Result<T> {
+    with_env_override("FUSEKIT_ACTIVE_M", Some(active_m.to_string()), || {
+        with_env_override("FUSEKIT_PREFILL_TILED_QMM", Some("1".to_string()), || {
+            with_env_override(
+                "FUSEKIT_PREFILL_NO_LOGITS_VARIANT",
+                Some("1".to_string()),
+                || {
+                    with_env_override(
+                        "FUSEKIT_DENSE_MATMUL_MODE",
+                        Some("auto".to_string()),
+                        || {
+                            with_env_override("FUSEKIT_QMM_MLX_QMMT", Some("1".to_string()), || {
+                                with_env_override(
+                                    "FUSEKIT_QMM_MLX_QMV_IMPL",
+                                    Some("0".to_string()),
+                                    || {
+                                        with_env_override(
+                                            "FUSEKIT_QMM_MLX_QMV",
+                                            Some("0".to_string()),
+                                            || {
+                                                with_env_override(
+                                                    "FUSEKIT_QMM_MLX_QMV_CHAIN_M",
+                                                    Some("0".to_string()),
+                                                    || {
+                                                        with_env_override(
+                                                            "FUSEKIT_QMV_FANOUT",
+                                                            Some("1".to_string()),
+                                                            || {
+                                                                with_env_override(
+                                                                    "FUSEKIT_QMM_NAX",
+                                                                    Some("1".to_string()),
+                                                                    || {
+                                                                        with_env_override(
+                                                                            "FUSEKIT_QMM_NAX_M",
+                                                                            Some("1".to_string()),
+                                                                            || {
+                                                                                with_env_override(
+                                                                                "FUSEKIT_QMM_CHAIN_NAX",
+                                                                                Some("1".to_string()),
+                                                                                || {
+                                                                                    with_env_override(
+                                                                                        "FUSEKIT_QMM_CHAIN_NAX_M",
+                                                                                        Some("1".to_string()),
+                                                                                        f,
+                                                                                    )
+                                                                                },
+                                                                            )
+                                                                            },
+                                                                        )
+                                                                    },
+                                                                )
+                                                            },
+                                                        )
+                                                    },
+                                                )
+                                            },
+                                        )
+                                    },
+                                )
+                            })
+                        },
+                    )
+                },
+            )
+        })
+    })
+}
+
 fn build_compile_graph(
     graph: &crate::graph::Graph,
     meta: &ModelMeta,
@@ -236,11 +366,40 @@ fn build_compile_graph(
             if crate::fusion::layer_block::enabled() {
                 crate::fusion::layer_block::integrate(&mut fg, graph);
             }
+            if std::env::var("FUSEKIT_PREFILL_NO_LOGITS_VARIANT").as_deref() == Ok("1")
+                && active_m > 1
+            {
+                prune_prefill_no_logits_tail(&mut fg);
+            }
             apply_ir_dce(graph, &mut fg, active_m);
             let tg = task::build::build_tasks(&fg)?;
             Ok(CompileGraph { fg, tg })
         },
     )
+}
+
+fn prune_prefill_no_logits_tail(fg: &mut crate::fusion::ir::FusionGraph) {
+    use crate::fusion::ir::FusionKind;
+
+    let before = fg.fusions.len();
+    fg.fusions.retain(|f| {
+        !matches!(
+            f.kind,
+            FusionKind::FinalRmsNormLmHead
+                | FusionKind::ArgmaxLogitsDecode
+                | FusionKind::ArgmaxLogitsScan
+                | FusionKind::ArgmaxLogitsFinalize
+        )
+    });
+    for (idx, f) in fg.fusions.iter_mut().enumerate() {
+        f.id = idx as u32;
+    }
+    let dropped = before.saturating_sub(fg.fusions.len());
+    if dropped > 0 {
+        ui::ok(format!(
+            "[prefill no-logits] pruned {dropped} final logits/argmax fusions"
+        ));
+    }
 }
 
 fn apply_ir_dce(

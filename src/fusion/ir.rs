@@ -203,6 +203,19 @@ pub enum FusionKind {
     /// computes both projections in registers and materializes only
     /// the activation output.
     QmvSwiglu,
+    /// Structural routed-expert gate/up projection with a SwiGLU tail:
+    /// two compatible `GatherQMM` siblings reading the same activation
+    /// row and route/expert indices feed `sigmoid(gate) * gate * up`.
+    /// This is admitted by op/dataflow/shape semantics, not by model
+    /// name, and covers top-k MoE decode paths.
+    RoutedQmvSwiglu,
+    /// Structural routed-expert projection plus route weighted sum:
+    /// a `GatherQMM` over selected expert outputs immediately feeds
+    /// route-weight multiply/reduce. The emitter computes each output
+    /// dim as `sum_r weight_r * expert_matvec_r` and materializes only
+    /// the reduced hidden row, avoiding the `[top_k, hidden]` scratch
+    /// round-trip. Admission is by routed QMM and reduce semantics.
+    RoutedQmvReduce,
     /// Per-layer megakernel — composes the full transformer-block
     /// pipeline (norm → QKV → RoPE → SDPA → o_proj+residual → norm →
     /// gate/up → swiglu → down_proj+residual) into ONE MSL function
@@ -343,6 +356,13 @@ pub enum FusionAttrs {
     QmvSwiglu {
         gate: QmvFanoutTarget,
         up: QmvFanoutTarget,
+    },
+    RoutedQmvSwiglu {
+        gate: QmvFanoutTarget,
+        up: QmvFanoutTarget,
+    },
+    RoutedQmvReduce {
+        target: QmvFanoutTarget,
     },
     /// Per-layer megakernel attrs. Carries the layer index (used for
     /// per-layer cache routing at the runtime) plus the shared per-block

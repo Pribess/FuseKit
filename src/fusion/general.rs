@@ -1,24 +1,19 @@
-//! Stage 3 — semantic-aware general fusion pass.
+//! Stage 3 — budget-driven general fusion pass.
 //!
-//! Runs AFTER pattern-matched fusion (Stage 2). Walks the
-//! [`FusionGraph`] looking for adjacent `FusionKind::Single` fusions
-//! whose op categories permit merging, single-consumer chains, and
-//! matching parallel axes — folds those into one
-//! `FusionKind::FusedChain` whose body is emitted as a single MSL
-//! kernel by the [`codegen::kernels::fused_chain`] emitter.
+//! Walks the [`FusionGraph`] and proposes graph-local fusion candidates from
+//! dataflow, op category, shape, alias, and state-role invariants. Admission is
+//! budget based: a candidate is kept only when its estimated register pressure,
+//! threadgroup-memory footprint, recompute cost, and preserved parallelism fit
+//! the target chip. The goal is to remove memory round-trips without turning a
+//! highly parallel producer/consumer pair into a spilling or under-occupied
+//! kernel.
 //!
 //! What this pass does NOT do:
-//! - Touch pattern-matched fusions (they're already hand-tuned).
+//! - Use model names or layer numbers as fusion criteria.
 //! - Cross a CustomKernel — those are opaque and must run as their
 //!   own dispatch.
 //! - Reorder. Producer→consumer order is preserved as the merge sweep
 //!   only ever folds a single-consumer producer into its consumer.
-//!
-//! The pass is currently a *no-op scaffold* — types and the entry
-//! point exist so we can wire it into the build pipeline before the
-//! merge logic lands. Activating it is gated by the
-//! `FUSEKIT_GENERAL_FUSION` env var to keep regression risk
-//! contained while we iterate.
 
 #![allow(dead_code)]
 
@@ -67,6 +62,91 @@ fn env_usize(name: &str, default: usize) -> usize {
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(default)
+}
+
+fn prefill_tiled_qmm_mode() -> bool {
+    env_flag("FUSEKIT_PREFILL_TILED_QMM")
+}
+
+fn shape_active_rows_before_last(shape: &[i32]) -> u64 {
+    if shape.len() <= 1 {
+        return 1;
+    }
+    shape[..shape.len() - 1]
+        .iter()
+        .map(|&d| d.max(1) as u64)
+        .product::<u64>()
+        .max(1)
+}
+
+fn prefill_tiled_qmm_reduction_barrier(producer: &Fusion, consumer: &Fusion) -> bool {
+    if !prefill_tiled_qmm_mode() {
+        return false;
+    }
+    if !matches!(&producer.kind, FusionKind::Single(op) if op == "RMSNorm") {
+        return false;
+    }
+    if !matches!(&consumer.kind, FusionKind::Single(op) if op == "QuantizedMatmul") {
+        return false;
+    }
+    let active_rows = consumer
+        .outputs
+        .first()
+        .map(|b| shape_active_rows_before_last(&b.shape))
+        .unwrap_or(1);
+    active_rows > 1
+}
+
+fn fusion_active_rows(fusion: &Fusion) -> u64 {
+    fusion
+        .outputs
+        .first()
+        .map(|b| shape_active_rows_before_last(&b.shape))
+        .unwrap_or(1)
+}
+
+fn fusion_is_quantized_matmul_head(fusion: &Fusion) -> bool {
+    match (&fusion.kind, &fusion.attrs) {
+        (FusionKind::Single(op), _) if op == "QuantizedMatmul" => true,
+        (FusionKind::FusedChain, FusionAttrs::FusedChain { steps, .. }) => {
+            steps.len() == 1 && steps[0].op_name == "QuantizedMatmul"
+        }
+        _ => false,
+    }
+}
+
+fn fusion_is_pointwise_view_tail(fusion: &Fusion) -> bool {
+    match (&fusion.kind, &fusion.attrs) {
+        (FusionKind::Single(op), _) => {
+            matches!(
+                categorize_name(op),
+                OpCategory::Pointwise | OpCategory::View
+            )
+        }
+        (FusionKind::FusedChain, FusionAttrs::FusedChain { steps, .. }) => {
+            !steps.is_empty()
+                && steps.iter().all(|step| {
+                    matches!(
+                        categorize_name(&step.op_name),
+                        OpCategory::Pointwise | OpCategory::View
+                    )
+                })
+        }
+        _ => false,
+    }
+}
+
+fn prefill_tiled_qmm_tail_barrier(producer: &Fusion, consumer: &Fusion) -> bool {
+    if !prefill_tiled_qmm_mode() {
+        return false;
+    }
+    if !fusion_is_quantized_matmul_head(producer) {
+        return false;
+    }
+    if fusion_active_rows(producer) <= 1 {
+        return false;
+    }
+    fusion_is_pointwise_view_tail(consumer)
 }
 
 fn step_register_slots(op_name: &str, input_count: usize) -> u32 {
@@ -229,10 +309,36 @@ enum PointwiseTailFormula {
 fn pointwise_tail_absorb_budget_ok(
     formula: PointwiseTailFormula,
     producer: &Fusion,
+    consumer: &Fusion,
     producer_steps: &[ChainStep],
+    reg_budget: u32,
+    smem_budget: usize,
+    meta: &crate::fusion::ir::ModelMeta,
 ) -> bool {
     if std::env::var_os("FUSEKIT_POINTWISE_TAIL_ABSORB_FORCE").is_some() {
         return true;
+    }
+    let dbg_budget = std::env::var_os("FUSEKIT_BUDGET_DEBUG").is_some()
+        || std::env::var_os("FUSEKIT_POINTWISE_TAIL_ABSORB_DEBUG").is_some();
+    let est_regs = estimate_combined_regs(producer, consumer);
+    if est_regs > reg_budget {
+        if dbg_budget {
+            eprintln!(
+                "[budget] pointwise-tail absorb reg reject: formula={formula:?} est={est_regs} budget={reg_budget} producer={:?} consumer={:?}",
+                producer.kind, consumer.kind
+            );
+        }
+        return false;
+    }
+    let est_smem = estimate_combined_smem(producer, consumer, meta);
+    if est_smem > smem_budget {
+        if dbg_budget {
+            eprintln!(
+                "[budget] pointwise-tail absorb smem reject: formula={formula:?} est={est_smem} budget={smem_budget} producer={:?} consumer={:?}",
+                producer.kind, consumer.kind
+            );
+        }
+        return false;
     }
     if producer_steps.len() < 3 || producer.outputs.len() < 2 {
         return false;
@@ -269,11 +375,13 @@ fn pointwise_tail_absorb_budget_ok(
         .sum::<u64>()
         .saturating_mul(rows);
 
-    let dbg_budget = std::env::var_os("FUSEKIT_BUDGET_DEBUG").is_some()
-        || std::env::var_os("FUSEKIT_POINTWISE_TAIL_ABSORB_DEBUG").is_some();
-    // Require saved activation traffic to be at least 12.5% of the
-    // heavy stream. This is shape/budget based, not model-name based.
-    let ok = dram_saved.saturating_mul(8) >= heavy_stream;
+    // Require saved activation traffic to be either absolutely large
+    // enough to matter as a full DRAM round-trip, or at least 12.5% of
+    // the heavy stream. The ratio gate alone rejects large 4B-class
+    // decode MLPs because their q-weight stream is huge, even though
+    // the absorbed SwiGLU avoids a substantial 9K-wide activation
+    // write/read and wins end-to-end.
+    let ok = dram_saved >= 512 * 1024 || dram_saved.saturating_mul(8) >= heavy_stream;
     if !ok && dbg_budget {
         eprintln!(
             "[budget] pointwise-tail absorb reject: formula={formula:?} saved={:.3}MiB heavy_stream={:.3}MiB rows={} out_dim={}",
@@ -299,6 +407,12 @@ pub fn run(mut fg: FusionGraph, target: &Target, graph: &crate::graph::Graph) ->
     if std::env::var_os("FUSEKIT_GENERAL_FUSION").is_none() {
         return fg;
     }
+    // General-fusion admission uses the same chip-aware helpers as the
+    // emitters for row coalescing, active-M, and qMV tiling estimates.
+    // Publish the requested target before any pass consults those
+    // helpers so patch-time `--chip` decisions are consistent from
+    // fusion through MSL emission.
+    crate::target::set_current_chip(target.chip);
     let reg_budget = target
         .budgets
         .regs_per_thread
@@ -344,12 +458,23 @@ pub fn run(mut fg: FusionGraph, target: &Target, graph: &crate::graph::Graph) ->
     }
     // Then ordinary single-consumer chain growth.
     while try_merge_one(&mut slots, reg_budget, smem_budget, &meta) {}
+    // More aggressive, still semantic, chain growth: a pointwise/view
+    // prefix can feed both an RMSNorm and another consumer. Ordinary
+    // single-consumer merging must reject that because the prefix value
+    // remains live. This pass keeps the prefix as an extra fusion
+    // output while also emitting the RMSNorm output from the same
+    // kernel, removing the prefix->RMSNorm activation read/write
+    // without dangling the other branch.
+    while try_pointwise_reduction_fanout_merge(&mut slots, reg_budget, smem_budget, &meta) {}
     while try_sdpa_q_scale_view_absorb(&mut slots, graph) {}
     if std::env::var("FUSEKIT_QKV_DECODE_SINK").as_deref() != Ok("0") {
         while try_qkv_decode_sink(&mut slots, graph) {}
     }
-    if env_flag("FUSEKIT_QMV_SWIGLU_ABSORB") {
+    if std::env::var("FUSEKIT_QMV_SWIGLU_ABSORB").as_deref() != Ok("0") {
         while try_qmv_swiglu_absorb(&mut slots, reg_budget) {}
+    }
+    if std::env::var("FUSEKIT_ROUTED_QMV_SWIGLU_ABSORB").as_deref() != Ok("0") {
+        while try_routed_qmv_swiglu_absorb(&mut slots, reg_budget, graph) {}
     }
     // Custom-kernel sigmoid input absorb: if a pointwise Sigmoid only
     // exists to feed one CustomKernel input, rewrite that custom
@@ -400,6 +525,9 @@ pub fn run(mut fg: FusionGraph, target: &Target, graph: &crate::graph::Graph) ->
     if std::env::var("FUSEKIT_WEIGHTED_ROUTE_REDUCE").as_deref() != Ok("0") {
         while try_weighted_route_reduce(&mut slots) {}
     }
+    if std::env::var("FUSEKIT_ROUTED_QMV_REDUCE_ABSORB").as_deref() == Ok("1") {
+        while try_routed_qmv_reduce_absorb(&mut slots, reg_budget) {}
+    }
 
     // Compact and renumber.
     fg.fusions = slots
@@ -429,8 +557,69 @@ fn mark_transposed_weight_slots(fg: &mut FusionGraph, graph: &crate::graph::Grap
         .enumerate()
         .flat_map(|(idx, op)| op.outputs.iter().map(move |&tid| (tid, idx)))
         .collect();
-
     for fusion in &mut fg.fusions {
+        let single_dense = match (&fusion.kind, &fusion.attrs) {
+            (
+                FusionKind::Single(op_name),
+                FusionAttrs::Single {
+                    op_attrs,
+                    op_name: _,
+                },
+            ) if matches!(op_name.as_str(), "Matmul" | "AddMM") => {
+                Some((op_name.clone(), op_attrs.clone()))
+            }
+            _ => None,
+        };
+        if let Some((op_name, op_attrs)) = single_dense {
+            let Some(boundary) = fusion.inputs.get_mut(1) else {
+                continue;
+            };
+            let Some(&op_idx) = producer_op.get(&boundary.source) else {
+                continue;
+            };
+            let op = &graph.ops[op_idx];
+            if op.name != "Transpose" || op.inputs.len() != 1 {
+                continue;
+            }
+            let src_tid = op.inputs[0];
+            let Some(src_tensor) = graph.tensors.get(src_tid as usize) else {
+                continue;
+            };
+            if let Some(filter) = path_filter.as_deref() {
+                let Some(path) = src_tensor.param_path.as_deref() else {
+                    continue;
+                };
+                if !path.contains(filter) {
+                    continue;
+                }
+            }
+            if src_tensor.param_path.is_none()
+                || src_tensor.shape.len() != 2
+                || boundary.shape.len() != 2
+                || boundary.shape[0] != src_tensor.shape[1]
+                || boundary.shape[1] != src_tensor.shape[0]
+                || fusion.outputs.is_empty()
+            {
+                continue;
+            }
+            boundary.source = src_tid;
+            let step = ChainStep {
+                op_name,
+                op_attrs,
+                inputs: (0..fusion.inputs.len() as u32)
+                    .map(|i| ChainOperand::External { buffer_index: i })
+                    .collect(),
+                output_shape: fusion.outputs[0].shape.clone(),
+                output_dtype: fusion.outputs[0].dtype,
+            };
+            fusion.kind = FusionKind::FusedChain;
+            fusion.attrs = FusionAttrs::FusedChain {
+                steps: vec![step],
+                transposed_weight_slots: vec![1],
+            };
+            continue;
+        }
+
         let FusionAttrs::FusedChain {
             steps,
             transposed_weight_slots,
@@ -602,6 +791,11 @@ fn mark_direct_external_view_slots(fg: &mut FusionGraph, graph: &crate::graph::G
         .enumerate()
         .flat_map(|(idx, op)| op.outputs.iter().map(move |&tid| (tid, idx)))
         .collect();
+    let fusion_output_sources: HashSet<TensorId> = fg
+        .fusions
+        .iter()
+        .flat_map(|f| f.outputs.iter().map(|b| b.source))
+        .collect();
 
     let numel = |shape: &[i32]| -> i64 {
         if shape.is_empty() {
@@ -658,6 +852,42 @@ fn mark_direct_external_view_slots(fg: &mut FusionGraph, graph: &crate::graph::G
         }
         None
     };
+    let direct_astype_source = |start: TensorId| -> Option<TensorId> {
+        let op = graph.ops.get(*producer_op.get(&start)?)?;
+        if op.name != "AsType" || op.inputs.len() != 1 {
+            return None;
+        }
+        let src = op.inputs[0];
+        let src_tensor = graph.tensors.get(src as usize)?;
+        let out_tensor = graph.tensors.get(start as usize)?;
+        if !is_external_leaf(src) && !fusion_output_sources.contains(&src) {
+            return None;
+        }
+        if numel(&src_tensor.shape) != numel(&out_tensor.shape) {
+            return None;
+        }
+        // A pointwise FusedChain reads every external operand through
+        // `float(inN[i])`. For half/bfloat inputs, that load performs
+        // the same promotion that a standalone AsType-to-f32 kernel
+        // would have materialized, without the extra dispatch and
+        // f32 scratch round-trip. Do not fold integer/bool casts here:
+        // those may be semantic masks rather than numeric promotion.
+        if out_tensor.dtype != Dtype::F32 || !matches!(src_tensor.dtype, Dtype::F16 | Dtype::Bf16) {
+            return None;
+        }
+        Some(src)
+    };
+    let is_pointwise_view_chain = |fusion: &Fusion| -> bool {
+        let FusionAttrs::FusedChain { steps, .. } = &fusion.attrs else {
+            return false;
+        };
+        !steps.is_empty()
+            && steps.iter().all(|step| {
+                let cat = categorize_name(&step.op_name);
+                cat == OpCategory::Pointwise
+                    || (cat == OpCategory::View && is_chain_absorbable_view(&step.op_name))
+            })
+    };
 
     // Classify external slots by how their emitter reads them.
     //
@@ -713,7 +943,24 @@ fn mark_direct_external_view_slots(fg: &mut FusionGraph, graph: &crate::graph::G
     let mut rewrites_total = 0usize;
     let mut qkv_bias_rewrites = 0usize;
     let mut scalar_rewrites = 0usize;
+    let mut astype_rewrites = 0usize;
     for fusion in &mut fg.fusions {
+        if is_pointwise_view_chain(fusion) {
+            for boundary in &mut fusion.inputs {
+                let Some(src_tid) = direct_astype_source(boundary.source) else {
+                    continue;
+                };
+                let Some(src_tensor) = graph.tensors.get(src_tid as usize) else {
+                    continue;
+                };
+                boundary.source = src_tid;
+                boundary.shape = src_tensor.shape.clone();
+                boundary.dtype = src_tensor.dtype;
+                rewrites_total += 1;
+                astype_rewrites += 1;
+            }
+        }
+
         // RmsNormQkv bias slots are semantically per-projection
         // vectors. The trace broadcasts them to `[B, T, D]`, but the
         // custom kernel never indexes token rows for bias: it adds
@@ -793,8 +1040,8 @@ fn mark_direct_external_view_slots(fg: &mut FusionGraph, graph: &crate::graph::G
 
     if std::env::var_os("FUSEKIT_DIRECT_EXTERNAL_VIEW_DEBUG").is_some() && rewrites_total > 0 {
         eprintln!(
-            "[direct-external-view] rewrites={} qkv_bias={} scalar_broadcast={}",
-            rewrites_total, qkv_bias_rewrites, scalar_rewrites
+            "[direct-external-view] rewrites={} qkv_bias={} scalar_broadcast={} astype={}",
+            rewrites_total, qkv_bias_rewrites, scalar_rewrites, astype_rewrites
         );
     }
 }
@@ -886,6 +1133,7 @@ fn try_merge_one(
             }
 
             let consumer_heavy = consumer_is_heavy_singleton(consumer);
+            let consumer_reduction = consumer_is_reduction_singleton(consumer);
             if consumer_heavy {
                 // Reduction → Heavy chains: producer must be a *bare*
                 // Single RMSNorm (no intervening pointwise yet — the
@@ -906,6 +1154,15 @@ fn try_merge_one(
                 if !heavy_chain_shape_ok(consumer) {
                     continue;
                 }
+                if prefill_tiled_qmm_reduction_barrier(producer, consumer) {
+                    if std::env::var_os("FUSEKIT_BUDGET_DEBUG").is_some() {
+                        eprintln!(
+                            "[budget] try_merge_one prefill-tiled-qmm barrier: producer={:?} consumer={:?}",
+                            producer.kind, consumer.kind
+                        );
+                    }
+                    continue;
+                }
                 if reduction_heavy_qmm_is_tile_amplified(producer, consumer) {
                     if std::env::var_os("FUSEKIT_BUDGET_DEBUG").is_some() {
                         eprintln!(
@@ -915,11 +1172,33 @@ fn try_merge_one(
                     }
                     continue;
                 }
+            } else if consumer_reduction {
+                // Pointwise/View prefix feeding a Reduction, e.g.
+                // Add(residual, projection) -> RMSNorm. The fused
+                // emitter recomputes the cheap prefix inside the
+                // RMSNorm row reduction and removes the prefix output
+                // round-trip. Do not allow Heavy or existing Reduction
+                // producers here: those need a different lowering and
+                // can amplify work.
+                if input_slot != 0 {
+                    continue;
+                }
+                if !fusion_is_pointwise_view_tail(producer) {
+                    continue;
+                }
             } else if producer_is_reduction(producer)
                 && !reduction_merge_tail_ok(consumer, input_slot, producer)
             {
                 // Pointwise/View tail after a Reduction head: external
                 // tail operands have to fit the per-row indexing model.
+                continue;
+            } else if prefill_tiled_qmm_tail_barrier(producer, consumer) {
+                if std::env::var_os("FUSEKIT_BUDGET_DEBUG").is_some() {
+                    eprintln!(
+                        "[budget] try_merge_one prefill-tiled-qmm tail barrier: producer={:?} consumer={:?}",
+                        producer.kind, consumer.kind
+                    );
+                }
                 continue;
             } else if producer_is_reduction(producer) && !consumer_heavy {
                 let max_tail = default_reduction_tail_max(producer, consumer, input_slot);
@@ -972,6 +1251,184 @@ fn try_merge_one(
         }
     }
     false
+}
+
+/// Fuse a pointwise/view prefix into a row reduction even when the
+/// prefix result has downstream fanout.
+///
+/// Shape:
+///   prefix(x, ...) -> y
+///                    ├─ RMSNorm(y, weight) -> norm_y
+///                    └─ other consumers
+///
+/// The ordinary `try_merge_one` path must reject this because deleting
+/// the prefix output would dangle the other consumers. This rewrite
+/// keeps the prefix output as output slot 0 and emits the RMSNorm
+/// result as output slot 1 from the same row-reduction kernel. It is
+/// dataflow/shape based: no model names, layer names, or op sequences
+/// beyond the producer being pointwise/view and the consumer being a
+/// supported reduction.
+fn try_pointwise_reduction_fanout_merge(
+    slots: &mut Vec<Option<Fusion>>,
+    reg_budget: u32,
+    smem_budget: usize,
+    meta: &crate::fusion::ir::ModelMeta,
+) -> bool {
+    let mut producer_of: HashMap<TensorId, usize> = HashMap::new();
+    let mut consumers_of: HashMap<TensorId, Vec<usize>> = HashMap::new();
+    for (idx, slot) in slots.iter().enumerate() {
+        let Some(f) = slot else { continue };
+        for out in &f.outputs {
+            producer_of.insert(out.source, idx);
+        }
+        for inp in &f.inputs {
+            consumers_of.entry(inp.source).or_default().push(idx);
+        }
+    }
+
+    for c_idx in 0..slots.len() {
+        let Some(consumer) = slots[c_idx].as_ref() else {
+            continue;
+        };
+        if !consumer_is_reduction_singleton(consumer) {
+            continue;
+        }
+        if consumer.inputs.len() < 2 || consumer.outputs.len() != 1 {
+            continue;
+        }
+        let input_slot = 0usize;
+        let src = consumer.inputs[input_slot].source;
+        let Some(&p_idx) = producer_of.get(&src) else {
+            continue;
+        };
+        if p_idx == c_idx {
+            continue;
+        }
+        let consumers = consumers_of.get(&src).cloned().unwrap_or_default();
+        if consumers.len() <= 1 || !consumers.contains(&c_idx) {
+            continue;
+        }
+
+        let Some(producer) = slots[p_idx].as_ref() else {
+            continue;
+        };
+        if producer.outputs.len() != 1 || !fusion_is_pointwise_view_tail(producer) {
+            continue;
+        }
+        let p_shape = &producer.outputs[0].shape;
+        let c_shape = &consumer.inputs[input_slot].shape;
+        if p_shape != c_shape {
+            continue;
+        }
+        if consumer.outputs[0].shape != *p_shape {
+            continue;
+        }
+
+        let er = estimate_combined_regs(producer, consumer);
+        if er > reg_budget {
+            if std::env::var_os("FUSEKIT_BUDGET_DEBUG").is_some() {
+                eprintln!("[budget] pointwise-reduction-fanout reg reject: est={er} budget={reg_budget} producer={:?} consumer={:?}", producer.kind, consumer.kind);
+            }
+            continue;
+        }
+        let es = estimate_combined_smem(producer, consumer, meta);
+        if es > smem_budget {
+            if std::env::var_os("FUSEKIT_BUDGET_DEBUG").is_some() {
+                eprintln!("[budget] pointwise-reduction-fanout smem reject: est={es} budget={smem_budget} producer={:?} consumer={:?}", producer.kind, consumer.kind);
+            }
+            continue;
+        }
+
+        merge_pointwise_reduction_fanout(slots, p_idx, c_idx, input_slot);
+        return true;
+    }
+    false
+}
+
+fn merge_pointwise_reduction_fanout(
+    slots: &mut Vec<Option<Fusion>>,
+    p_idx: usize,
+    c_idx: usize,
+    consumer_input_slot: usize,
+) {
+    let producer = slots[p_idx].take().expect("producer present");
+    let consumer = slots[c_idx].take().expect("consumer present");
+
+    let (p_steps, p_inputs) = extract_steps_and_inputs(&producer);
+    let (c_steps, c_inputs) = extract_steps_and_inputs(&consumer);
+
+    let mut new_inputs = p_inputs.clone();
+    let consumer_buf_base = new_inputs.len() as u32;
+    let mut next_consumer_buf = consumer_buf_base;
+    let consumer_buf_remap: Vec<Option<u32>> = (0..c_inputs.len())
+        .map(|i| {
+            if i == consumer_input_slot {
+                None
+            } else {
+                let out = Some(next_consumer_buf);
+                next_consumer_buf += 1;
+                new_inputs.push(c_inputs[i].clone());
+                out
+            }
+        })
+        .collect();
+
+    let producer_step_count = p_steps.len() as u32;
+    let last_producer_step_index = producer_step_count - 1;
+    let mut new_steps = Vec::with_capacity(p_steps.len() + c_steps.len());
+    new_steps.extend(p_steps.iter().cloned());
+    for step in &c_steps {
+        let inputs = step
+            .inputs
+            .iter()
+            .map(|op| match op {
+                ChainOperand::External { buffer_index } => {
+                    match consumer_buf_remap.get(*buffer_index as usize) {
+                        Some(Some(b)) => ChainOperand::External { buffer_index: *b },
+                        Some(None) => ChainOperand::Register {
+                            step_index: last_producer_step_index,
+                        },
+                        None => panic!(
+                            "consumer step references missing buffer slot {}",
+                            buffer_index
+                        ),
+                    }
+                }
+                ChainOperand::Register { step_index } => ChainOperand::Register {
+                    step_index: step_index + producer_step_count,
+                },
+            })
+            .collect();
+        new_steps.push(ChainStep {
+            op_name: step.op_name.clone(),
+            op_attrs: step.op_attrs.clone(),
+            inputs,
+            output_shape: step.output_shape.clone(),
+            output_dtype: step.output_dtype,
+        });
+    }
+
+    let mut outputs = producer.outputs.clone();
+    outputs.extend(consumer.outputs.iter().cloned());
+
+    let mut op_ids = producer.op_ids.clone();
+    op_ids.extend(consumer.op_ids.iter().copied());
+
+    let new_fusion = Fusion {
+        id: producer.id,
+        kind: FusionKind::FusedChain,
+        op_ids,
+        inputs: new_inputs,
+        outputs,
+        attrs: FusionAttrs::FusedChain {
+            steps: new_steps,
+            transposed_weight_slots: Vec::new(),
+        },
+        parallel_axes: consumer.parallel_axes.clone(),
+        layer_hint: producer.layer_hint.or(consumer.layer_hint),
+    };
+
+    slots[p_idx] = Some(new_fusion);
 }
 
 /// A consumer fusion whose single step is a chain-supported Heavy op.
@@ -1090,6 +1547,40 @@ fn collect_metadata_alias_chain(
         }
     }
     (alias_tensors, metadata_indices)
+}
+
+fn walk_to_param_rank1(
+    graph: &crate::graph::Graph,
+    start: crate::graph::TensorId,
+) -> Option<crate::graph::TensorId> {
+    let mut cur = start;
+    let mut depth = 0;
+    while depth < 8 {
+        let t = graph.tensors.get(cur as usize)?;
+        if t.shape.len() == 1 && t.param_path.is_some() {
+            return Some(cur);
+        }
+        let op = graph
+            .ops
+            .iter()
+            .find(|op| op.outputs.iter().any(|&out| out == cur))?;
+        if !matches!(
+            op.name.as_str(),
+            "Broadcast"
+                | "Reshape"
+                | "Flatten"
+                | "Unflatten"
+                | "Squeeze"
+                | "ExpandDims"
+                | "AsContiguous"
+                | "Transpose"
+        ) {
+            return None;
+        }
+        cur = *op.inputs.first()?;
+        depth += 1;
+    }
+    None
 }
 
 fn collect_q_layout_alias_chain(
@@ -1459,8 +1950,12 @@ fn try_final_lm_head_merge(
 /// adds out of this rewrite.
 fn try_linear_residual_merge(slots: &mut Vec<Option<Fusion>>, graph: &Graph) -> bool {
     let mut consumers_of: HashMap<TensorId, Vec<usize>> = HashMap::new();
+    let mut producer_of: HashMap<TensorId, usize> = HashMap::new();
     for (idx, slot) in slots.iter().enumerate() {
         let Some(f) = slot else { continue };
+        for out in &f.outputs {
+            producer_of.insert(out.source, idx);
+        }
         for inp in &f.inputs {
             consumers_of.entry(inp.source).or_default().push(idx);
         }
@@ -1491,7 +1986,6 @@ fn try_linear_residual_merge(slots: &mut Vec<Option<Fusion>>, graph: &Graph) -> 
         if producer.inputs.len() != expected_inputs || producer.outputs.len() != 1 {
             continue;
         }
-
         let mm_out = producer.outputs[0].source;
         let (aliases, metadata_idxs) = collect_metadata_alias_chain(mm_out, slots, &consumers_of);
         let metadata_set: HashSet<usize> = metadata_idxs.iter().copied().collect();
@@ -1545,11 +2039,39 @@ fn try_linear_residual_merge(slots: &mut Vec<Option<Fusion>>, graph: &Graph) -> 
         let residual_side = 1 - mm_side;
         let out_shape = &add.outputs[0].shape;
         let residual = &add.inputs[residual_side];
-        if residual.shape != *out_shape {
+        let direct_bias_param = walk_to_param_rank1(graph, residual.source).and_then(|tid| {
+            let t = graph.tensors.get(tid as usize)?;
+            (t.shape.last() == out_shape.last()).then_some((tid, t))
+        });
+        let residual_bias_view_idx = direct_bias_param.and_then(|_| {
+            let idx = producer_of.get(&residual.source).copied()?;
+            let f = slots.get(idx)?.as_ref()?;
+            let FusionKind::Single(name) = &f.kind else {
+                return None;
+            };
+            let only_this_add = consumers_of
+                .get(&residual.source)
+                .is_some_and(|v| v.iter().all(|&consumer_idx| consumer_idx == c_idx));
+            (is_chain_absorbable_view(name)
+                && f.inputs.len() == 1
+                && f.outputs.len() == 1
+                && only_this_add)
+                .then_some(idx)
+        });
+        if residual.shape != *out_shape && direct_bias_param.is_none() {
             continue;
         }
         if producer.outputs[0].shape.last() != add.outputs[0].shape.last() {
             continue;
+        }
+        if prefill_tiled_qmm_mode() && is_quant && fusion_active_rows(producer) > 1 {
+            let Some(q) = quant else {
+                continue;
+            };
+            let out_dim = out_shape.last().copied().unwrap_or(0);
+            if q.group_size != 64 || !matches!(q.bits, 4 | 8) || out_dim < 64 {
+                continue;
+            }
         }
 
         let weight_root = trace_view_root(graph, producer.inputs[1].source);
@@ -1568,10 +2090,19 @@ fn try_linear_residual_merge(slots: &mut Vec<Option<Fusion>>, graph: &Graph) -> 
                 ..producer.inputs[3].clone()
             });
         }
-        inputs.push(FusionBoundary {
-            role: "residual",
-            ..residual.clone()
-        });
+        if let Some((bias_tid, bias_tensor)) = direct_bias_param {
+            inputs.push(FusionBoundary {
+                source: bias_tid,
+                role: "residual",
+                shape: bias_tensor.shape.clone(),
+                dtype: bias_tensor.dtype,
+            });
+        } else {
+            inputs.push(FusionBoundary {
+                role: "residual",
+                ..residual.clone()
+            });
+        }
 
         let outputs = vec![FusionBoundary {
             role: "y",
@@ -1606,6 +2137,9 @@ fn try_linear_residual_merge(slots: &mut Vec<Option<Fusion>>, graph: &Graph) -> 
         };
         slots[p_idx] = Some(new_fusion);
         for idx in metadata_idxs {
+            slots[idx].take();
+        }
+        if let Some(idx) = residual_bias_view_idx {
             slots[idx].take();
         }
         slots[c_idx].take();
@@ -1767,6 +2301,32 @@ fn try_fanout_merge(
         if !valid {
             continue;
         }
+        if materialized_norm_q8_swiglu_candidate(slots, &heavy_cons, &consumers_of) {
+            if std::env::var_os("FUSEKIT_BUDGET_DEBUG").is_some() {
+                eprintln!(
+                    "[budget] try_fanout_merge q8 swiglu materialized-norm barrier: producer={:?} n_heavy_cons={}",
+                    producer.kind,
+                    heavy_cons.len()
+                );
+            }
+            continue;
+        }
+        if prefill_tiled_qmm_mode()
+            && heavy_cons.iter().any(|&c_idx| {
+                slots[c_idx]
+                    .as_ref()
+                    .is_some_and(|c| prefill_tiled_qmm_reduction_barrier(producer, c))
+            })
+        {
+            if std::env::var_os("FUSEKIT_BUDGET_DEBUG").is_some() {
+                eprintln!(
+                    "[budget] try_fanout_merge prefill-tiled-qmm barrier: producer={:?} n_heavy_cons={}",
+                    producer.kind,
+                    heavy_cons.len()
+                );
+            }
+            continue;
+        }
         // Budget gate: producer step + one step per Heavy consumer.
         let dbg_budget = std::env::var_os("FUSEKIT_BUDGET_DEBUG").is_some();
         let mut est = REG_CONTROL_HEADROOM + step_register_slots("RMSNorm", producer.inputs.len());
@@ -1804,6 +2364,271 @@ fn try_fanout_merge(
         return true;
     }
     false
+}
+
+fn materialized_norm_q8_swiglu_candidate(
+    slots: &[Option<Fusion>],
+    heavy_cons: &[usize],
+    consumers_of: &HashMap<TensorId, Vec<usize>>,
+) -> bool {
+    let dbg = std::env::var_os("FUSEKIT_Q8_SWIGLU_MATERIALIZE_DEBUG").is_some();
+    if std::env::var("FUSEKIT_Q8_SWIGLU_MATERIALIZE_NORM").as_deref() != Ok("1") {
+        return false;
+    }
+    if heavy_cons.len() != 2 {
+        if dbg && heavy_cons.len() > 1 {
+            eprintln!(
+                "[q8-swiglu-materialize] reject heavy_cons_len={}",
+                heavy_cons.len()
+            );
+        }
+        return false;
+    }
+    let Some(a) = slots[heavy_cons[0]].as_ref() else {
+        return false;
+    };
+    let Some(b) = slots[heavy_cons[1]].as_ref() else {
+        return false;
+    };
+    let Some(a_target) = qmv_fanout_target(a) else {
+        if dbg {
+            eprintln!("[q8-swiglu-materialize] reject a target");
+        }
+        return false;
+    };
+    let Some(b_target) = qmv_fanout_target(b) else {
+        if dbg {
+            eprintln!("[q8-swiglu-materialize] reject b target");
+        }
+        return false;
+    };
+    if !qmv_swiglu_target_compatible(a_target, b_target)
+        || a_target.bits != 8
+        || a_target.group_size != 64
+        || a_target.active_rows > 1
+    {
+        if dbg {
+            eprintln!(
+                "[q8-swiglu-materialize] reject target a={:?} b={:?}",
+                a_target, b_target
+            );
+        }
+        return false;
+    }
+
+    let fusions = [a, b];
+    for (gate_idx, up_idx) in [(0usize, 1usize), (1usize, 0usize)] {
+        let Some(gate_out) = fusions[gate_idx].outputs.first() else {
+            continue;
+        };
+        let Some(up_out) = fusions[up_idx].outputs.first() else {
+            continue;
+        };
+        let (gate_aliases, gate_metadata) =
+            collect_metadata_alias_chain(gate_out.source, slots, consumers_of);
+        let (up_aliases, up_metadata) =
+            collect_metadata_alias_chain(up_out.source, slots, consumers_of);
+        let metadata_set: HashSet<usize> = gate_metadata
+            .iter()
+            .chain(up_metadata.iter())
+            .copied()
+            .collect();
+        let heavy_set: HashSet<usize> = heavy_cons.iter().copied().collect();
+        let alias_consumers = |aliases: &HashSet<TensorId>| -> HashSet<usize> {
+            let mut set = HashSet::new();
+            for alias in aliases {
+                for c_idx in consumers_of.get(alias).cloned().unwrap_or_default() {
+                    if heavy_set.contains(&c_idx) || metadata_set.contains(&c_idx) {
+                        continue;
+                    }
+                    set.insert(c_idx);
+                }
+            }
+            set
+        };
+        let gate_set = alias_consumers(&gate_aliases);
+        let up_set = alias_consumers(&up_aliases);
+        let mut tail_consumers: HashSet<usize> = HashSet::new();
+        if gate_set.len() != 1 || up_set.len() != 1 {
+            if let Some(raw_used) = semantic_silu_gate_up_raw_tail(
+                slots,
+                consumers_of,
+                &gate_aliases,
+                &up_aliases,
+                &metadata_set,
+                &heavy_set,
+            ) {
+                if dbg {
+                    eprintln!(
+                        "[q8-swiglu-materialize] raw tail candidate gate_idx={gate_idx} up_idx={up_idx} used={raw_used:?}"
+                    );
+                }
+                tail_consumers = raw_used;
+            } else {
+                if dbg {
+                    eprintln!(
+                        "[q8-swiglu-materialize] reject consumer sets gate_idx={gate_idx} up_idx={up_idx} gate_set={gate_set:?} up_set={up_set:?}"
+                    );
+                }
+                continue;
+            }
+        }
+        if gate_set.len() == 1 && up_set.len() == 1 {
+            let c_idx = *gate_set.iter().next().expect("checked len");
+            if !up_set.contains(&c_idx) {
+                continue;
+            }
+            tail_consumers.insert(c_idx);
+            let Some(consumer) = slots[c_idx].as_ref() else {
+                continue;
+            };
+            if !semantic_silu_gate_up_consumer(consumer, &gate_aliases, &up_aliases)
+                && semantic_silu_gate_up_raw_tail(
+                    slots,
+                    consumers_of,
+                    &gate_aliases,
+                    &up_aliases,
+                    &metadata_set,
+                    &heavy_set,
+                )
+                .is_none()
+            {
+                if dbg {
+                    eprintln!("[q8-swiglu-materialize] reject semantic consumer c_idx={c_idx}");
+                }
+                continue;
+            }
+        }
+        if tail_consumers.is_empty() {
+            continue;
+        }
+
+        let mut metadata_isolated = true;
+        for &m_idx in &metadata_set {
+            let Some(m) = slots[m_idx].as_ref() else {
+                metadata_isolated = false;
+                break;
+            };
+            for out in &m.outputs {
+                for d_idx in consumers_of.get(&out.source).cloned().unwrap_or_default() {
+                    if !tail_consumers.contains(&d_idx) && !metadata_set.contains(&d_idx) {
+                        metadata_isolated = false;
+                        break;
+                    }
+                }
+                if !metadata_isolated {
+                    break;
+                }
+            }
+            if !metadata_isolated {
+                break;
+            }
+        }
+        if metadata_isolated {
+            if dbg {
+                eprintln!("[q8-swiglu-materialize] accept gate_idx={gate_idx} up_idx={up_idx}");
+            }
+            return true;
+        }
+        if dbg {
+            eprintln!(
+                "[q8-swiglu-materialize] reject metadata isolation gate_idx={gate_idx} up_idx={up_idx}"
+            );
+        }
+    }
+    false
+}
+
+fn semantic_silu_gate_up_raw_tail(
+    slots: &[Option<Fusion>],
+    consumers_of: &HashMap<TensorId, Vec<usize>>,
+    gate_aliases: &HashSet<TensorId>,
+    up_aliases: &HashSet<TensorId>,
+    metadata_set: &HashSet<usize>,
+    ignored: &HashSet<usize>,
+) -> Option<HashSet<usize>> {
+    let direct_consumers = |aliases: &HashSet<TensorId>| -> HashSet<usize> {
+        let mut out = HashSet::new();
+        for alias in aliases {
+            for idx in consumers_of.get(alias).cloned().unwrap_or_default() {
+                if ignored.contains(&idx) || metadata_set.contains(&idx) {
+                    continue;
+                }
+                out.insert(idx);
+            }
+        }
+        out
+    };
+    let gate_consumers = direct_consumers(gate_aliases);
+    let up_consumers = direct_consumers(up_aliases);
+
+    for &sig_idx in &gate_consumers {
+        let Some(sig) = slots[sig_idx].as_ref() else {
+            continue;
+        };
+        if !matches!(&sig.kind, FusionKind::Single(name) if name == "Sigmoid")
+            || sig.inputs.len() != 1
+            || sig.outputs.len() != 1
+            || !gate_aliases.contains(&sig.inputs[0].source)
+        {
+            continue;
+        }
+        let sig_out = sig.outputs[0].source;
+        for &mul_gate_idx in consumers_of
+            .get(&sig_out)
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+        {
+            let Some(mul_gate) = slots[mul_gate_idx].as_ref() else {
+                continue;
+            };
+            if !matches!(&mul_gate.kind, FusionKind::Single(name) if name == "Multiply")
+                || mul_gate.inputs.len() != 2
+                || mul_gate.outputs.len() != 1
+            {
+                continue;
+            }
+            let a = mul_gate.inputs[0].source;
+            let b = mul_gate.inputs[1].source;
+            let gate_mul_ok = (a == sig_out && gate_aliases.contains(&b))
+                || (b == sig_out && gate_aliases.contains(&a));
+            if !gate_mul_ok {
+                continue;
+            }
+            let mul_gate_out = mul_gate.outputs[0].source;
+            for &mul_up_idx in consumers_of
+                .get(&mul_gate_out)
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+            {
+                let Some(mul_up) = slots[mul_up_idx].as_ref() else {
+                    continue;
+                };
+                if !matches!(&mul_up.kind, FusionKind::Single(name) if name == "Multiply")
+                    || mul_up.inputs.len() != 2
+                    || mul_up.outputs.len() != 1
+                {
+                    continue;
+                }
+                let a = mul_up.inputs[0].source;
+                let b = mul_up.inputs[1].source;
+                let up_mul_ok = (a == mul_gate_out && up_aliases.contains(&b))
+                    || (b == mul_gate_out && up_aliases.contains(&a));
+                if !up_mul_ok {
+                    continue;
+                }
+                let used = HashSet::from([sig_idx, mul_gate_idx, mul_up_idx]);
+                let expected_gate = HashSet::from([sig_idx, mul_gate_idx]);
+                let expected_up = HashSet::from([mul_up_idx]);
+                if gate_consumers == expected_gate && up_consumers == expected_up {
+                    return Some(used);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// Build the multi-Heavy chain. The producer becomes chain step 0;
@@ -2170,11 +2995,13 @@ fn qmv_fanout_target(fusion: &Fusion) -> Option<QmvFanoutTarget> {
     }
     let exact_tail = std::env::var("FUSEKIT_QMV_FANOUT_EXACT").as_deref() == Ok("1");
     let (k_dim, out_dim, active_rows, bits, group_size) =
-        crate::codegen::kernels::qmm_mlx_qmv_fast_shape(fusion).or_else(|| {
-            exact_tail
-                .then(|| crate::codegen::kernels::qmm_mlx_qmv_tail_safe_shape(fusion))
-                .flatten()
-        })?;
+        crate::codegen::kernels::qmm_mlx_qmmt_shape(fusion)
+            .or_else(|| crate::codegen::kernels::qmm_mlx_qmv_fast_shape(fusion))
+            .or_else(|| {
+                exact_tail
+                    .then(|| crate::codegen::kernels::qmm_mlx_qmv_tail_safe_shape(fusion))
+                    .flatten()
+            })?;
     Some(QmvFanoutTarget {
         k_dim,
         out_dim,
@@ -2264,6 +3091,14 @@ fn qmv_fanout_target_compatible(a: QmvFanoutTarget, b: QmvFanoutTarget) -> bool 
 }
 
 fn qmv_fanout_tiling(target: QmvFanoutTarget) -> (u32, u32, u32) {
+    if target.active_rows >= 128 && matches!(target.bits, 4 | 8) {
+        return crate::codegen::kernels::qmm_mlx_qmmt_tile(
+            target.k_dim,
+            target.out_dim,
+            target.active_rows,
+            target.bits,
+        );
+    }
     (
         crate::codegen::kernels::qmv_fanout_fast_simdgroups(
             target.active_rows,
@@ -2938,13 +3773,485 @@ fn qmv_swiglu_target_compatible(gate: QmvFanoutTarget, up: QmvFanoutTarget) -> b
         && matches!(gate.bits, 4 | 8)
 }
 
-fn try_qmv_swiglu_absorb(slots: &mut Vec<Option<Fusion>>, reg_budget: u32) -> bool {
-    let dbg = std::env::var_os("FUSEKIT_QMV_SWIGLU_ABSORB_DEBUG").is_some();
-    let mut consumers_of: HashMap<TensorId, HashSet<usize>> = HashMap::new();
+fn gather_qmm_target(fusion: &Fusion) -> Option<QmvFanoutTarget> {
+    if !matches!(&fusion.kind, FusionKind::Single(op) if op == "GatherQMM") {
+        return None;
+    }
+    if fusion.inputs.len() < 6 || fusion.outputs.len() != 1 {
+        return None;
+    }
+    let x_shape = fusion.inputs.first()?.shape.as_slice();
+    let w_shape = fusion.inputs.get(1)?.shape.as_slice();
+    let s_shape = fusion.inputs.get(2)?.shape.as_slice();
+    let b_shape = fusion.inputs.get(3)?.shape.as_slice();
+    let out_shape = fusion.outputs.first()?.shape.as_slice();
+    if x_shape.is_empty()
+        || w_shape.len() != 3
+        || s_shape.len() != 3
+        || b_shape.len() != 3
+        || out_shape.len() < 5
+    {
+        return None;
+    }
+    let k_dim = x_shape.last().copied().unwrap_or(0).max(1) as u32;
+    let n_experts = w_shape[0].max(1) as u32;
+    let out_dim = w_shape[1].max(1) as u32;
+    let packed = w_shape[2].max(1) as u32;
+    let n_groups = s_shape[2].max(1) as u32;
+    if s_shape[0].max(1) as u32 != n_experts
+        || b_shape[0].max(1) as u32 != n_experts
+        || s_shape[1].max(1) as u32 != out_dim
+        || b_shape[1].max(1) as u32 != out_dim
+        || b_shape[2].max(1) as u32 != n_groups
+        || out_shape.last().copied().unwrap_or(0).max(1) as u32 != out_dim
+    {
+        return None;
+    }
+    let bits = ((packed * 32) / k_dim).max(1);
+    if !matches!(bits, 4 | 8) || packed.saturating_mul(32) != k_dim.saturating_mul(bits) {
+        return None;
+    }
+    if !k_dim.is_multiple_of(n_groups) {
+        return None;
+    }
+    let active_tokens = crate::target::current_chip().active_tokens_for_shape(out_shape) as u64;
+    let routes_per_token = out_shape[2..out_shape.len().saturating_sub(1)]
+        .iter()
+        .map(|&d| d.max(1) as u64)
+        .product::<u64>()
+        .max(1);
+    Some(QmvFanoutTarget {
+        k_dim,
+        out_dim,
+        active_rows: active_tokens.saturating_mul(routes_per_token).max(1),
+        bits,
+        group_size: (k_dim / n_groups).max(1),
+    })
+}
+
+fn token_arange_length_through_views(graph: &Graph, mut tid: TensorId) -> Option<i32> {
+    let mut seen = HashSet::new();
+    while seen.insert(tid) {
+        let tensor = graph.tensors.get(tid as usize)?;
+        let producer = tensor.producer?;
+        let op = graph.ops.get(producer as usize)?;
+        match op.name.as_str() {
+            "Broadcast" | "Reshape" | "Flatten" | "Unflatten" | "Squeeze" | "ExpandDims"
+            | "AsContiguous" => {
+                if op.inputs.len() != 1 {
+                    return None;
+                }
+                tid = op.inputs[0];
+            }
+            "Arange" => {
+                if let Attrs::Arange { start, stop, step } = &op.attrs {
+                    if (*start - 0.0).abs() > f64::EPSILON || (*step - 1.0).abs() > f64::EPSILON {
+                        return None;
+                    }
+                    let n = stop.round() as i32;
+                    if n <= 0 || (*stop - n as f64).abs() > f64::EPSILON {
+                        return None;
+                    }
+                    return Some(n);
+                }
+                let n = tensor.shape.iter().product::<i32>().max(1);
+                return Some(n);
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn routed_row_index_equivalent(graph: &Graph, a: &FusionBoundary, b: &FusionBoundary) -> bool {
+    if a.source == b.source {
+        return true;
+    }
+    if a.dtype != b.dtype || a.shape != b.shape || !matches!(a.dtype, Dtype::U32 | Dtype::I32) {
+        return false;
+    }
+    let Some(a_len) = token_arange_length_through_views(graph, a.source) else {
+        return false;
+    };
+    let Some(b_len) = token_arange_length_through_views(graph, b.source) else {
+        return false;
+    };
+    let token_dim = a
+        .shape
+        .get(1)
+        .copied()
+        .unwrap_or_else(|| a.shape.iter().product::<i32>().max(1))
+        .max(1);
+    a_len == b_len && a_len == token_dim
+}
+
+fn try_routed_qmv_swiglu_absorb(
+    slots: &mut Vec<Option<Fusion>>,
+    reg_budget: u32,
+    graph: &Graph,
+) -> bool {
+    let dbg = std::env::var_os("FUSEKIT_ROUTED_QMV_SWIGLU_DEBUG").is_some();
+    let est_regs = REG_CONTROL_HEADROOM + 56;
+    if est_regs > reg_budget {
+        if dbg {
+            eprintln!("[routed-qmv-swiglu] reg reject est={est_regs} budget={reg_budget}");
+        }
+        return false;
+    }
+
+    let mut consumers_of: HashMap<TensorId, Vec<usize>> = HashMap::new();
     for (idx, slot) in slots.iter().enumerate() {
         let Some(fusion) = slot else { continue };
         for input in &fusion.inputs {
-            consumers_of.entry(input.source).or_default().insert(idx);
+            consumers_of.entry(input.source).or_default().push(idx);
+        }
+    }
+
+    for gate_idx in 0..slots.len() {
+        let Some(gate) = slots[gate_idx].as_ref() else {
+            continue;
+        };
+        let Some(gate_target) = gather_qmm_target(gate) else {
+            continue;
+        };
+        for up_idx in 0..slots.len() {
+            if up_idx == gate_idx {
+                continue;
+            }
+            let Some(up) = slots[up_idx].as_ref() else {
+                continue;
+            };
+            let Some(up_target) = gather_qmm_target(up) else {
+                continue;
+            };
+            if !qmv_swiglu_target_compatible(gate_target, up_target) {
+                continue;
+            }
+            if gate.inputs[0].source != up.inputs[0].source
+                || gate.inputs[5].source != up.inputs[5].source
+                || !routed_row_index_equivalent(graph, &gate.inputs[4], &up.inputs[4])
+            {
+                continue;
+            }
+            if gate.outputs[0].shape != up.outputs[0].shape
+                || gate.outputs[0].dtype != up.outputs[0].dtype
+            {
+                continue;
+            }
+
+            let (gate_aliases, gate_metadata) =
+                collect_metadata_alias_chain(gate.outputs[0].source, slots, &consumers_of);
+            let (up_aliases, up_metadata) =
+                collect_metadata_alias_chain(up.outputs[0].source, slots, &consumers_of);
+            let metadata_set: HashSet<usize> = gate_metadata
+                .iter()
+                .chain(up_metadata.iter())
+                .copied()
+                .collect();
+            let alias_consumers = |aliases: &HashSet<TensorId>| -> HashSet<usize> {
+                let mut set = HashSet::new();
+                for alias in aliases {
+                    for c_idx in consumers_of.get(alias).cloned().unwrap_or_default() {
+                        if c_idx == gate_idx || c_idx == up_idx || metadata_set.contains(&c_idx) {
+                            continue;
+                        }
+                        set.insert(c_idx);
+                    }
+                }
+                set
+            };
+            let gate_cons = alias_consumers(&gate_aliases);
+            let up_cons = alias_consumers(&up_aliases);
+            if gate_cons.len() != 1 || up_cons.len() != 1 {
+                continue;
+            }
+            let c_idx = *gate_cons.iter().next().expect("checked len");
+            if !up_cons.contains(&c_idx) {
+                continue;
+            }
+            let Some(consumer) = slots[c_idx].as_ref() else {
+                continue;
+            };
+            if !semantic_silu_gate_up_consumer(consumer, &gate_aliases, &up_aliases) {
+                continue;
+            }
+
+            let mut metadata_isolated = true;
+            for &m_idx in &metadata_set {
+                let Some(m) = slots[m_idx].as_ref() else {
+                    metadata_isolated = false;
+                    break;
+                };
+                for out in &m.outputs {
+                    for d_idx in consumers_of.get(&out.source).cloned().unwrap_or_default() {
+                        if d_idx != c_idx && !metadata_set.contains(&d_idx) {
+                            metadata_isolated = false;
+                            break;
+                        }
+                    }
+                    if !metadata_isolated {
+                        break;
+                    }
+                }
+                if !metadata_isolated {
+                    break;
+                }
+            }
+            if !metadata_isolated {
+                continue;
+            }
+
+            let metadata_owned = metadata_set
+                .iter()
+                .filter_map(|&m_idx| slots[m_idx].as_ref().cloned())
+                .collect::<Vec<_>>();
+            let gate_owned = slots[gate_idx].take().expect("gate present");
+            let up_owned = slots[up_idx].take().expect("up present");
+            for &m_idx in &metadata_set {
+                slots[m_idx].take();
+            }
+            let consumer_owned = slots[c_idx].take().expect("consumer present");
+
+            let mut inputs = Vec::with_capacity(9);
+            let mut x = gate_owned.inputs[0].clone();
+            x.role = "x";
+            inputs.push(x);
+            let push_qmm_inputs =
+                |inputs: &mut Vec<FusionBoundary>, fusion: &Fusion, role: &str| {
+                    let mut w = fusion.inputs[1].clone();
+                    let mut s = fusion.inputs[2].clone();
+                    let mut b = fusion.inputs[3].clone();
+                    let (w_role, s_role, b_role) = match role {
+                        "gate" => (
+                            "W_routed_qmv_swiglu_gate",
+                            "W_routed_qmv_swiglu_gate_scales",
+                            "W_routed_qmv_swiglu_gate_biases",
+                        ),
+                        _ => (
+                            "W_routed_qmv_swiglu_up",
+                            "W_routed_qmv_swiglu_up_scales",
+                            "W_routed_qmv_swiglu_up_biases",
+                        ),
+                    };
+                    w.role = w_role;
+                    s.role = s_role;
+                    b.role = b_role;
+                    inputs.push(w);
+                    inputs.push(s);
+                    inputs.push(b);
+                };
+            push_qmm_inputs(&mut inputs, &gate_owned, "gate");
+            push_qmm_inputs(&mut inputs, &up_owned, "up");
+            let mut row_idx = gate_owned.inputs[4].clone();
+            row_idx.role = "row_idx";
+            let mut expert_idx = gate_owned.inputs[5].clone();
+            expert_idx.role = "expert_idx";
+            inputs.push(row_idx);
+            inputs.push(expert_idx);
+
+            let mut op_ids = gate_owned.op_ids.clone();
+            op_ids.extend(up_owned.op_ids.iter().copied());
+            for m in &metadata_owned {
+                op_ids.extend(m.op_ids.iter().copied());
+            }
+            op_ids.extend(consumer_owned.op_ids.iter().copied());
+            let merged = Fusion {
+                id: gate_owned.id,
+                kind: FusionKind::RoutedQmvSwiglu,
+                op_ids,
+                inputs,
+                outputs: consumer_owned.outputs.clone(),
+                attrs: FusionAttrs::RoutedQmvSwiglu {
+                    gate: gate_target,
+                    up: up_target,
+                },
+                parallel_axes: Vec::new(),
+                layer_hint: gate_owned
+                    .layer_hint
+                    .or(up_owned.layer_hint)
+                    .or(consumer_owned.layer_hint),
+            };
+            if dbg {
+                eprintln!(
+                    "[routed-qmv-swiglu] merged gate={gate_idx} up={up_idx} consumer={c_idx}"
+                );
+            }
+            slots[gate_idx] = Some(merged);
+            return true;
+        }
+    }
+    false
+}
+
+fn try_routed_qmv_reduce_absorb(slots: &mut Vec<Option<Fusion>>, reg_budget: u32) -> bool {
+    let dbg = std::env::var_os("FUSEKIT_ROUTED_QMV_REDUCE_DEBUG").is_some();
+    let est_regs = REG_CONTROL_HEADROOM + 40;
+    if est_regs > reg_budget {
+        if dbg {
+            eprintln!("[routed-qmv-reduce] reg reject est={est_regs} budget={reg_budget}");
+        }
+        return false;
+    }
+
+    let mut consumers_of: HashMap<TensorId, Vec<usize>> = HashMap::new();
+    for (idx, slot) in slots.iter().enumerate() {
+        let Some(fusion) = slot else { continue };
+        for input in &fusion.inputs {
+            consumers_of.entry(input.source).or_default().push(idx);
+        }
+    }
+
+    for qmm_idx in 0..slots.len() {
+        let Some(qmm) = slots[qmm_idx].as_ref() else {
+            continue;
+        };
+        let Some(target) = gather_qmm_target(qmm) else {
+            continue;
+        };
+        let qmm_out = qmm.outputs[0].source;
+        let (aliases, metadata) = collect_metadata_alias_chain(qmm_out, slots, &consumers_of);
+        let metadata_set: HashSet<usize> = metadata.iter().copied().collect();
+
+        let mut reduce_idx: Option<usize> = None;
+        let mut data_source: Option<TensorId> = None;
+        let mut isolated = true;
+        for alias in &aliases {
+            for c_idx in consumers_of.get(alias).cloned().unwrap_or_default() {
+                if c_idx == qmm_idx || metadata_set.contains(&c_idx) {
+                    continue;
+                }
+                let Some(consumer) = slots[c_idx].as_ref() else {
+                    isolated = false;
+                    break;
+                };
+                if !matches!(&consumer.kind, FusionKind::Single(name) if name == "WeightedRouteReduce")
+                    || consumer.inputs.len() < 2
+                    || consumer.outputs.len() != 1
+                    || consumer.inputs[0].source != *alias
+                {
+                    isolated = false;
+                    break;
+                }
+                if reduce_idx.replace(c_idx).is_some() {
+                    isolated = false;
+                    break;
+                }
+                data_source = Some(*alias);
+            }
+            if !isolated {
+                break;
+            }
+        }
+        let Some(reduce_idx) = reduce_idx else {
+            continue;
+        };
+        if !isolated {
+            continue;
+        }
+
+        let Some(reduce) = slots[reduce_idx].as_ref() else {
+            continue;
+        };
+        let Some(data_source) = data_source else {
+            continue;
+        };
+        if reduce.outputs[0].shape.last().copied().unwrap_or(0).max(1) as u32 != target.out_dim {
+            continue;
+        }
+        if reduce.inputs[0].shape.last().copied().unwrap_or(0).max(1) as u32 != target.out_dim {
+            continue;
+        }
+        let route_weight = reduce.inputs[1].clone();
+        if route_weight.dtype != qmm.outputs[0].dtype {
+            continue;
+        }
+
+        let mut metadata_isolated = true;
+        for &m_idx in &metadata_set {
+            let Some(m) = slots[m_idx].as_ref() else {
+                metadata_isolated = false;
+                break;
+            };
+            for out in &m.outputs {
+                for d_idx in consumers_of.get(&out.source).cloned().unwrap_or_default() {
+                    if d_idx != reduce_idx && !metadata_set.contains(&d_idx) {
+                        metadata_isolated = false;
+                        break;
+                    }
+                }
+                if !metadata_isolated {
+                    break;
+                }
+            }
+            if !metadata_isolated {
+                break;
+            }
+        }
+        if !metadata_isolated {
+            continue;
+        }
+
+        let metadata_owned = metadata_set
+            .iter()
+            .filter_map(|&m_idx| slots[m_idx].as_ref().cloned())
+            .collect::<Vec<_>>();
+        let qmm_owned = slots[qmm_idx].take().expect("qmm present");
+        for &m_idx in &metadata_set {
+            slots[m_idx].take();
+        }
+        let reduce_owned = slots[reduce_idx].take().expect("reduce present");
+
+        let mut inputs = Vec::with_capacity(7);
+        for (idx, role) in [
+            (0usize, "x"),
+            (1, "W_routed_qmv_reduce"),
+            (2, "W_routed_qmv_reduce_scales"),
+            (3, "W_routed_qmv_reduce_biases"),
+            (4, "row_idx"),
+            (5, "expert_idx"),
+        ] {
+            let mut input = qmm_owned.inputs[idx].clone();
+            input.role = role;
+            inputs.push(input);
+        }
+        let mut weight = route_weight;
+        weight.role = "route_weight";
+        inputs.push(weight);
+
+        let mut op_ids = qmm_owned.op_ids.clone();
+        for m in &metadata_owned {
+            op_ids.extend(m.op_ids.iter().copied());
+        }
+        op_ids.extend(reduce_owned.op_ids.iter().copied());
+        let merged = Fusion {
+            id: qmm_owned.id,
+            kind: FusionKind::RoutedQmvReduce,
+            op_ids,
+            inputs,
+            outputs: reduce_owned.outputs.clone(),
+            attrs: FusionAttrs::RoutedQmvReduce { target },
+            parallel_axes: Vec::new(),
+            layer_hint: qmm_owned.layer_hint.or(reduce_owned.layer_hint),
+        };
+        if dbg {
+            eprintln!(
+                "[routed-qmv-reduce] merged qmm={qmm_idx} reduce={reduce_idx} data_source={data_source}"
+            );
+        }
+        slots[qmm_idx] = Some(merged);
+        return true;
+    }
+
+    false
+}
+
+fn try_qmv_swiglu_absorb(slots: &mut Vec<Option<Fusion>>, reg_budget: u32) -> bool {
+    let dbg = std::env::var_os("FUSEKIT_QMV_SWIGLU_ABSORB_DEBUG").is_some();
+    let mut consumers_of: HashMap<TensorId, Vec<usize>> = HashMap::new();
+    for (idx, slot) in slots.iter().enumerate() {
+        let Some(fusion) = slot else { continue };
+        for input in &fusion.inputs {
+            consumers_of.entry(input.source).or_default().push(idx);
         }
     }
 
@@ -2982,8 +4289,29 @@ fn try_qmv_swiglu_absorb(slots: &mut Vec<Option<Fusion>>, reg_budget: u32) -> bo
 
             let gate_src = producer.outputs[gate_idx].source;
             let up_src = producer.outputs[up_idx].source;
-            let gate_cons = consumers_of.get(&gate_src).cloned().unwrap_or_default();
-            let up_cons = consumers_of.get(&up_src).cloned().unwrap_or_default();
+            let (gate_aliases, gate_metadata) =
+                collect_metadata_alias_chain(gate_src, slots, &consumers_of);
+            let (up_aliases, up_metadata) =
+                collect_metadata_alias_chain(up_src, slots, &consumers_of);
+            let metadata_set: HashSet<usize> = gate_metadata
+                .iter()
+                .chain(up_metadata.iter())
+                .copied()
+                .collect();
+            let alias_consumers = |aliases: &HashSet<TensorId>| -> HashSet<usize> {
+                let mut set = HashSet::new();
+                for alias in aliases {
+                    for c_idx in consumers_of.get(alias).cloned().unwrap_or_default() {
+                        if c_idx == p_idx || metadata_set.contains(&c_idx) {
+                            continue;
+                        }
+                        set.insert(c_idx);
+                    }
+                }
+                set
+            };
+            let gate_cons = alias_consumers(&gate_aliases);
+            let up_cons = alias_consumers(&up_aliases);
             if gate_cons.len() != 1 || up_cons.len() != 1 {
                 continue;
             }
@@ -2992,67 +4320,42 @@ fn try_qmv_swiglu_absorb(slots: &mut Vec<Option<Fusion>>, reg_budget: u32) -> bo
                 continue;
             }
 
+            let mut metadata_isolated = true;
+            for &m_idx in &metadata_set {
+                let Some(m) = slots[m_idx].as_ref() else {
+                    metadata_isolated = false;
+                    break;
+                };
+                for out in &m.outputs {
+                    for d_idx in consumers_of.get(&out.source).cloned().unwrap_or_default() {
+                        if d_idx != c_idx && !metadata_set.contains(&d_idx) {
+                            metadata_isolated = false;
+                            break;
+                        }
+                    }
+                    if !metadata_isolated {
+                        break;
+                    }
+                }
+                if !metadata_isolated {
+                    break;
+                }
+            }
+            if !metadata_isolated {
+                continue;
+            }
+
             let Some(consumer) = slots[c_idx].as_ref() else {
                 continue;
             };
-            let c_steps = match (&consumer.kind, &consumer.attrs) {
-                (FusionKind::FusedChain, FusionAttrs::FusedChain { steps, .. }) => steps,
-                _ => continue,
-            };
-            if c_steps.len() != 3
-                || c_steps[0].op_name != "Sigmoid"
-                || c_steps[1].op_name != "Multiply"
-                || c_steps[2].op_name != "Multiply"
-                || consumer.outputs.len() != 1
-            {
-                continue;
-            }
-            let cinputs: Vec<TensorId> = consumer.inputs.iter().map(|b| b.source).collect();
-            let external_is = |operand: ChainOperand, src: TensorId| -> bool {
-                match operand {
-                    ChainOperand::External { buffer_index } => cinputs
-                        .get(buffer_index as usize)
-                        .is_some_and(|candidate| *candidate == src),
-                    _ => false,
-                }
-            };
-
-            let Some(sig_in) = c_steps[0].inputs.first().copied() else {
-                continue;
-            };
-            if !external_is(sig_in, gate_src) {
-                continue;
-            }
-
-            let mul1_ok = match (
-                c_steps[1].inputs.first().copied(),
-                c_steps[1].inputs.get(1).copied(),
-            ) {
-                (Some(ChainOperand::Register { step_index: 0 }), Some(x)) => {
-                    external_is(x, gate_src)
-                }
-                (Some(x), Some(ChainOperand::Register { step_index: 0 })) => {
-                    external_is(x, gate_src)
-                }
-                _ => false,
-            };
-            if !mul1_ok {
-                continue;
-            }
-
-            let mul2_ok = match (
-                c_steps[2].inputs.first().copied(),
-                c_steps[2].inputs.get(1).copied(),
-            ) {
-                (Some(ChainOperand::Register { step_index: 1 }), Some(x)) => external_is(x, up_src),
-                (Some(x), Some(ChainOperand::Register { step_index: 1 })) => external_is(x, up_src),
-                _ => false,
-            };
-            if !mul2_ok {
+            if !semantic_silu_gate_up_consumer(consumer, &gate_aliases, &up_aliases) {
                 continue;
             }
 
             let producer_owned = slots[p_idx].take().expect("producer present");
+            for &m_idx in &metadata_set {
+                slots[m_idx].take();
+            }
             let consumer_owned = slots[c_idx].take().expect("consumer present");
 
             let mut inputs = Vec::with_capacity(7);
@@ -3303,6 +4606,16 @@ fn producer_is_reduction(f: &Fusion) -> bool {
         }
         _ => false,
     }
+}
+
+fn consumer_is_reduction_singleton(f: &Fusion) -> bool {
+    matches!(
+        &f.kind,
+        FusionKind::Single(op_name)
+            if categorize_name(op_name) == OpCategory::Reduction
+                && is_chainable_reduction_op(op_name)
+                && reduction_chain_shape_ok(f)
+    )
 }
 
 /// Check that the consumer's external operands (other than the slot
@@ -3671,6 +4984,9 @@ fn is_chainable_consumer(f: &Fusion) -> bool {
             if chain_safe(op_name) {
                 return true;
             }
+            if categorize_name(op_name) == OpCategory::Reduction {
+                return false;
+            }
             // Heavy singleton — accepted; producer-side gating decides
             // whether the merge actually proceeds.
             let cat = categorize_name(op_name);
@@ -3847,6 +5163,9 @@ fn try_gated_multiply_absorb(
     smem_budget: usize,
     meta: &crate::fusion::ir::ModelMeta,
 ) -> bool {
+    if prefill_tiled_qmm_mode() {
+        return false;
+    }
     let mut consumers_of: HashMap<TensorId, Vec<usize>> = HashMap::new();
     for (idx, slot) in slots.iter().enumerate() {
         let Some(f) = slot else { continue };
@@ -4431,7 +5750,7 @@ fn build_reduction_fanout_tail_chain(
     producer_steps: &[ChainStep],
     gate_step_idx: usize,
     up_step_idx: usize,
-    meta: &crate::fusion::ir::ModelMeta,
+    _meta: &crate::fusion::ir::ModelMeta,
     metadata_fusions: &[Fusion],
 ) -> Option<Fusion> {
     if formula != PointwiseTailFormula::SiluGateUp {
@@ -4446,13 +5765,12 @@ fn build_reduction_fanout_tail_chain(
     }
     let gate = producer_steps.get(gate_step_idx)?;
     let up = producer_steps.get(up_step_idx)?;
-    if head.op_name != "RMSNorm"
-        || gate.op_name != "QuantizedMatmul"
-        || up.op_name != "QuantizedMatmul"
-    {
+    if head.op_name != "RMSNorm" {
         return None;
     }
-    if gate.inputs.len() != 4 || up.inputs.len() != 4 {
+    let quant_pair = gate.op_name == "QuantizedMatmul" && up.op_name == "QuantizedMatmul";
+    let dense_pair = gate.op_name == "Matmul" && up.op_name == "Matmul";
+    if !quant_pair && !dense_pair {
         return None;
     }
     if chain_register_operand(gate, 0) != Some(0) || chain_register_operand(up, 0) != Some(0) {
@@ -4460,28 +5778,32 @@ fn build_reduction_fanout_tail_chain(
     }
     let hidden = *head.output_shape.last()?;
     let out_dim = *gate.output_shape.last()?;
-    if hidden != meta.hidden_size as i32
-        || out_dim != meta.intermediate_size as i32
-        || up.output_shape.last().copied() != Some(out_dim)
-    {
+    if hidden <= 0 || out_dim <= 0 || up.output_shape.last().copied() != Some(out_dim) {
         return None;
     }
     if !matches!(head.op_attrs, Attrs::RmsNorm { .. }) {
         return None;
     }
-    match (gate.op_attrs.clone(), up.op_attrs.clone()) {
-        (
-            Attrs::Quantized {
-                bits: gate_bits,
-                group_size: gate_group,
-            },
-            Attrs::Quantized {
-                bits: up_bits,
-                group_size: up_group,
-            },
-        ) if gate_bits == up_bits && gate_group == up_group => {}
-        _ => return None,
-    };
+    if quant_pair {
+        if gate.inputs.len() != 4 || up.inputs.len() != 4 {
+            return None;
+        }
+        match (gate.op_attrs.clone(), up.op_attrs.clone()) {
+            (
+                Attrs::Quantized {
+                    bits: gate_bits,
+                    group_size: gate_group,
+                },
+                Attrs::Quantized {
+                    bits: up_bits,
+                    group_size: up_group,
+                },
+            ) if gate_bits == up_bits && gate_group == up_group => {}
+            _ => return None,
+        };
+    } else if gate.inputs.len() < 2 || up.inputs.len() < 2 {
+        return None;
+    }
 
     let mut output = consumer.outputs.first()?.clone();
     output.role = "scratch";
@@ -4496,8 +5818,21 @@ fn build_reduction_fanout_tail_chain(
         (FusionKind::FusedChain, FusionAttrs::FusedChain { steps, .. }) => steps,
         _ => return None,
     };
-    if c_steps.len() != 3 {
+    if c_steps.len() < 3 {
         return None;
+    }
+    for (idx, step) in c_steps.iter().enumerate().skip(3) {
+        if !is_chain_absorbable_view(&step.op_name) {
+            return None;
+        }
+        if step.inputs.len() != 1
+            || !matches!(
+                step.inputs[0],
+                ChainOperand::Register { step_index } if step_index == (idx - 1) as u32
+            )
+        {
+            return None;
+        }
     }
     let sigmoid_step = c_steps[0].clone();
     let mul_gate_step = c_steps[1].clone();
@@ -4576,13 +5911,26 @@ fn semantic_silu_gate_up_consumer(
         (FusionKind::FusedChain, FusionAttrs::FusedChain { steps, .. }) => steps,
         _ => return false,
     };
-    if c_steps.len() != 3
+    if c_steps.len() < 3
         || c_steps[0].op_name != "Sigmoid"
         || c_steps[1].op_name != "Multiply"
         || c_steps[2].op_name != "Multiply"
         || consumer.outputs.len() != 1
     {
         return false;
+    }
+    for (idx, step) in c_steps.iter().enumerate().skip(3) {
+        if !is_chain_absorbable_view(&step.op_name) {
+            return false;
+        }
+        if step.inputs.len() != 1
+            || !matches!(
+                step.inputs[0],
+                ChainOperand::Register { step_index } if step_index == (idx - 1) as u32
+            )
+        {
+            return false;
+        }
     }
 
     let cinputs: Vec<TensorId> = consumer.inputs.iter().map(|b| b.source).collect();
@@ -4638,8 +5986,8 @@ fn semantic_silu_gate_up_consumer(
 /// FusedChain absorb path remains opt-in for experimentation.
 fn try_reduction_fanout_pointwise_tail_lowering(
     slots: &mut Vec<Option<Fusion>>,
-    _reg_budget: u32,
-    _smem_budget: usize,
+    reg_budget: u32,
+    smem_budget: usize,
     meta: &crate::fusion::ir::ModelMeta,
 ) -> bool {
     let mut producer_of: HashMap<TensorId, usize> = HashMap::new();
@@ -4692,7 +6040,10 @@ fn try_reduction_fanout_pointwise_tail_lowering(
             continue;
         }
 
-        if p_steps[1].op_name != "QuantizedMatmul" || p_steps[2].op_name != "QuantizedMatmul" {
+        let supported_gate_up_pair = (p_steps[1].op_name == "QuantizedMatmul"
+            && p_steps[2].op_name == "QuantizedMatmul")
+            || (p_steps[1].op_name == "Matmul" && p_steps[2].op_name == "Matmul");
+        if !supported_gate_up_pair {
             continue;
         }
 
@@ -4780,6 +6131,17 @@ fn try_reduction_fanout_pointwise_tail_lowering(
             }
 
             let formula = PointwiseTailFormula::SiluGateUp;
+            if !pointwise_tail_absorb_budget_ok(
+                formula,
+                producer,
+                consumer,
+                p_steps,
+                reg_budget,
+                smem_budget,
+                meta,
+            ) {
+                continue;
+            }
             let metadata_fusions = metadata_set
                 .iter()
                 .filter_map(|&idx| slots[idx].as_ref().cloned())
@@ -4896,36 +6258,125 @@ fn report_swiglu_down_admission(
                 .max(1) as usize;
             let intermediate = intermediate.max(1) as usize;
             let reduce_buf = 32usize * 4;
-            let full_smem = hidden
-                .saturating_mul(4)
-                .saturating_add(intermediate.saturating_mul(4))
+            let norm_smem = hidden.saturating_mul(4);
+            let silu_smem_f32 = intermediate.saturating_mul(4);
+            let silu_smem_dtype =
+                intermediate.saturating_mul(dtype_size_bytes(out.dtype).max(1) as usize);
+            let full_smem_f32 = norm_smem
+                .saturating_add(silu_smem_f32)
                 .saturating_add(reduce_buf);
-            let activation_bytes = shape_elems(&silu_shape)
-                .saturating_mul(dtype_size_bytes(out.dtype))
+            let full_smem_dtype = norm_smem
+                .saturating_add(silu_smem_dtype)
+                .saturating_add(reduce_buf);
+            let activation_write_bytes =
+                shape_elems(&silu_shape).saturating_mul(dtype_size_bytes(out.dtype));
+            let (down_cols_per_sg, down_cols_per_tg, down_tiles, down_quant_bits) =
+                match &consumer.attrs {
+                    FusionAttrs::LinearResidual { quant: Some(q) } => {
+                        let cols_per_sg =
+                            crate::codegen::kernels::linear_residual_qmv_fast_cols_per_simdgroup(
+                                1,
+                                q.bits,
+                                intermediate as u32,
+                                hidden as u32,
+                            ) as u64;
+                        let cols_per_tg =
+                            crate::codegen::kernels::linear_residual_qmv_fast_cols_per_threadgroup(
+                                1,
+                                q.bits,
+                                intermediate as u32,
+                                hidden as u32,
+                            ) as u64;
+                        (
+                            cols_per_sg.max(1),
+                            cols_per_tg.max(1),
+                            (hidden as u64).div_ceil(cols_per_sg.max(1)),
+                            q.bits,
+                        )
+                    }
+                    FusionAttrs::LinearResidual { quant: None } => {
+                        let cols_per_sg = crate::target::current_chip()
+                            .dense_gemv_rows_per_simdgroup(intermediate as u32, hidden as u32)
+                            as u64;
+                        (
+                            cols_per_sg.max(1),
+                            cols_per_sg.max(1),
+                            (hidden as u64).div_ceil(cols_per_sg.max(1)),
+                            0,
+                        )
+                    }
+                    _ => (1, 1, hidden as u64, 0),
+                };
+            let down_activation_read_bytes =
+                activation_write_bytes.saturating_mul(down_tiles.max(1));
+            let current_external_activation_bytes =
+                activation_write_bytes.saturating_add(down_activation_read_bytes);
+
+            let current_parallel_tgs = (hidden as u64).div_ceil(down_cols_per_tg.max(1));
+            let recompute_extra_gateup_weight_bytes = if down_quant_bits > 0 {
+                let bytes_per_weight = down_quant_bits as u64;
+                let gate_up_weight_bits = 2u64
+                    .saturating_mul(hidden as u64)
+                    .saturating_mul(intermediate as u64)
+                    .saturating_mul(bytes_per_weight);
+                let gate_up_weight_bytes = gate_up_weight_bits.div_ceil(8);
+                current_parallel_tgs
+                    .saturating_sub(1)
+                    .saturating_mul(gate_up_weight_bytes)
+            } else {
+                let gate_up_weight_bytes = 2u64
+                    .saturating_mul(hidden as u64)
+                    .saturating_mul(intermediate as u64)
+                    .saturating_mul(2);
+                current_parallel_tgs
+                    .saturating_sub(1)
+                    .saturating_mul(gate_up_weight_bytes)
+            };
+            let usable_tile_smem = smem_budget.saturating_sub(norm_smem.saturating_add(reduce_buf));
+            let tile_k_dtype =
+                (usable_tile_smem / dtype_size_bytes(out.dtype).max(1) as usize).max(1);
+            let partial_tiles = intermediate.div_ceil(tile_k_dtype);
+            let partial_accum_roundtrip_bytes = (partial_tiles as u64)
+                .saturating_mul(hidden as u64)
+                .saturating_mul(4)
                 .saturating_mul(2);
-            let status = if full_smem <= smem_budget {
+
+            let status = if full_smem_f32 <= smem_budget {
                 fit += 1;
-                "fit"
+                "fit_full_f32"
+            } else if full_smem_dtype <= smem_budget {
+                reject += 1;
+                "reject_parallelism"
             } else {
                 reject += 1;
                 "reject_smem"
             };
             eprintln!(
-                "[swiglu-down-admission] {status} producer={p_idx} consumer={c_idx} hidden={hidden} intermediate={intermediate} smem={} budget={} activation_roundtrip={}B reason={}",
-                full_smem,
+                "[swiglu-down-admission] {status} producer={p_idx} consumer={c_idx} hidden={hidden} intermediate={intermediate} quant_bits={down_quant_bits} smem_f32={} smem_dtype={} budget={} current_silu_write={}B down_silu_reads={}B current_external={}B down_cols_per_sg={} down_cols_per_tg={} current_parallel_tgs={} recompute_extra_gateup_weight={}B partial_tile_k={} partial_tiles={} partial_accum_roundtrip={}B reason={}",
+                full_smem_f32,
+                full_smem_dtype,
                 smem_budget,
-                activation_bytes,
-                if full_smem <= smem_budget {
-                    "full_silu_up_can_stay_in_tgmem"
+                activation_write_bytes,
+                down_activation_read_bytes,
+                current_external_activation_bytes,
+                down_cols_per_sg,
+                down_cols_per_tg,
+                current_parallel_tgs,
+                recompute_extra_gateup_weight_bytes,
+                tile_k_dtype,
+                partial_tiles,
+                partial_accum_roundtrip_bytes,
+                if full_smem_f32 <= smem_budget {
+                    "full_silu_up_can_stay_in_tgmem_without_dtype_narrowing"
+                } else if full_smem_dtype <= smem_budget {
+                    "dtype_smem_fits_but_single_tg_would_collapse_down_parallelism"
                 } else {
-                    "full_silu_up_exceeds_tgmem; avoid_gate_up_recompute_per_down_tile"
+                    "full_silu_up_exceeds_tgmem; recompute_or_partial_accum_cost_is_larger_than_saved_activation_traffic"
                 }
             );
         }
     }
-    eprintln!(
-        "[swiglu-down-admission] summary candidates={seen} fit={fit} reject={reject}"
-    );
+    eprintln!("[swiglu-down-admission] summary candidates={seen} fit={fit} reject={reject}");
 }
 
 fn try_weighted_route_reduce(slots: &mut Vec<Option<Fusion>>) -> bool {
