@@ -70,6 +70,7 @@ pub fn emit(
         1
     };
     let accum_rows = rows_per_sg.saturating_mul(2);
+    let use_x_smem = chip.use_gatherqmm_x_smem(k_dim, out_dim, rows_per_sg, active_routes);
 
     w.line(format!(
         "// Fusion #{}: RoutedQmvSwiglu (K={}, routes={}, O={}, experts={}, bits={}, gs={}, rows/sg={})",
@@ -114,6 +115,125 @@ pub fn emit(
     w.line("uint simd_lane  = tid % 32u;");
     w.line("uint simd_id    = tid / 32u;");
     w.line("uint sgs_per_tg = tg_size / 32u;");
+    if use_x_smem {
+        w.line("threadgroup float x_smem[K];");
+        w.line("uint sg0 = gid * sgs_per_tg;");
+        w.line("uint sg_last = sg0 + sgs_per_tg - 1u;");
+        w.line("bool x_smem_ok = sg_last < ACTIVE_ROUTES * ROW_BLOCKS && (sg0 / ROW_BLOCKS) == (sg_last / ROW_BLOCKS);");
+        w.line("if (x_smem_ok) {");
+        w.push_indent();
+        w.line("uint sg = sg0 + simd_id;");
+        w.line("uint route = sg0 / ROW_BLOCKS;");
+        w.line("uint o_base = (sg % ROW_BLOCKS) * ROWS_PER_SG;");
+        w.line("uint slot = route % TOP_K;");
+        w.line("uint tok = (route / TOP_K) % TOKENS;");
+        w.line("uint route_idx = tok * TOP_K + slot;");
+        w.line("uint x_row = uint(row_idx[route_idx]);");
+        w.line("uint expert = min(uint(expert_idx[route_idx]), N_EXPERTS - 1u);");
+        w.line("for (uint k = tid; k < K; k += tg_size) {");
+        w.push_indent();
+        w.line("x_smem[k] = float(x[x_row * K + k]);");
+        w.pop_indent();
+        w.line("}");
+        w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
+        w.line("if (tok >= ACTIVE_TOKENS) return;");
+        for r in 0..rows_per_sg {
+            w.line(format!("float acc_gate{r} = 0.0f;"));
+        }
+        for r in 0..rows_per_sg {
+            w.line(format!("float acc_up{r} = 0.0f;"));
+        }
+        if rows_per_sg == 1 {
+            crate::codegen::kernels::emit_int4_gemv_inner(
+                w,
+                "acc_gate0",
+                "gate_w + (expert * O + o_base) * PACKED",
+                "gate_s + (expert * O + o_base) * N_GROUPS",
+                "gate_b + (expert * O + o_base) * N_GROUPS",
+                "K",
+                gate.bits,
+                gate.group_size,
+                |off| format!("x_smem[{off}]"),
+            );
+            crate::codegen::kernels::emit_int4_gemv_inner(
+                w,
+                "acc_up0",
+                "up_w + (expert * O + o_base) * PACKED",
+                "up_s + (expert * O + o_base) * N_GROUPS",
+                "up_b + (expert * O + o_base) * N_GROUPS",
+                "K",
+                gate.bits,
+                gate.group_size,
+                |off| format!("x_smem[{off}]"),
+            );
+        } else {
+            crate::codegen::kernels::emit_int4_gemv_inner_multirow(
+                w,
+                |r| {
+                    if r < rows_per_sg {
+                        format!("acc_gate{r}")
+                    } else {
+                        format!("acc_up{}", r - rows_per_sg)
+                    }
+                },
+                |r| {
+                    if r < rows_per_sg {
+                        format!("gate_w + (expert * O + (o_base + {r}u)) * PACKED")
+                    } else {
+                        format!(
+                            "up_w + (expert * O + (o_base + {}u)) * PACKED",
+                            r - rows_per_sg
+                        )
+                    }
+                },
+                |r| {
+                    if r < rows_per_sg {
+                        format!("gate_s + (expert * O + (o_base + {r}u)) * N_GROUPS")
+                    } else {
+                        format!(
+                            "up_s + (expert * O + (o_base + {}u)) * N_GROUPS",
+                            r - rows_per_sg
+                        )
+                    }
+                },
+                |r| {
+                    if r < rows_per_sg {
+                        format!("gate_b + (expert * O + (o_base + {r}u)) * N_GROUPS")
+                    } else {
+                        format!(
+                            "up_b + (expert * O + (o_base + {}u)) * N_GROUPS",
+                            r - rows_per_sg
+                        )
+                    }
+                },
+                "K",
+                gate.bits,
+                gate.group_size,
+                accum_rows,
+                |off| format!("x_smem[{off}]"),
+            );
+        }
+        for r in 0..rows_per_sg {
+            w.line(format!("acc_gate{r} = simd_sum(acc_gate{r});"));
+            w.line(format!("acc_up{r} = simd_sum(acc_up{r});"));
+        }
+        w.line("if (simd_lane != 0u) return;");
+        for r in 0..rows_per_sg {
+            w.line(format!("if (o_base + {r}u < O) {{"));
+            w.push_indent();
+            w.line(format!("float g{r} = float({t}(acc_gate{r}));"));
+            w.line(format!("float u{r} = float({t}(acc_up{r}));"));
+            w.line(format!("float sig{r} = 1.0f / (1.0f + exp(-g{r}));"));
+            w.line(format!(
+                "out0[route * O + o_base + {r}u] = {out_t}((sig{r} * g{r}) * u{r});"
+            ));
+            w.pop_indent();
+            w.line("}");
+        }
+        w.pop_indent();
+        w.line("} else {");
+        w.push_indent();
+    }
     w.line("uint sg = gid * sgs_per_tg + simd_id;");
     w.line("if (sg >= ACTIVE_ROUTES * ROW_BLOCKS) return;");
     w.line("uint route = sg / ROW_BLOCKS;");
@@ -214,6 +334,10 @@ pub fn emit(
         w.line(format!(
             "out0[route * O + o_base + {r}u] = {out_t}((sig{r} * g{r}) * u{r});"
         ));
+        w.pop_indent();
+        w.line("}");
+    }
+    if use_x_smem {
         w.pop_indent();
         w.line("}");
     }
