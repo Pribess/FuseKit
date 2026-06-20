@@ -306,6 +306,24 @@ enum PointwiseTailFormula {
     SiluGateUp,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PointwiseTailRole {
+    Gate,
+    Up,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PointwiseTailSource<'a> {
+    role: PointwiseTailRole,
+    aliases: &'a HashSet<TensorId>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PointwiseTailMatch {
+    formula: PointwiseTailFormula,
+    consumer_idx: usize,
+}
+
 fn pointwise_tail_absorb_budget_ok(
     formula: PointwiseTailFormula,
     producer: &Fusion,
@@ -343,55 +361,40 @@ fn pointwise_tail_absorb_budget_ok(
     if producer_steps.len() < 3 || producer.outputs.len() < 2 {
         return false;
     }
-    let gate = &producer.outputs[0];
-    let Some((&out_dim, row_dims)) = gate.shape.split_last() else {
-        return false;
-    };
-    if out_dim <= 0 {
-        return false;
+
+    // This pass attaches a pointwise tail to a reduction-fanout producer
+    // that already computes the heavy sibling projections in one kernel.
+    // Unlike a standalone qMV-pair absorb, it does not serialize extra
+    // heavy work; it removes the producer's gate/up materialization plus
+    // the separate pointwise-tail dispatch. Once register and SMEM budgets
+    // pass, the generic dataflow merge is the right default.
+    if dbg_budget {
+        let gate = &producer.outputs[0];
+        if let Some((&out_dim, row_dims)) = gate.shape.split_last() {
+            let rows = shape_elems(row_dims);
+            let activation_bytes = rows
+                .saturating_mul(out_dim.max(1) as u64)
+                .saturating_mul(dtype_size_bytes(gate.dtype));
+            let dram_saved = match formula {
+                PointwiseTailFormula::SiluGateUp => activation_bytes.saturating_mul(5),
+            };
+            let heavy_stream = producer_steps
+                .iter()
+                .skip(1)
+                .take(2)
+                .map(|s| step_external_nbytes(producer, s, true))
+                .sum::<u64>()
+                .saturating_mul(rows);
+            eprintln!(
+                "[budget] pointwise-tail absorb accept: formula={formula:?} saved={:.3}MiB heavy_stream={:.3}MiB rows={} out_dim={}",
+                dram_saved as f64 / (1024.0 * 1024.0),
+                heavy_stream as f64 / (1024.0 * 1024.0),
+                rows,
+                out_dim
+            );
+        }
     }
-    let rows = shape_elems(row_dims);
-    let activation_bytes = rows
-        .saturating_mul(out_dim as u64)
-        .saturating_mul(dtype_size_bytes(gate.dtype));
-
-    // Baseline SiluGateUp writes gate/up, then the standalone tail reads
-    // gate twice and up once. The final tail output write remains in
-    // both plans, so it is not saved.
-    let dram_saved = match formula {
-        PointwiseTailFormula::SiluGateUp => activation_bytes.saturating_mul(5),
-    };
-
-    // Absorbing gate/up makes each simdgroup compute both heavy
-    // projections serially. That can win only if the saved activation
-    // traffic is non-trivial next to the heavy operands that still must
-    // be streamed. Otherwise we reduce dispatch count while hurting
-    // occupancy/ILP, which Qwen2.5 0.5B 4bit showed clearly in bench.
-    let heavy_stream = producer_steps
-        .iter()
-        .skip(1)
-        .take(2)
-        .map(|s| step_external_nbytes(producer, s, true))
-        .sum::<u64>()
-        .saturating_mul(rows);
-
-    // Require saved activation traffic to be either absolutely large
-    // enough to matter as a full DRAM round-trip, or at least 12.5% of
-    // the heavy stream. The ratio gate alone rejects large 4B-class
-    // decode MLPs because their q-weight stream is huge, even though
-    // the absorbed SwiGLU avoids a substantial 9K-wide activation
-    // write/read and wins end-to-end.
-    let ok = dram_saved >= 512 * 1024 || dram_saved.saturating_mul(8) >= heavy_stream;
-    if !ok && dbg_budget {
-        eprintln!(
-            "[budget] pointwise-tail absorb reject: formula={formula:?} saved={:.3}MiB heavy_stream={:.3}MiB rows={} out_dim={}",
-            dram_saved as f64 / (1024.0 * 1024.0),
-            heavy_stream as f64 / (1024.0 * 1024.0),
-            rows,
-            out_dim
-        );
-    }
-    ok
+    true
 }
 
 /// Run the general fusion pass. Returns a (possibly) rewritten
@@ -470,11 +473,15 @@ pub fn run(mut fg: FusionGraph, target: &Target, graph: &crate::graph::Graph) ->
     if std::env::var("FUSEKIT_QKV_DECODE_SINK").as_deref() != Ok("0") {
         while try_qkv_decode_sink(&mut slots, graph) {}
     }
-    if std::env::var("FUSEKIT_QMV_SWIGLU_ABSORB").as_deref() != Ok("0") {
-        while try_qmv_swiglu_absorb(&mut slots, reg_budget) {}
+    if std::env::var("FUSEKIT_QMV_POINTWISE_TAIL_ABSORB").as_deref() != Ok("0")
+        && std::env::var("FUSEKIT_QMV_SWIGLU_ABSORB").as_deref() != Ok("0")
+    {
+        while try_qmv_fanout_pointwise_tail_absorb(&mut slots, reg_budget) {}
     }
-    if std::env::var("FUSEKIT_ROUTED_QMV_SWIGLU_ABSORB").as_deref() != Ok("0") {
-        while try_routed_qmv_swiglu_absorb(&mut slots, reg_budget, graph) {}
+    if std::env::var("FUSEKIT_ROUTED_QMV_POINTWISE_TAIL_ABSORB").as_deref() != Ok("0")
+        && std::env::var("FUSEKIT_ROUTED_QMV_SWIGLU_ABSORB").as_deref() != Ok("0")
+    {
+        while try_routed_qmv_fanout_pointwise_tail_absorb(&mut slots, reg_budget, graph) {}
     }
     // Custom-kernel sigmoid input absorb: if a pointwise Sigmoid only
     // exists to feed one CustomKernel input, rewrite that custom
@@ -2482,7 +2489,18 @@ fn materialized_norm_q8_swiglu_candidate(
             let Some(consumer) = slots[c_idx].as_ref() else {
                 continue;
             };
-            if !semantic_silu_gate_up_consumer(consumer, &gate_aliases, &up_aliases)
+            let sources = [
+                PointwiseTailSource {
+                    role: PointwiseTailRole::Gate,
+                    aliases: &gate_aliases,
+                },
+                PointwiseTailSource {
+                    role: PointwiseTailRole::Up,
+                    aliases: &up_aliases,
+                },
+            ];
+            if pointwise_tail_chain_formula(consumer, &sources)
+                != Some(PointwiseTailFormula::SiluGateUp)
                 && semantic_silu_gate_up_raw_tail(
                     slots,
                     consumers_of,
@@ -3885,7 +3903,7 @@ fn routed_row_index_equivalent(graph: &Graph, a: &FusionBoundary, b: &FusionBoun
     a_len == b_len && a_len == token_dim
 }
 
-fn try_routed_qmv_swiglu_absorb(
+fn try_routed_qmv_fanout_pointwise_tail_absorb(
     slots: &mut Vec<Option<Fusion>>,
     reg_budget: u32,
     graph: &Graph,
@@ -3948,33 +3966,30 @@ fn try_routed_qmv_swiglu_absorb(
                 .chain(up_metadata.iter())
                 .copied()
                 .collect();
-            let alias_consumers = |aliases: &HashSet<TensorId>| -> HashSet<usize> {
-                let mut set = HashSet::new();
-                for alias in aliases {
-                    for c_idx in consumers_of.get(alias).cloned().unwrap_or_default() {
-                        if c_idx == gate_idx || c_idx == up_idx || metadata_set.contains(&c_idx) {
-                            continue;
-                        }
-                        set.insert(c_idx);
-                    }
-                }
-                set
-            };
-            let gate_cons = alias_consumers(&gate_aliases);
-            let up_cons = alias_consumers(&up_aliases);
-            if gate_cons.len() != 1 || up_cons.len() != 1 {
-                continue;
-            }
-            let c_idx = *gate_cons.iter().next().expect("checked len");
-            if !up_cons.contains(&c_idx) {
-                continue;
-            }
-            let Some(consumer) = slots[c_idx].as_ref() else {
+            let ignored = HashSet::from([gate_idx, up_idx]);
+            let sources = [
+                PointwiseTailSource {
+                    role: PointwiseTailRole::Gate,
+                    aliases: &gate_aliases,
+                },
+                PointwiseTailSource {
+                    role: PointwiseTailRole::Up,
+                    aliases: &up_aliases,
+                },
+            ];
+            let Some(tail) = collect_pointwise_tail_formula(
+                slots,
+                &consumers_of,
+                &sources,
+                &ignored,
+                &metadata_set,
+            ) else {
                 continue;
             };
-            if !semantic_silu_gate_up_consumer(consumer, &gate_aliases, &up_aliases) {
+            if tail.formula != PointwiseTailFormula::SiluGateUp {
                 continue;
             }
+            let c_idx = tail.consumer_idx;
 
             let mut metadata_isolated = true;
             for &m_idx in &metadata_set {
@@ -4245,7 +4260,10 @@ fn try_routed_qmv_reduce_absorb(slots: &mut Vec<Option<Fusion>>, reg_budget: u32
     false
 }
 
-fn try_qmv_swiglu_absorb(slots: &mut Vec<Option<Fusion>>, reg_budget: u32) -> bool {
+fn try_qmv_fanout_pointwise_tail_absorb(
+    slots: &mut Vec<Option<Fusion>>,
+    reg_budget: u32,
+) -> bool {
     let dbg = std::env::var_os("FUSEKIT_QMV_SWIGLU_ABSORB_DEBUG").is_some();
     let mut consumers_of: HashMap<TensorId, Vec<usize>> = HashMap::new();
     for (idx, slot) in slots.iter().enumerate() {
@@ -4298,27 +4316,30 @@ fn try_qmv_swiglu_absorb(slots: &mut Vec<Option<Fusion>>, reg_budget: u32) -> bo
                 .chain(up_metadata.iter())
                 .copied()
                 .collect();
-            let alias_consumers = |aliases: &HashSet<TensorId>| -> HashSet<usize> {
-                let mut set = HashSet::new();
-                for alias in aliases {
-                    for c_idx in consumers_of.get(alias).cloned().unwrap_or_default() {
-                        if c_idx == p_idx || metadata_set.contains(&c_idx) {
-                            continue;
-                        }
-                        set.insert(c_idx);
-                    }
-                }
-                set
+            let ignored = HashSet::from([p_idx]);
+            let sources = [
+                PointwiseTailSource {
+                    role: PointwiseTailRole::Gate,
+                    aliases: &gate_aliases,
+                },
+                PointwiseTailSource {
+                    role: PointwiseTailRole::Up,
+                    aliases: &up_aliases,
+                },
+            ];
+            let Some(tail) = collect_pointwise_tail_formula(
+                slots,
+                &consumers_of,
+                &sources,
+                &ignored,
+                &metadata_set,
+            ) else {
+                continue;
             };
-            let gate_cons = alias_consumers(&gate_aliases);
-            let up_cons = alias_consumers(&up_aliases);
-            if gate_cons.len() != 1 || up_cons.len() != 1 {
+            if tail.formula != PointwiseTailFormula::SiluGateUp {
                 continue;
             }
-            let c_idx = *gate_cons.iter().next().unwrap();
-            if !up_cons.contains(&c_idx) || c_idx == p_idx {
-                continue;
-            }
+            let c_idx = tail.consumer_idx;
 
             let mut metadata_isolated = true;
             for &m_idx in &metadata_set {
@@ -4342,13 +4363,6 @@ fn try_qmv_swiglu_absorb(slots: &mut Vec<Option<Fusion>>, reg_budget: u32) -> bo
                 }
             }
             if !metadata_isolated {
-                continue;
-            }
-
-            let Some(consumer) = slots[c_idx].as_ref() else {
-                continue;
-            };
-            if !semantic_silu_gate_up_consumer(consumer, &gate_aliases, &up_aliases) {
                 continue;
             }
 
@@ -5902,26 +5916,37 @@ fn build_reduction_fanout_tail_chain(
     })
 }
 
-fn semantic_silu_gate_up_consumer(
+fn pointwise_tail_aliases<'a>(
+    sources: &'a [PointwiseTailSource<'a>],
+    role: PointwiseTailRole,
+) -> Option<&'a HashSet<TensorId>> {
+    sources
+        .iter()
+        .find(|source| source.role == role)
+        .map(|source| source.aliases)
+}
+
+fn pointwise_tail_chain_formula(
     consumer: &Fusion,
-    gate_aliases: &HashSet<TensorId>,
-    up_aliases: &HashSet<TensorId>,
-) -> bool {
+    sources: &[PointwiseTailSource<'_>],
+) -> Option<PointwiseTailFormula> {
     let c_steps = match (&consumer.kind, &consumer.attrs) {
         (FusionKind::FusedChain, FusionAttrs::FusedChain { steps, .. }) => steps,
-        _ => return false,
+        _ => return None,
     };
+    pointwise_tail_aliases(sources, PointwiseTailRole::Gate)?;
+    pointwise_tail_aliases(sources, PointwiseTailRole::Up)?;
     if c_steps.len() < 3
         || c_steps[0].op_name != "Sigmoid"
         || c_steps[1].op_name != "Multiply"
         || c_steps[2].op_name != "Multiply"
         || consumer.outputs.len() != 1
     {
-        return false;
+        return None;
     }
     for (idx, step) in c_steps.iter().enumerate().skip(3) {
         if !is_chain_absorbable_view(&step.op_name) {
-            return false;
+            return None;
         }
         if step.inputs.len() != 1
             || !matches!(
@@ -5929,12 +5954,15 @@ fn semantic_silu_gate_up_consumer(
                 ChainOperand::Register { step_index } if step_index == (idx - 1) as u32
             )
         {
-            return false;
+            return None;
         }
     }
 
     let cinputs: Vec<TensorId> = consumer.inputs.iter().map(|b| b.source).collect();
-    let resolves_to_alias = |op: ChainOperand, aliases: &HashSet<TensorId>| -> bool {
+    let resolves_to_role = |op: ChainOperand, role: PointwiseTailRole| -> bool {
+        let Some(aliases) = pointwise_tail_aliases(sources, role) else {
+            return false;
+        };
         match op {
             ChainOperand::External { buffer_index } => cinputs
                 .get(buffer_index as usize)
@@ -5944,10 +5972,10 @@ fn semantic_silu_gate_up_consumer(
     };
 
     let Some(sig_input) = c_steps[0].inputs.first().copied() else {
-        return false;
+        return None;
     };
-    if !resolves_to_alias(sig_input, gate_aliases) {
-        return false;
+    if !resolves_to_role(sig_input, PointwiseTailRole::Gate) {
+        return None;
     }
 
     let mul1_ok = match (
@@ -5955,29 +5983,73 @@ fn semantic_silu_gate_up_consumer(
         c_steps[1].inputs.get(1).copied(),
     ) {
         (Some(ChainOperand::Register { step_index: 0 }), Some(x)) => {
-            resolves_to_alias(x, gate_aliases)
+            resolves_to_role(x, PointwiseTailRole::Gate)
         }
         (Some(x), Some(ChainOperand::Register { step_index: 0 })) => {
-            resolves_to_alias(x, gate_aliases)
+            resolves_to_role(x, PointwiseTailRole::Gate)
         }
         _ => false,
     };
     if !mul1_ok {
-        return false;
+        return None;
     }
 
-    match (
+    let mul2_ok = match (
         c_steps[2].inputs.first().copied(),
         c_steps[2].inputs.get(1).copied(),
     ) {
         (Some(ChainOperand::Register { step_index: 1 }), Some(x)) => {
-            resolves_to_alias(x, up_aliases)
+            resolves_to_role(x, PointwiseTailRole::Up)
         }
         (Some(x), Some(ChainOperand::Register { step_index: 1 })) => {
-            resolves_to_alias(x, up_aliases)
+            resolves_to_role(x, PointwiseTailRole::Up)
         }
         _ => false,
+    };
+    if !mul2_ok {
+        return None;
     }
+
+    Some(PointwiseTailFormula::SiluGateUp)
+}
+
+fn collect_pointwise_tail_formula(
+    slots: &[Option<Fusion>],
+    consumers_of: &HashMap<TensorId, Vec<usize>>,
+    sources: &[PointwiseTailSource<'_>],
+    ignored: &HashSet<usize>,
+    metadata_set: &HashSet<usize>,
+) -> Option<PointwiseTailMatch> {
+    let direct_consumers = |aliases: &HashSet<TensorId>| -> HashSet<usize> {
+        let mut out = HashSet::new();
+        for alias in aliases {
+            for idx in consumers_of.get(alias).cloned().unwrap_or_default() {
+                if ignored.contains(&idx) || metadata_set.contains(&idx) {
+                    continue;
+                }
+                out.insert(idx);
+            }
+        }
+        out
+    };
+
+    let gate_aliases = pointwise_tail_aliases(sources, PointwiseTailRole::Gate)?;
+    let up_aliases = pointwise_tail_aliases(sources, PointwiseTailRole::Up)?;
+    let gate_consumers = direct_consumers(gate_aliases);
+    let up_consumers = direct_consumers(up_aliases);
+    if gate_consumers.len() != 1 || up_consumers.len() != 1 {
+        return None;
+    }
+    let consumer_idx = *gate_consumers.iter().next()?;
+    if !up_consumers.contains(&consumer_idx) {
+        return None;
+    }
+    let consumer = slots.get(consumer_idx).and_then(|slot| slot.as_ref())?;
+    let formula = pointwise_tail_chain_formula(consumer, sources)?;
+    Some(PointwiseTailMatch {
+        formula,
+        consumer_idx,
+    })
 }
 
 /// Recognize a reduction-fanout producer plus pointwise tail as a
@@ -6067,31 +6139,32 @@ fn try_reduction_fanout_pointwise_tail_lowering(
                 .copied()
                 .collect();
 
-            let alias_consumers = |aliases: &HashSet<TensorId>| -> HashSet<usize> {
-                let mut set = HashSet::new();
-                for alias in aliases {
-                    for c_idx in consumers_of.get(alias).cloned().unwrap_or_default() {
-                        if c_idx == p_idx || metadata_set.contains(&c_idx) {
-                            continue;
-                        }
-                        set.insert(c_idx);
-                    }
-                }
-                set
+            let ignored = HashSet::from([p_idx]);
+            let sources = [
+                PointwiseTailSource {
+                    role: PointwiseTailRole::Gate,
+                    aliases: &gate_aliases,
+                },
+                PointwiseTailSource {
+                    role: PointwiseTailRole::Up,
+                    aliases: &up_aliases,
+                },
+            ];
+            let Some(tail) = collect_pointwise_tail_formula(
+                slots,
+                &consumers_of,
+                &sources,
+                &ignored,
+                &metadata_set,
+            ) else {
+                continue;
             };
-            let gate_set = alias_consumers(&gate_aliases);
-            let up_set = alias_consumers(&up_aliases);
+            let c_idx = tail.consumer_idx;
+            let formula = tail.formula;
             if dbg {
                 eprintln!(
-                    "[pointwise-tail]   gate_out={gate_out_idx} up_out={up_out_idx} gate_t={gate_t} up_t={up_t} gate_aliases={gate_aliases:?} up_aliases={up_aliases:?} gate_set={gate_set:?} up_set={up_set:?}"
+                    "[pointwise-tail]   gate_out={gate_out_idx} up_out={up_out_idx} gate_t={gate_t} up_t={up_t} gate_aliases={gate_aliases:?} up_aliases={up_aliases:?} formula={formula:?} consumer={c_idx}"
                 );
-            }
-            if gate_set.len() != 1 || up_set.len() != 1 {
-                continue;
-            }
-            let c_idx = *gate_set.iter().next().unwrap();
-            if !up_set.contains(&c_idx) || c_idx == p_idx {
-                continue;
             }
 
             // The metadata views we plan to drop must only feed the final
@@ -6126,11 +6199,7 @@ fn try_reduction_fanout_pointwise_tail_lowering(
                 Some(f) => f,
                 None => continue,
             };
-            if !semantic_silu_gate_up_consumer(consumer, &gate_aliases, &up_aliases) {
-                continue;
-            }
 
-            let formula = PointwiseTailFormula::SiluGateUp;
             if !pointwise_tail_absorb_budget_ok(
                 formula,
                 producer,

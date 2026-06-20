@@ -2196,3 +2196,68 @@ table came mostly from the raw oMLX baseline moving upward:
 FuseKit itself was roughly flat/slightly up versus the earlier table; raw oMLX
 reran materially faster, especially at L32. Treat the earlier `-0.1%` as a
 stale/low raw baseline, not as a regression-free current comparison.
+
+## Generic Pointwise-Tail Admission
+
+Checkpoint before this work:
+
+- `f415c4a Checkpoint general fusion optimization state`
+
+Goal:
+
+- Stop admitting Qwen/DeepSeek SwiGLU-like wins through direct named consumer
+  checks. Use graph metadata to collect heavy-output aliases and a pointwise
+  tail formula, then lower supported formulas through the existing fast emitter.
+
+Implemented:
+
+- Added `PointwiseTailSource`, `PointwiseTailRole`, and `PointwiseTailMatch`.
+- Replaced direct `try_qmv_swiglu_absorb` / `try_routed_qmv_swiglu_absorb`
+  admission with:
+  - `try_qmv_fanout_pointwise_tail_absorb`
+  - `try_routed_qmv_fanout_pointwise_tail_absorb`
+- Replaced direct reduction-fanout consumer checks with
+  `collect_pointwise_tail_formula`.
+- Removed the direct `semantic_silu_gate_up_consumer` helper. The remaining
+  tail match is expressed as a formula returned by the collector.
+- Kept lowering compatibility with existing fast emitters. This is not a new
+  model-name pattern; the current supported formula is still
+  `SiluGateUp`, selected from op/dataflow/alias metadata.
+
+Important cost-model fix:
+
+- `pointwise_tail_absorb_budget_ok` was rejecting Qwen small-model MLP tails
+  because it compared saved activation traffic against quantized weight stream.
+  That was the wrong model for reduction-fanout tails: the producer already
+  computes both heavy projections in one kernel, so attaching the pointwise tail
+  does not serialize new heavy work. After reg/SMEM checks pass, the merge
+  removes gate/up materialization and a standalone pointwise dispatch.
+
+Patch artifacts:
+
+| Model | Patterns | Tasks | Fallback | Notable fused path |
+| --- | --- | ---: | ---: | --- |
+| Qwen2.5-Coder-0.5B-Instruct-4bit | off | 364 | 0% | 24 reduction-fanout MLP tails absorbed |
+| DeepSeek-Coder-V2-Lite-Instruct-4bit-mlx | off | 1720 | 0% | 26 `RoutedQmvSwiglu`, 26 dense `QmvSwiglu` |
+
+Correctness:
+
+| Model | Check | Result |
+| --- | --- | --- |
+| Qwen2.5-Coder-0.5B-Instruct-4bit | raw vs patched decode logits | same argmax, top-5 preserved, max abs 0.0327148, mean abs 0.00475509 |
+
+Bench, Qwen2.5-Coder-0.5B-Instruct-4bit, raw first, warmup discarded:
+
+| Tokens | Raw TPS | FuseKit TPS | Delta | Peak raw | Peak FuseKit |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 32 | 147.270 | 257.725 | +75.0% | 0.289 GB | 0.357 GB |
+| 512 | 285.860 | 295.054 | +3.2% | 0.299 GB | 0.350 GB |
+
+Interpretation:
+
+- The Qwen win is now coming from the general reduction-fanout + pointwise-tail
+  collector, not from `src/fusion/patterns/*`.
+- This is still a staged generalization: the collector is generic over aliases
+  and pointwise formula, while the only fast lowered formula today is
+  `SiluGateUp`. Extending the formula enum and emitter hooks is the next step
+  for non-SwiGLU pointwise tails.
