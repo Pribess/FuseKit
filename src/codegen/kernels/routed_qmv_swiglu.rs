@@ -26,13 +26,19 @@ pub fn emit(
     if !matches!(fusion.kind, FusionKind::RoutedQmvSwiglu) {
         bail!("RoutedQmvSwiglu emitter called for non-RoutedQmvSwiglu fusion");
     }
-    let FusionAttrs::RoutedQmvSwiglu { gate, up } = fusion.attrs else {
+    let FusionAttrs::RoutedQmvSwiglu {
+        gate,
+        up,
+        pre_scale_route_weight,
+    } = fusion.attrs
+    else {
         bail!("RoutedQmvSwiglu attrs missing");
     };
     if !compatible(gate, up) {
         bail!("RoutedQmvSwiglu gate/up target mismatch");
     }
-    if fusion.inputs.len() != 9 || fusion.outputs.len() != 1 {
+    let expected_inputs = if pre_scale_route_weight { 10 } else { 9 };
+    if fusion.inputs.len() != expected_inputs || fusion.outputs.len() != 1 {
         bail!("RoutedQmvSwiglu malformed inputs/outputs");
     }
 
@@ -72,6 +78,99 @@ pub fn emit(
     let accum_rows = rows_per_sg.saturating_mul(2);
     let use_x_smem = chip.use_gatherqmm_x_smem(k_dim, out_dim, rows_per_sg, active_routes);
 
+    if out_t == t && crate::codegen::kernels::routed_qmv_swiglu_fast_shape(fusion).is_some() {
+        let qmv_sgs = crate::codegen::kernels::qmv_fast_simdgroups(1, gate.bits, k_dim, out_dim);
+        let qmv_cols_per_sg =
+            crate::codegen::kernels::qmv_fast_cols_per_simdgroup(1, gate.bits, k_dim, out_dim);
+        w.line(format!(
+            "// Fusion #{}: RoutedQmvSwiglu fast qMV (K={}, routes={}, O={}, experts={}, bits={}, gs={}, sgs={}, cols/sg={})",
+            fusion.id,
+            k_dim,
+            active_routes,
+            out_dim,
+            n_experts,
+            gate.bits,
+            gate.group_size,
+            qmv_sgs,
+            qmv_cols_per_sg
+        ));
+        w.line(format!("kernel void {fn_name}("));
+        w.push_indent();
+        w.line(format!("device const {t} *x [[buffer(0)]],"));
+        w.line("device const uint *gate_w [[buffer(1)]],");
+        w.line(format!("device const {t} *gate_s [[buffer(2)]],"));
+        w.line(format!("device const {t} *gate_b [[buffer(3)]],"));
+        w.line("device const uint *up_w [[buffer(4)]],");
+        w.line(format!("device const {t} *up_s [[buffer(5)]],"));
+        w.line(format!("device const {t} *up_b [[buffer(6)]],"));
+        w.line("device const uint *row_idx [[buffer(7)]],");
+        w.line("device const uint *expert_idx [[buffer(8)]],");
+        if pre_scale_route_weight {
+            w.line(format!("device const {t} *route_weight [[buffer(9)]],"));
+            w.line(format!("device {out_t} *out0 [[buffer(10)]],"));
+        } else {
+            w.line(format!("device {out_t} *out0 [[buffer(9)]],"));
+        }
+        w.line("uint3 tgid [[threadgroup_position_in_grid]],");
+        w.line("uint simd_gid [[simdgroup_index_in_threadgroup]],");
+        w.line("uint simd_lid [[thread_index_in_simdgroup]]");
+        w.pop_indent();
+        w.line(") {");
+        w.push_indent();
+        w.line("#if FUSEKIT_HAVE_MLX_NAX");
+        w.push_indent();
+        w.line(format!("constexpr int K = {k_dim};"));
+        w.line(format!("constexpr int O = {out_dim};"));
+        w.line(format!("constexpr uint N_EXPERTS = {n_experts};"));
+        w.line(format!("constexpr uint PACKED = {packed};"));
+        w.line(format!("constexpr uint N_GROUPS = {n_groups};"));
+        w.line(format!("constexpr uint TOKENS = {tokens};"));
+        w.line(format!("constexpr uint ACTIVE_TOKENS = {active_tokens};"));
+        w.line(format!("constexpr uint TOP_K = {top_k};"));
+        w.line(format!("constexpr uint ACTIVE_ROUTES = {active_routes};"));
+        w.line("uint route = tgid.x;");
+        w.line("if (route >= ACTIVE_ROUTES) return;");
+        w.line("uint slot = route % TOP_K;");
+        w.line("uint tok = (route / TOP_K) % TOKENS;");
+        w.line("if (tok >= ACTIVE_TOKENS) return;");
+        w.line("uint route_idx = tok * TOP_K + slot;");
+        w.line("uint x_row = uint(row_idx[route_idx]);");
+        w.line("uint expert = min(uint(expert_idx[route_idx]), N_EXPERTS - 1u);");
+        if pre_scale_route_weight {
+            w.line("float y_scale = float(route_weight[route_idx]);");
+        } else {
+            w.line("float y_scale = 1.0f;");
+        }
+        w.line("uint3 local_tid = uint3(0u, tgid.y, 0u);");
+        w.writeln(format_args!(
+            "fusekit_qmv_swiglu_pair_m_impl<{t}, {}, {}, {}, {}, 1>(",
+            gate.group_size, gate.bits, qmv_sgs, qmv_cols_per_sg
+        ));
+        w.push_indent();
+        w.line("gate_w + expert * O * PACKED,");
+        w.line("gate_s + expert * O * N_GROUPS,");
+        w.line("gate_b + expert * O * N_GROUPS,");
+        w.line("up_w + expert * O * PACKED,");
+        w.line("up_s + expert * O * N_GROUPS,");
+        w.line("up_b + expert * O * N_GROUPS,");
+        w.line("x + x_row * K,");
+        w.line("out0 + route * O,");
+        w.line("y_scale, K, O, 1, local_tid, simd_gid, simd_lid);");
+        w.pop_indent();
+        w.pop_indent();
+        w.line("#else");
+        w.push_indent();
+        w.line(
+            "static_assert(FUSEKIT_HAVE_MLX_NAX, \"FuseKit RoutedQmvSwiglu fast qMV requires MLX Metal headers\");",
+        );
+        w.pop_indent();
+        w.line("#endif");
+        w.pop_indent();
+        w.line("}");
+        w.blank();
+        return Ok(());
+    }
+
     w.line(format!(
         "// Fusion #{}: RoutedQmvSwiglu (K={}, routes={}, O={}, experts={}, bits={}, gs={}, rows/sg={})",
         fusion.id,
@@ -94,7 +193,12 @@ pub fn emit(
     w.line(format!("device const {t} *up_b [[buffer(6)]],"));
     w.line("device const uint *row_idx [[buffer(7)]],");
     w.line("device const uint *expert_idx [[buffer(8)]],");
-    w.line(format!("device {out_t} *out0 [[buffer(9)]],"));
+    if pre_scale_route_weight {
+        w.line(format!("device const {t} *route_weight [[buffer(9)]],"));
+        w.line(format!("device {out_t} *out0 [[buffer(10)]],"));
+    } else {
+        w.line(format!("device {out_t} *out0 [[buffer(9)]],"));
+    }
     w.line("uint tid [[thread_position_in_threadgroup]],");
     w.line("uint tg_size [[threads_per_threadgroup]],");
     w.line("uint gid [[threadgroup_position_in_grid]]");
@@ -116,7 +220,7 @@ pub fn emit(
     w.line("uint simd_id    = tid / 32u;");
     w.line("uint sgs_per_tg = tg_size / 32u;");
     if use_x_smem {
-        w.line("threadgroup float x_smem[K];");
+        w.line(format!("threadgroup {t} x_smem[K];"));
         w.line("uint sg0 = gid * sgs_per_tg;");
         w.line("uint sg_last = sg0 + sgs_per_tg - 1u;");
         w.line("bool x_smem_ok = sg_last < ACTIVE_ROUTES * ROW_BLOCKS && (sg0 / ROW_BLOCKS) == (sg_last / ROW_BLOCKS);");
@@ -132,7 +236,7 @@ pub fn emit(
         w.line("uint expert = min(uint(expert_idx[route_idx]), N_EXPERTS - 1u);");
         w.line("for (uint k = tid; k < K; k += tg_size) {");
         w.push_indent();
-        w.line("x_smem[k] = float(x[x_row * K + k]);");
+        w.line("x_smem[k] = x[x_row * K + k];");
         w.pop_indent();
         w.line("}");
         w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
@@ -144,27 +248,20 @@ pub fn emit(
             w.line(format!("float acc_up{r} = 0.0f;"));
         }
         if rows_per_sg == 1 {
-            crate::codegen::kernels::emit_int4_gemv_inner(
+            crate::codegen::kernels::emit_int4_gemv_inner_pair(
                 w,
                 "acc_gate0",
+                "acc_up0",
                 "gate_w + (expert * O + o_base) * PACKED",
                 "gate_s + (expert * O + o_base) * N_GROUPS",
                 "gate_b + (expert * O + o_base) * N_GROUPS",
-                "K",
-                gate.bits,
-                gate.group_size,
-                |off| format!("x_smem[{off}]"),
-            );
-            crate::codegen::kernels::emit_int4_gemv_inner(
-                w,
-                "acc_up0",
                 "up_w + (expert * O + o_base) * PACKED",
                 "up_s + (expert * O + o_base) * N_GROUPS",
                 "up_b + (expert * O + o_base) * N_GROUPS",
                 "K",
                 gate.bits,
                 gate.group_size,
-                |off| format!("x_smem[{off}]"),
+                |off| format!("float(x_smem[{off}])"),
             );
         } else {
             crate::codegen::kernels::emit_int4_gemv_inner_multirow(
@@ -210,7 +307,7 @@ pub fn emit(
                 gate.bits,
                 gate.group_size,
                 accum_rows,
-                |off| format!("x_smem[{off}]"),
+                |off| format!("float(x_smem[{off}])"),
             );
         }
         for r in 0..rows_per_sg {
@@ -223,9 +320,16 @@ pub fn emit(
             w.push_indent();
             w.line(format!("float g{r} = float({t}(acc_gate{r}));"));
             w.line(format!("float u{r} = float({t}(acc_up{r}));"));
-            w.line(format!("float sig{r} = 1.0f / (1.0f + exp(-g{r}));"));
             w.line(format!(
-                "out0[route * O + o_base + {r}u] = {out_t}((sig{r} * g{r}) * u{r});"
+                "float sig{r} = 1.0f / (1.0f + metal::fast::exp(-g{r}));"
+            ));
+            if pre_scale_route_weight {
+                w.line("float rw = float(route_weight[route_idx]);");
+            } else {
+                w.line("float rw = 1.0f;");
+            }
+            w.line(format!(
+                "out0[route * O + o_base + {r}u] = {out_t}(((sig{r} * g{r}) * u{r}) * rw);"
             ));
             w.pop_indent();
             w.line("}");
@@ -251,20 +355,13 @@ pub fn emit(
         w.line(format!("float acc_up{r} = 0.0f;"));
     }
     if rows_per_sg == 1 {
-        crate::codegen::kernels::emit_int4_gemv_inner(
+        crate::codegen::kernels::emit_int4_gemv_inner_pair(
             w,
             "acc_gate0",
+            "acc_up0",
             "gate_w + (expert * O + o_base) * PACKED",
             "gate_s + (expert * O + o_base) * N_GROUPS",
             "gate_b + (expert * O + o_base) * N_GROUPS",
-            "K",
-            gate.bits,
-            gate.group_size,
-            |off| format!("float(x[x_row * K + {off}])"),
-        );
-        crate::codegen::kernels::emit_int4_gemv_inner(
-            w,
-            "acc_up0",
             "up_w + (expert * O + o_base) * PACKED",
             "up_s + (expert * O + o_base) * N_GROUPS",
             "up_b + (expert * O + o_base) * N_GROUPS",
@@ -330,9 +427,16 @@ pub fn emit(
         w.push_indent();
         w.line(format!("float g{r} = float({t}(acc_gate{r}));"));
         w.line(format!("float u{r} = float({t}(acc_up{r}));"));
-        w.line(format!("float sig{r} = 1.0f / (1.0f + exp(-g{r}));"));
         w.line(format!(
-            "out0[route * O + o_base + {r}u] = {out_t}((sig{r} * g{r}) * u{r});"
+            "float sig{r} = 1.0f / (1.0f + metal::fast::exp(-g{r}));"
+        ));
+        if pre_scale_route_weight {
+            w.line("float rw = float(route_weight[route_idx]);");
+        } else {
+            w.line("float rw = 1.0f;");
+        }
+        w.line(format!(
+            "out0[route * O + o_base + {r}u] = {out_t}(((sig{r} * g{r}) * u{r}) * rw);"
         ));
         w.pop_indent();
         w.line("}");

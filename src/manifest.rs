@@ -49,6 +49,16 @@ pub struct ModelInfo {
     pub hidden_size: u32,
     pub num_hidden_layers: u32,
     #[serde(default)]
+    pub num_kv_shared_layers: u32,
+    #[serde(default)]
+    pub num_attention_heads: u32,
+    #[serde(default)]
+    pub num_key_value_heads: u32,
+    #[serde(default)]
+    pub head_dim: u32,
+    #[serde(default)]
+    pub vocab_size: u32,
+    #[serde(default)]
     pub mtp: MtpInfo,
 }
 

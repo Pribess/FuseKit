@@ -98,6 +98,7 @@ impl Pattern for RmsNormQkv {
                 role,
                 shape: t.shape.clone(),
                 dtype: t.dtype,
+                scalar_value: t.scalar_value.clone(),
             }
         };
 
@@ -159,6 +160,44 @@ impl Pattern for RmsNormQkv {
                 bnd(info.output, role)
             })
             .collect::<Vec<_>>();
+
+        let reaches_post_projection_norm = |tid: TensorId| -> bool {
+            let mut stack = vec![(tid, 0u8)];
+            let mut seen = std::collections::HashSet::new();
+            while let Some((cur, depth)) = stack.pop() {
+                if !seen.insert(cur) || depth > 8 {
+                    continue;
+                }
+                for &op_id in ud.consumers.get(cur as usize).into_iter().flatten() {
+                    let op = g.op(op_id);
+                    if op.name == "RMSNorm" {
+                        return true;
+                    }
+                    if matches!(
+                        op.name.as_str(),
+                        "Reshape"
+                            | "Flatten"
+                            | "Unflatten"
+                            | "Squeeze"
+                            | "ExpandDims"
+                            | "AsContiguous"
+                            | "Transpose"
+                    ) {
+                        for &out in &op.outputs {
+                            stack.push((out, depth + 1));
+                        }
+                    }
+                }
+            }
+            false
+        };
+        if outputs
+            .iter()
+            .filter(|b| matches!(b.role, "q" | "k"))
+            .any(|b| reaches_post_projection_norm(b.source))
+        {
+            return None;
+        }
 
         // Q's output_dim is the natural axis to split across heads.
         let q_shape = &g.tensors[projs[0].1.output as usize].shape;

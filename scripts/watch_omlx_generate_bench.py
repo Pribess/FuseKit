@@ -19,12 +19,14 @@ import time
 from pathlib import Path
 
 
-OMLX_RESOURCES = "/Applications/oMLX.app/Contents/Resources"
-OMLX_SITE = (
-    "/Applications/oMLX.app/Contents/Python/framework-mlx-framework/"
-    "lib/python3.11/site-packages"
+OMLX_APP = Path(os.environ.get("FUSEKIT_MLX_APP", "/Applications/oMLX.app")).expanduser()
+OMLX_RESOURCES = str(OMLX_APP / "Contents/Resources")
+OMLX_SITE = str(
+    OMLX_APP / "Contents/Python/framework-mlx-framework/lib/python3.11/site-packages"
 )
-OMLX_MODEL_ROOT = Path("/Users/pribess/.omlx/models")
+OMLX_MODEL_ROOT = Path(
+    os.environ.get("FUSEKIT_OMLX_DIR", Path.home() / ".omlx/models")
+).expanduser()
 CHILD_ENV = "FUSEKIT_WATCH_CHILD"
 MTP_KERNEL_ENV_KEYS = (
     "FUSEKIT_AUTO_MTP_MN_VARIANT",
@@ -933,7 +935,7 @@ def main() -> int:
         "--models",
         help=(
             "comma-separated models for parent compare mode; use all to scan "
-            "/Users/pribess/.omlx/models, mtp to scan only MTP-looking models, "
+            "the configured oMLX model root, mtp to scan only MTP-looking models, "
             "mtp-regressions for the two negative MTP models, or mtp-check "
             "for regressions plus controls"
         ),

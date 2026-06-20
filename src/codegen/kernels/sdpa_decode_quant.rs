@@ -22,7 +22,7 @@
 use anyhow::{bail, Result};
 
 use crate::codegen::msl::MslWriter;
-use crate::fusion::ir::{Fusion, FusionAttrs, FusionKind, ModelMeta};
+use crate::fusion::ir::{Fusion, FusionAttrs, FusionKind, ModelMeta, RopeInfo};
 use crate::task::ir::PartitionPlan;
 
 const MAX_KV_LEN: u32 = 4096;
@@ -38,9 +38,19 @@ pub fn emit(
     if !matches!(fusion.kind, FusionKind::SdpaDecode) {
         bail!("sdpa_decode_quant emitter: wrong kind {:?}", fusion.kind);
     }
-    let FusionAttrs::SdpaDecode { scale, .. } = fusion.attrs else {
+    let FusionAttrs::SdpaDecode {
+        scale,
+        trace_q,
+        q_split,
+        q_transpose_split: _,
+        q1_rope,
+        ..
+    } = &fusion.attrs
+    else {
         bail!("sdpa_decode_quant emitter: attrs mismatch");
     };
+    let scale = *scale;
+    let trace_q = *trace_q;
     if !matches!(bits, 4 | 8) {
         bail!("sdpa_decode_quant: only bits ∈ {{4, 8}} supported, got {bits}");
     }
@@ -52,9 +62,30 @@ pub fn emit(
         .first()
         .map(|b| b.shape.as_slice())
         .unwrap_or(&[]);
+    let split_q = q_split.is_some() && fusion.inputs.len() >= 4;
+    let q0_dim = q_shape
+        .last()
+        .copied()
+        .unwrap_or(meta.head_dim as i32)
+        .max(1) as u32;
+    let q1_shape = if split_q {
+        fusion
+            .inputs
+            .get(1)
+            .map(|b| b.shape.as_slice())
+            .unwrap_or(&[])
+    } else {
+        &[][..]
+    };
+    let q1_dim = if split_q {
+        q1_shape.last().copied().unwrap_or(0).max(0) as u32
+    } else {
+        0
+    };
+    let v_input_idx = if split_q { 3 } else { 2 };
     let v_shape = fusion
         .inputs
-        .get(2)
+        .get(v_input_idx)
         .map(|b| b.shape.as_slice())
         .unwrap_or(&[]);
     let out_shape = fusion
@@ -65,6 +96,8 @@ pub fn emit(
     let inputless_semantic_decode = fusion.inputs.is_empty();
     let qk_dim = if inputless_semantic_decode {
         meta.head_dim
+    } else if split_q {
+        q0_dim + q1_dim
     } else {
         q_shape
             .last()
@@ -88,6 +121,7 @@ pub fn emit(
     } else {
         scale
     };
+    let q1_rope = if split_q { q1_rope.as_ref() } else { None };
     let t = crate::codegen::kernels::act_ty(meta);
     let el_per_int = 32 / bits;
     let n_words_k = qk_dim / el_per_int;
@@ -95,20 +129,21 @@ pub fn emit(
     let n_groups_k = qk_dim / group_size.max(1);
     let n_groups_v = v_dim / group_size.max(1);
     let mask = (1u32 << bits) - 1;
-    let direct_scaled_q = (scale - 1.0).abs() < f32::EPSILON && !inputless_semantic_decode;
-    let active_m = out_shape
-        .get(0..)
-        .filter(|s| !s.is_empty())
-        .map(|s| crate::target::current_chip().active_tokens_for_shape(s))
-        .unwrap_or_else(|| crate::target::current_chip().active_m_for_unshaped(8))
-        .max(1);
+    let direct_scaled_q = trace_q && !inputless_semantic_decode;
+    let active_m = super::sdpa_decode::active_rows_for_shape(out_shape, n_heads, v_dim);
     let q_head_major = inputless_semantic_decode
         || direct_scaled_q
-        || infer_q_head_major(q_shape, n_heads, active_m, qk_dim);
+        || super::sdpa_decode::infer_head_major_layout(q_shape, n_heads, qk_dim);
+    let out_head_major = super::sdpa_decode::infer_head_major_layout(out_shape, n_heads, v_dim);
     let q_seq = if q_head_major {
-        trace_q_head_stride(q_shape).max(1)
+        super::sdpa_decode::trace_q_head_stride(q_shape).max(1)
     } else {
         1
+    };
+    let out_trace_seq = if out_head_major {
+        super::sdpa_decode::trace_q_head_stride(out_shape).max(1)
+    } else {
+        active_m
     };
     let out_seq = active_m;
     let flash_decoding = super::sdpa_decode::flash_decoding_enabled_for(
@@ -129,19 +164,37 @@ pub fn emit(
     ));
     w.line(format!("kernel void {fn_name}("));
     w.push_indent();
-    w.line(format!("device const {t}   *Q          [[buffer(0)]],"));
-    w.line("device const uint  *K_packed   [[buffer(1)]],");
-    w.line(format!("device const {t}   *K_scales   [[buffer(2)]],"));
-    w.line(format!("device const {t}   *K_biases   [[buffer(3)]],"));
-    w.line("device const uint  *V_packed   [[buffer(4)]],");
-    w.line(format!("device const {t}   *V_scales   [[buffer(5)]],"));
-    w.line(format!("device const {t}   *V_biases   [[buffer(6)]],"));
-    w.line("constant uint       &kv_len     [[buffer(7)]],");
-    w.line("constant uint       &capacity   [[buffer(8)]],");
-    w.line(format!("device {t}         *out        [[buffer(9)]],"));
-    if flash_decoding {
-        w.line("device float       *partials   [[buffer(10)]],");
-        w.line("device atomic_uint *counter    [[buffer(11)]],");
+    if split_q {
+        w.line(format!("device const {t}   *Q0         [[buffer(0)]],"));
+        w.line(format!("device const {t}   *Q1         [[buffer(1)]],"));
+        w.line("device const uint  *K_packed   [[buffer(2)]],");
+        w.line(format!("device const {t}   *K_scales   [[buffer(3)]],"));
+        w.line(format!("device const {t}   *K_biases   [[buffer(4)]],"));
+        w.line("device const uint  *V_packed   [[buffer(5)]],");
+        w.line(format!("device const {t}   *V_scales   [[buffer(6)]],"));
+        w.line(format!("device const {t}   *V_biases   [[buffer(7)]],"));
+        w.line("constant uint       &kv_len     [[buffer(8)]],");
+        w.line("constant uint       &capacity   [[buffer(9)]],");
+        w.line(format!("device {t}         *out        [[buffer(10)]],"));
+        if flash_decoding {
+            w.line("device float       *partials   [[buffer(11)]],");
+            w.line("device atomic_uint *counter    [[buffer(12)]],");
+        }
+    } else {
+        w.line(format!("device const {t}   *Q          [[buffer(0)]],"));
+        w.line("device const uint  *K_packed   [[buffer(1)]],");
+        w.line(format!("device const {t}   *K_scales   [[buffer(2)]],"));
+        w.line(format!("device const {t}   *K_biases   [[buffer(3)]],"));
+        w.line("device const uint  *V_packed   [[buffer(4)]],");
+        w.line(format!("device const {t}   *V_scales   [[buffer(5)]],"));
+        w.line(format!("device const {t}   *V_biases   [[buffer(6)]],"));
+        w.line("constant uint       &kv_len     [[buffer(7)]],");
+        w.line("constant uint       &capacity   [[buffer(8)]],");
+        w.line(format!("device {t}         *out        [[buffer(9)]],"));
+        if flash_decoding {
+            w.line("device float       *partials   [[buffer(10)]],");
+            w.line("device atomic_uint *counter    [[buffer(11)]],");
+        }
     }
     w.line("uint tid       [[thread_position_in_threadgroup]],");
     w.line("uint tg_size   [[threads_per_threadgroup]],");
@@ -151,14 +204,23 @@ pub fn emit(
     w.push_indent();
 
     w.writeln(format_args!("constexpr uint QK_DIM       = {qk_dim};"));
+    w.writeln(format_args!("constexpr uint Q0_DIM       = {q0_dim};"));
+    w.writeln(format_args!("constexpr uint Q1_DIM       = {q1_dim};"));
     w.writeln(format_args!("constexpr uint V_DIM        = {v_dim};"));
     w.writeln(format_args!("constexpr uint Q_SEQ        = {q_seq};"));
     w.writeln(format_args!("constexpr uint OUT_SEQ      = {out_seq};"));
+    w.writeln(format_args!(
+        "constexpr uint OUT_TRACE_SEQ = {out_trace_seq};"
+    ));
     w.writeln(format_args!("constexpr uint N_HEADS      = {n_heads};"));
     w.writeln(format_args!("constexpr uint N_KV_HEADS   = {n_kv_heads};"));
     w.writeln(format_args!(
         "constexpr bool Q_HEAD_MAJOR = {};",
         if q_head_major { "true" } else { "false" }
+    ));
+    w.writeln(format_args!(
+        "constexpr bool OUT_HEAD_MAJOR = {};",
+        if out_head_major { "true" } else { "false" }
     ));
     w.writeln(format_args!(
         "constexpr uint HEADS_PER_KV = {heads_per_kv};"
@@ -177,6 +239,7 @@ pub fn emit(
     w.writeln(format_args!("constexpr uint N_GROUPS_V   = {n_groups_v};"));
     w.writeln(format_args!("constexpr uint GROUP_SIZE   = {group_size};"));
     w.writeln(format_args!("constexpr uint MASK         = {mask};"));
+    emit_q1_rope_constants(w, q1_rope, q1_dim);
     if flash_decoding {
         w.writeln(format_args!(
             "constexpr uint KV_CHUNK     = {};",
@@ -200,7 +263,7 @@ pub fn emit(
     w.blank();
 
     if flash_decoding {
-        emit_flash_decoding(w, t, bits);
+        emit_flash_decoding(w, t, bits, split_q, q1_rope, q1_dim);
         w.pop_indent();
         w.line("}");
         w.blank();
@@ -220,14 +283,18 @@ pub fn emit(
     w.blank();
 
     w.line("threadgroup float q_local[QK_DIM];");
-    w.line(format!(
-        "device const {t}* q_base = Q + ((Q_HEAD_MAJOR ? (head_id_real * OUT_SEQ + query_row) : ((query_row * N_HEADS + head_id_real) * Q_SEQ)) * QK_DIM);"
-    ));
-    w.line("for (uint d = tid; d < QK_DIM; d += tg_size) {");
-    w.push_indent();
-    w.line("q_local[d] = float(q_base[d]);");
-    w.pop_indent();
-    w.line("}");
+    if split_q {
+        emit_split_q_stage_body(w, t, q1_rope, q1_dim);
+    } else {
+        w.line(format!(
+            "device const {t}* q_base = Q + ((Q_HEAD_MAJOR ? (((query_row / Q_SEQ) * N_HEADS + head_id_real) * Q_SEQ + (query_row % Q_SEQ)) : ((query_row * N_HEADS + head_id_real) * Q_SEQ)) * QK_DIM);"
+        ));
+        w.line("for (uint d = tid; d < QK_DIM; d += tg_size) {");
+        w.push_indent();
+        w.line("q_local[d] = float(q_base[d]);");
+        w.pop_indent();
+        w.line("}");
+    }
     w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
     w.blank();
 
@@ -238,9 +305,6 @@ pub fn emit(
     w.line("// Stage 1: dot product Q · dequant(K[kv]) per kv position.");
     w.line("for (uint kv = tid; kv < kv_len_eff; kv += tg_size) {");
     w.push_indent();
-    w.writeln(format_args!(
-        "device const {t}4* q_row4 = (device const {t}4*)(Q + ((Q_HEAD_MAJOR ? (head_id_real * OUT_SEQ + query_row) : ((query_row * N_HEADS + head_id_real) * Q_SEQ)) * QK_DIM));"
-    ));
     w.line("uint kv_off = (kv_head * capacity + kv);");
     w.line("device const uint *kp = K_packed + kv_off * N_WORDS_K;");
     w.line(format!(
@@ -410,7 +474,7 @@ pub fn emit(
         }
         w.line("if (simd_lane == 0u) {");
         w.push_indent();
-        w.line("uint out_base = (query_row * N_HEADS + head_id_real) * V_DIM + d_base;");
+        w.line("uint out_base = ((OUT_HEAD_MAJOR ? (((query_row / OUT_TRACE_SEQ) * N_HEADS + head_id_real) * OUT_TRACE_SEQ + (query_row % OUT_TRACE_SEQ)) : (query_row * N_HEADS + head_id_real)) * V_DIM) + d_base;");
         for i in 0..8 {
             w.writeln(format_args!("out[out_base + {i}u] = {t}(acc{i});"));
         }
@@ -422,7 +486,7 @@ pub fn emit(
         }
         w.line("if (simd_lane == 0u) {");
         w.push_indent();
-        w.line("uint out_base = (query_row * N_HEADS + head_id_real) * V_DIM + d_base;");
+        w.line("uint out_base = ((OUT_HEAD_MAJOR ? (((query_row / OUT_TRACE_SEQ) * N_HEADS + head_id_real) * OUT_TRACE_SEQ + (query_row % OUT_TRACE_SEQ)) : (query_row * N_HEADS + head_id_real)) * V_DIM) + d_base;");
         for i in 0..4 {
             w.writeln(format_args!("out[out_base + {i}u] = {t}(acc{i});"));
         }
@@ -442,7 +506,14 @@ pub fn emit(
 /// decomposition; this variant keeps K/V packed and dequantizes inside
 /// the chunk kernel. Stage 3 is word-owned rather than dim-owned so one
 /// V packed/scales/biases load fans out to all values in that word.
-fn emit_flash_decoding(w: &mut MslWriter, t: &str, bits: u32) {
+fn emit_flash_decoding(
+    w: &mut MslWriter,
+    t: &str,
+    bits: u32,
+    split_q: bool,
+    q1_rope: Option<&RopeInfo>,
+    q1_dim: u32,
+) {
     let lanes = 32 / bits;
     w.line("// Quant Flash-Decoding: per-(head, chunk) TG with packed K/V dequant.");
     w.line("uint gid_compound = head_id;");
@@ -465,14 +536,18 @@ fn emit_flash_decoding(w: &mut MslWriter, t: &str, bits: u32) {
     w.line("threadgroup float q_local[QK_DIM];");
     w.line("threadgroup float s_block[BLOCK];");
     w.line("threadgroup float reduce_buf[32];");
-    w.line(format!(
-        "device const {t}* q_base = Q + ((Q_HEAD_MAJOR ? (head_id_real * OUT_SEQ + query_row) : ((query_row * N_HEADS + head_id_real) * Q_SEQ)) * QK_DIM);"
-    ));
-    w.line("for (uint d = tid; d < QK_DIM; d += tg_size) {");
-    w.push_indent();
-    w.line("q_local[d] = float(q_base[d]);");
-    w.pop_indent();
-    w.line("}");
+    if split_q {
+        emit_split_q_stage_body(w, t, q1_rope, q1_dim);
+    } else {
+        w.line(format!(
+            "device const {t}* q_base = Q + ((Q_HEAD_MAJOR ? (((query_row / Q_SEQ) * N_HEADS + head_id_real) * Q_SEQ + (query_row % Q_SEQ)) : ((query_row * N_HEADS + head_id_real) * Q_SEQ)) * QK_DIM);"
+        ));
+        w.line("for (uint d = tid; d < QK_DIM; d += tg_size) {");
+        w.push_indent();
+        w.line("q_local[d] = float(q_base[d]);");
+        w.pop_indent();
+        w.line("}");
+    }
     w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
     w.blank();
 
@@ -696,7 +771,7 @@ fn emit_flash_decoding(w: &mut MslWriter, t: &str, bits: u32) {
     w.line("final_m = m_new;");
     w.pop_indent();
     w.line("}");
-    w.line("uint out_base = (query_row * N_HEADS + head_id_real) * V_DIM + d_base;");
+    w.line("uint out_base = ((OUT_HEAD_MAJOR ? (((query_row / OUT_TRACE_SEQ) * N_HEADS + head_id_real) * OUT_TRACE_SEQ + (query_row % OUT_TRACE_SEQ)) : (query_row * N_HEADS + head_id_real)) * V_DIM) + d_base;");
     for i in 0..lanes {
         w.writeln(format_args!(
             "out[out_base + {i}u] = {t}(final_o{i} / final_l);"
@@ -710,30 +785,114 @@ pub fn function_name_for(fusion: &Fusion, bits: u32) -> String {
     format!("fusekit_sdpa_decode_q{bits}_f{}", fusion.id)
 }
 
-fn trace_q_head_stride(q_shape: &[i32]) -> u32 {
-    if q_shape.len() >= 3 {
-        q_shape[q_shape.len() - 2].max(1) as u32
+fn q1_rope_active(info: Option<&RopeInfo>, q1_dim: u32) -> Option<&RopeInfo> {
+    let info = info?;
+    if info.dims.min(q1_dim) >= 2 {
+        Some(info)
     } else {
-        1
+        None
     }
 }
 
-fn infer_q_head_major(q_shape: &[i32], n_heads: u32, active_m: u32, qk_dim: u32) -> bool {
-    if q_shape.len() < 3 {
-        return false;
+fn emit_q1_rope_constants(w: &mut MslWriter, info: Option<&RopeInfo>, q1_dim: u32) {
+    let active = q1_rope_active(info, q1_dim);
+    if let Some(info) = active {
+        let dims = info.dims.min(q1_dim);
+        let half = dims / 2;
+        let log2_base = (info.base as f64).log2() as f32;
+        w.line("constexpr bool Q1_ROPE      = true;");
+        w.writeln(format_args!("constexpr uint Q1_ROPE_DIMS = {dims};"));
+        w.writeln(format_args!("constexpr uint Q1_ROPE_HALF = {half};"));
+        w.writeln(format_args!(
+            "constexpr float Q1_ROPE_BASE_LOG2 = {log2_base:e}f;"
+        ));
+        w.writeln(format_args!(
+            "constexpr float Q1_ROPE_SCALE = {};",
+            info.scale
+        ));
+        w.writeln(format_args!(
+            "constexpr bool Q1_ROPE_TRADITIONAL = {};",
+            if info.traditional { "true" } else { "false" }
+        ));
+        if let Some(freqs) = info.inline_freqs.as_ref().filter(|freqs| !freqs.is_empty()) {
+            let vals = freqs
+                .iter()
+                .map(|v| format!("{v:.9e}f"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            w.line("constexpr bool Q1_ROPE_INLINE_FREQS = true;");
+            w.writeln(format_args!(
+                "const float q1_inline_freqs[{}] = {{ {vals} }};",
+                freqs.len()
+            ));
+        } else {
+            w.line("constexpr bool Q1_ROPE_INLINE_FREQS = false;");
+        }
+    } else {
+        w.line("constexpr bool Q1_ROPE      = false;");
+        w.line("constexpr uint Q1_ROPE_DIMS = 0;");
+        w.line("constexpr uint Q1_ROPE_HALF = 0;");
+        w.line("constexpr float Q1_ROPE_BASE_LOG2 = 0.0f;");
+        w.line("constexpr float Q1_ROPE_SCALE = 1.0f;");
+        w.line("constexpr bool Q1_ROPE_TRADITIONAL = false;");
+        w.line("constexpr bool Q1_ROPE_INLINE_FREQS = false;");
     }
-    let Some(&last) = q_shape.last() else {
-        return false;
-    };
-    if last.max(1) as u32 != qk_dim {
-        return false;
+}
+
+fn emit_split_q_stage_body(w: &mut MslWriter, t: &str, q1_rope: Option<&RopeInfo>, q1_dim: u32) {
+    w.line(format!(
+        "device const {t}* q0_base = Q0 + ((Q_HEAD_MAJOR ? (((query_row / Q_SEQ) * N_HEADS + head_id_real) * Q_SEQ + (query_row % Q_SEQ)) : ((query_row * N_HEADS + head_id_real) * Q_SEQ)) * Q0_DIM);"
+    ));
+    w.line(format!(
+        "device const {t}* q1_base = Q1 + ((Q_HEAD_MAJOR ? (((query_row / Q_SEQ) * N_HEADS + head_id_real) * Q_SEQ + (query_row % Q_SEQ)) : ((query_row * N_HEADS + head_id_real) * Q_SEQ)) * Q1_DIM);"
+    ));
+    w.line("for (uint d = tid; d < QK_DIM; d += tg_size) {");
+    w.push_indent();
+    if q1_rope_active(q1_rope, q1_dim).is_some() {
+        w.line("if (d < Q0_DIM) {");
+        w.push_indent();
+        w.line("q_local[d] = float(q0_base[d]);");
+        w.pop_indent();
+        w.line("} else {");
+        w.push_indent();
+        w.line("uint q1d = d - Q0_DIM;");
+        w.line("if (q1d >= Q1_ROPE_DIMS) {");
+        w.push_indent();
+        w.line("q_local[d] = float(q1_base[q1d]);");
+        w.pop_indent();
+        w.line("} else {");
+        w.push_indent();
+        w.line("uint pair_idx = Q1_ROPE_TRADITIONAL ? (q1d / 2u) : ((q1d < Q1_ROPE_HALF) ? q1d : (q1d - Q1_ROPE_HALF));");
+        w.line("float d_norm = float(pair_idx) / float(Q1_ROPE_HALF);");
+        if let Some(freqs) = q1_rope
+            .and_then(|info| info.inline_freqs.as_ref())
+            .filter(|freqs| !freqs.is_empty())
+        {
+            w.writeln(format_args!(
+                "uint freq_idx = (pair_idx < {}u) ? pair_idx : {}u;",
+                freqs.len(),
+                freqs.len().saturating_sub(1)
+            ));
+            w.line("float inv_freq = Q1_ROPE_SCALE / q1_inline_freqs[freq_idx];");
+        } else {
+            w.line("float inv_freq = metal::exp2(-d_norm * Q1_ROPE_BASE_LOG2) * Q1_ROPE_SCALE;");
+        }
+        w.line("float angle = float((kv_len > 0u ? (kv_len - 1u) : 0u) + query_row) * inv_freq;");
+        w.line("float c = metal::fast::cos(angle);");
+        w.line("float s = metal::fast::sin(angle);");
+        w.line("uint lo_idx = Q1_ROPE_TRADITIONAL ? (pair_idx * 2u) : pair_idx;");
+        w.line("uint hi_idx = Q1_ROPE_TRADITIONAL ? (lo_idx + 1u) : (pair_idx + Q1_ROPE_HALF);");
+        w.line("float lo = float(q1_base[lo_idx]);");
+        w.line("float hi = float(q1_base[hi_idx]);");
+        w.line("bool lo_lane = Q1_ROPE_TRADITIONAL ? ((q1d & 1u) == 0u) : (q1d < Q1_ROPE_HALF);");
+        w.line("q_local[d] = lo_lane ? (lo * c - hi * s) : (hi * c + lo * s);");
+        w.pop_indent();
+        w.line("}");
+        w.pop_indent();
+        w.line("}");
+    } else {
+        w.line("q_local[d] = (d < Q0_DIM) ? float(q0_base[d]) : float(q1_base[d - Q0_DIM]);");
     }
-    if trace_q_head_stride(q_shape).max(1) != active_m.max(1) {
-        return false;
-    }
-    let head_prefix = q_shape[..q_shape.len() - 2]
-        .iter()
-        .map(|&d| d.max(1) as u64)
-        .product::<u64>();
-    head_prefix == n_heads.max(1) as u64
+    w.pop_indent();
+    w.line("}");
 }

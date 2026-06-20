@@ -26,7 +26,7 @@
 //! the annotation so codegen can emit a separate kernel variant.
 
 use crate::op::module::Module;
-use crate::op::op::{AttrValue, Op, OpKind};
+use crate::op::op::AttrValue;
 use crate::op::passes::{Pass, PassError};
 
 pub struct DecodeL1Specialize;

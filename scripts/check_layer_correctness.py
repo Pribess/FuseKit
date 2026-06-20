@@ -77,7 +77,99 @@ def run_text_layers(text, inputs, cache, *, capture: bool):
     from mlx_lm.models.base import create_attention_mask, create_ssm_mask
 
     core = text_core(text)
-    hidden = core.embed_tokens(inputs)
+    input_embeddings = core.embed_tokens(inputs)
+    hidden = input_embeddings
+    if hasattr(core, "embed_scale"):
+        hidden = hidden * core.embed_scale
+    elif type(core).__name__ == "Gemma3Model" and hasattr(core, "args"):
+        hidden = hidden * mx.array(
+            core.args.hidden_size**0.5, mx.bfloat16
+        ).astype(hidden.dtype)
+    if hasattr(core, "previous_kvs") and hasattr(core, "_make_masks"):
+        layers = core.layers
+        if getattr(core, "hidden_size_per_layer_input", None):
+            per_layer_inputs = core._get_per_layer_inputs(inputs, input_embeddings)
+            per_layer_inputs = core._project_per_layer_inputs(hidden, per_layer_inputs)
+            per_layer_inputs = [
+                per_layer_inputs[:, :, i, :] for i, _ in enumerate(layers)
+            ]
+        else:
+            per_layer_inputs = [None] * len(layers)
+        if cache is None:
+            cache = [None] * len(layers)
+        else:
+            cache = cache + [None] * (len(layers) - len(cache))
+        masks = core._make_masks(hidden, cache)
+        intermediates = [(None, None)] * len(layers)
+        captures = {}
+        for i, (layer, c, mask, prev_idx, per_layer_input) in enumerate(
+            zip(layers, cache, masks, core.previous_kvs, per_layer_inputs)
+        ):
+            shared_kv, offset = intermediates[prev_idx]
+            out = layer(
+                hidden,
+                mask,
+                c,
+                per_layer_input=per_layer_input,
+                shared_kv=shared_kv,
+                offset=offset,
+            )
+            if isinstance(out, tuple):
+                hidden, shared_kv, offset = out
+            else:
+                hidden = out
+            intermediates[i] = (shared_kv, offset)
+            mx.eval(hidden)
+            if capture:
+                captures[f"layer_{i:03d}"] = row1(hidden).astype(mx.float32)
+        normed = core.norm(hidden)
+        if getattr(text.args, "tie_word_embeddings", False):
+            logits = core.embed_tokens.as_linear(normed)
+        else:
+            logits = text.lm_head(normed)
+        if getattr(text.args, "final_logit_softcapping", None) is not None:
+            from mlx_lm.models.gemma4_text import logit_softcap
+
+            logits = logit_softcap(text.args.final_logit_softcapping, logits)
+        mx.eval(logits)
+        if capture:
+            captures["logits"] = row1(logits).astype(mx.float32)
+        return logits, captures
+    if type(core).__name__ == "Gemma3Model" and hasattr(core, "sliding_window_pattern"):
+        layers = core.layers
+        if cache is None:
+            cache = [None] * len(layers)
+        else:
+            cache = cache + [None] * (len(layers) - len(cache))
+        global_mask = create_attention_mask(
+            hidden, cache[core.sliding_window_pattern - 1]
+        )
+        if core.sliding_window_pattern > 1:
+            sliding_window_mask = create_attention_mask(
+                hidden, cache[0], window_size=core.window_size
+            )
+        else:
+            sliding_window_mask = None
+        captures = {}
+        for i, (layer, c) in enumerate(zip(layers, cache)):
+            is_global = (
+                i % core.sliding_window_pattern == core.sliding_window_pattern - 1
+            )
+            mask = global_mask if is_global else sliding_window_mask
+            hidden = layer(hidden, mask, c)
+            mx.eval(hidden)
+            if capture:
+                captures[f"layer_{i:03d}"] = row1(hidden).astype(mx.float32)
+        normed = core.norm(hidden)
+        if getattr(text, "tie_word_embeddings", False):
+            logits = core.embed_tokens.as_linear(normed)
+        else:
+            logits = text.lm_head(normed)
+        mx.eval(logits)
+        if capture:
+            captures["logits"] = row1(logits).astype(mx.float32)
+        return logits, captures
+
     if not (hasattr(core, "fa_idx") and hasattr(core, "ssm_idx")):
         layers = getattr(core, "pipeline_layers", core.layers)
         if cache is None:
@@ -134,6 +226,11 @@ def child_raw(args: argparse.Namespace) -> int:
     ids = mx.array([ids], dtype=mx.uint32)
     run_text_layers(text, ids, cache, capture=False)
 
+    if args.force_prefix_steps > 0:
+        prefix = mx.array([[args.decode_token]], dtype=mx.uint32)
+        for _ in range(args.force_prefix_steps):
+            run_text_layers(text, prefix, cache, capture=False)
+
     decode = mx.array([[args.decode_token]], dtype=mx.uint32)
     _, arrays = run_text_layers(text, decode, cache, capture=True)
     mx.save_safetensors(args.out, arrays)
@@ -170,6 +267,14 @@ def child_patched(args: argparse.Namespace) -> int:
         prefill = prefill[0]
     mx.eval(prefill)
 
+    if args.force_prefix_steps > 0:
+        prefix = mx.array([[args.decode_token]], dtype=mx.uint32)
+        for _ in range(args.force_prefix_steps):
+            y = model(prefix, cache=cache)
+            if isinstance(y, tuple):
+                y = y[0]
+            mx.eval(y)
+
     decode = mx.array([[args.decode_token]], dtype=mx.uint32)
     logits = model(decode, cache=cache)
     if isinstance(logits, tuple):
@@ -204,6 +309,11 @@ def child_main(args: argparse.Namespace) -> int:
 def parent_main(args: argparse.Namespace) -> int:
     import mlx.core as mx
 
+    def nan_count(x) -> int:
+        n = mx.sum(mx.isnan(x.astype(mx.float32)))
+        mx.eval(n)
+        return int(n.item())
+
     with tempfile.TemporaryDirectory(prefix="fusekit-layer-correctness-") as td:
         tmp = Path(td)
         raw_out = tmp / "raw.safetensors"
@@ -221,6 +331,8 @@ def parent_main(args: argparse.Namespace) -> int:
             args.prompt,
             "--decode-token",
             str(args.decode_token),
+            "--force-prefix-steps",
+            str(args.force_prefix_steps),
         ]
         if args.fusekit_dir:
             base_cmd += ["--fusekit-dir", args.fusekit_dir]
@@ -244,16 +356,21 @@ def parent_main(args: argparse.Namespace) -> int:
                 continue
             diff = mx.abs(raw[key] - patched[key])
             mx.eval(diff)
-            rows.append({
-                "name": key,
-                "max_abs_diff": float(mx.max(diff).item()),
-                "mean_abs_diff": float(mx.mean(diff).item()),
-            })
+            rows.append(
+                {
+                    "name": key,
+                    "raw_nan": nan_count(raw[key]),
+                    "patched_nan": nan_count(patched[key]),
+                    "max_abs_diff": float(mx.max(diff).item()),
+                    "mean_abs_diff": float(mx.mean(diff).item()),
+                }
+            )
 
         print(json.dumps({
             "model": args.model,
             "prompt": args.prompt,
             "decode_token": args.decode_token,
+            "force_prefix_steps": args.force_prefix_steps,
             "raw_meta": json.loads(raw_meta.read_text()),
             "patched_meta": json.loads(patched_meta.read_text()),
             "rows": rows,
@@ -266,6 +383,7 @@ def main() -> int:
     ap.add_argument("--model", required=True)
     ap.add_argument("--prompt", default="Hello from fusekit")
     ap.add_argument("--decode-token", type=int, default=1)
+    ap.add_argument("--force-prefix-steps", type=int, default=0)
     ap.add_argument("--child", action="store_true")
     ap.add_argument("--mode", choices=["raw", "patched"])
     ap.add_argument("--out")

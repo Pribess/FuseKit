@@ -228,7 +228,7 @@ pub fn emit(
         gate.active_rows
     ));
     w.writeln(format_args!(
-        "fusekit_qmv_swiglu_pair_m_impl<{t}, {}, {}, {}, {}, {}>(gate_w, gate_s, gate_b, up_w, up_s, up_b, x, out0, K, N, ACTIVE_ROWS, tgid, simd_gid, simd_lid);",
+        "fusekit_qmv_swiglu_pair_m_impl<{t}, {}, {}, {}, {}, {}>(gate_w, gate_s, gate_b, up_w, up_s, up_b, x, out0, 1.0f, K, N, ACTIVE_ROWS, tgid, simd_gid, simd_lid);",
         gate.group_size, gate.bits, qmv_sgs, qmv_cols_per_sg, token_rows
     ));
     w.pop_indent();

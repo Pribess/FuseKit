@@ -17,12 +17,23 @@ import time
 from pathlib import Path
 
 
-PY = "/Applications/oMLX.app/Contents/Python/cpython-3.11/bin/python3.11"
-PYTHONPATH = (
-    "/Applications/oMLX.app/Contents/Resources:"
-    "/Applications/oMLX.app/Contents/Python/framework-mlx-framework/lib/python3.11/site-packages"
+OMLX_APP = Path(os.environ.get("FUSEKIT_MLX_APP", "/Applications/oMLX.app")).expanduser()
+PY = os.environ.get(
+    "FUSEKIT_PYTHON",
+    str(OMLX_APP / "Contents/Python/cpython-3.11/bin/python3.11"),
 )
-OMLX_MODEL_ROOT = Path("/Users/pribess/.omlx/models")
+PYTHONPATH = os.pathsep.join(
+    [
+        str(OMLX_APP / "Contents/Resources"),
+        str(
+            OMLX_APP
+            / "Contents/Python/framework-mlx-framework/lib/python3.11/site-packages"
+        ),
+    ]
+)
+OMLX_MODEL_ROOT = Path(
+    os.environ.get("FUSEKIT_OMLX_DIR", Path.home() / ".omlx/models")
+).expanduser()
 
 MODELS = [
     "Youssofal/Qwen3.5-4B-MTPLX-Optimized-Speed",

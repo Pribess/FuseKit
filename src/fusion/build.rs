@@ -52,6 +52,9 @@ pub fn build_fusions(g: &Graph, meta: ModelMeta) -> Result<FusionGraph> {
                 return None;
             }
             let m = p.try_match(g, &ud, op.id)?;
+            if p.name() == "rmsnorm_qkv" && qkv_projection_outputs_feed_post_norm(g, &ud, &m) {
+                return None;
+            }
             match safety::check(&m, &meta) {
                 SafetyCheck::Accept => Some(m),
                 SafetyCheck::Reject(_) | SafetyCheck::SplitTasks(_) => None,
@@ -86,6 +89,7 @@ pub fn build_fusions(g: &Graph, meta: ModelMeta) -> Result<FusionGraph> {
                 }
                 _ => true,
             });
+            let layer_hint = op_ids_layer_hint(g, &m.op_ids);
             fusions.push(Fusion {
                 id: fusions.len() as u32,
                 kind: m.kind,
@@ -94,7 +98,7 @@ pub fn build_fusions(g: &Graph, meta: ModelMeta) -> Result<FusionGraph> {
                 outputs: m.outputs,
                 attrs: m.attrs,
                 parallel_axes: m.parallel_axes,
-                layer_hint: None,
+                layer_hint,
             });
             continue;
         }
@@ -125,10 +129,12 @@ pub fn build_fusions(g: &Graph, meta: ModelMeta) -> Result<FusionGraph> {
                 op_attrs: op.attrs.clone(),
             },
             parallel_axes: vec![],
-            layer_hint: None,
+            layer_hint: op.layer_id,
         });
         consumed.insert(op.id);
     }
+
+    inline_rope_constant_freqs(g, &mut fusions);
 
     // Direction A: synthetic decode-utility kernel injection is now
     // *conditional on the trace's RoPE op matching the synthetic's
@@ -146,37 +152,115 @@ pub fn build_fusions(g: &Graph, meta: ModelMeta) -> Result<FusionGraph> {
     // Same story for `Single(Quantize)` against the embedding — kept
     // unconditional for now since EmbedLookupDecode is shape-agnostic.
 
-    // Detect a representative `Single(RoPE)`'s attrs to derive theta
-    // and check the "standard pattern" predicate. mlx-lm models use
-    // the same RoPE config across all layers so reading the first
-    // surviving op is sufficient.
-    let head_dim = meta.head_dim as i32;
-    let (rope_base, rope_matches_synthetic) = fusions
-        .iter()
-        .find_map(|f| match (&f.kind, &f.attrs) {
-            (FusionKind::Single(name), FusionAttrs::Single { op_attrs, .. }) if name == "RoPE" => {
-                match op_attrs {
-                    crate::graph::Attrs::Rope {
-                        base,
-                        dims,
-                        traditional,
-                        scale,
-                    } => {
-                        // Synthetic kernel assumes full-dim rotation,
-                        // half-split (non-traditional) pairing, no
-                        // freqs/scale override. Anything else falls back
-                        // to the Single emit.
-                        let matches =
-                            *dims == head_dim && !*traditional && (*scale - 1.0_f32).abs() < 1e-6;
-                        Some((*base, matches))
-                    }
-                    _ => Some((1_000_000.0_f32, false)),
-                }
+    // Decide synthetic RoPE eligibility per layer, not per model. Gemma4
+    // mixes sliding attention (`dims == head_dim`) with full attention
+    // partial RoPE (`dims < head_dim`). A single global flag would remove
+    // the partial RoPE producer and leave downstream Q as an anonymous
+    // external trace tensor.
+    let mut rope_by_layer: HashMap<i32, (f32, bool)> = HashMap::new();
+    let mut trace_rope_layers: HashSet<i32> = HashSet::new();
+    let producer_op = |tid: crate::graph::TensorId| -> Option<&crate::graph::Op> {
+        g.tensors
+            .get(tid as usize)?
+            .producer
+            .map(|id| &g.ops[id as usize])
+    };
+    let reaches_rmsnorm_through_views = |tid: crate::graph::TensorId| -> bool {
+        let mut stack = vec![(tid, 0u8)];
+        let mut seen = HashSet::new();
+        while let Some((cur, depth)) = stack.pop() {
+            if !seen.insert(cur) || depth > 8 {
+                continue;
             }
-            _ => None,
-        })
-        .unwrap_or((1_000_000.0_f32, true)); // No RoPE op in trace → default
-                                             // (e.g. tests with stub graphs).
+            let Some(op) = producer_op(cur) else {
+                continue;
+            };
+            if op.name == "RMSNorm" {
+                return true;
+            }
+            if !matches!(
+                op.name.as_str(),
+                "Broadcast"
+                    | "ExpandDims"
+                    | "Squeeze"
+                    | "Transpose"
+                    | "AsContiguous"
+                    | "Flatten"
+                    | "Unflatten"
+                    | "Reshape"
+            ) {
+                continue;
+            }
+            for &input in &op.inputs {
+                stack.push((input, depth + 1));
+            }
+        }
+        false
+    };
+    for fusion in &fusions {
+        let (FusionKind::Single(name), FusionAttrs::Single { op_attrs, .. }) =
+            (&fusion.kind, &fusion.attrs)
+        else {
+            continue;
+        };
+        if name != "RoPE" {
+            continue;
+        }
+        let Some(layer) = fusion_layer_index(g, fusion) else {
+            continue;
+        };
+        let Some(input_head_dim) = fusion.inputs.first().and_then(|b| b.shape.last()).copied()
+        else {
+            continue;
+        };
+        if fusion
+            .inputs
+            .first()
+            .is_some_and(|input| reaches_rmsnorm_through_views(input.source))
+        {
+            trace_rope_layers.insert(layer);
+        }
+        let (base, compatible) = match op_attrs {
+            crate::graph::Attrs::Rope {
+                base,
+                dims,
+                traditional,
+                scale,
+                ..
+            } => (
+                *base,
+                *dims == input_head_dim
+                    && fusion.inputs.len() <= 2
+                    && !*traditional
+                    && (*scale - 1.0_f32).abs() < 1e-6,
+            ),
+            _ => (1_000_000.0_f32, false),
+        };
+        rope_by_layer
+            .entry(layer)
+            .and_modify(|(prev_base, all_compatible)| {
+                *all_compatible = *all_compatible && compatible && (*prev_base - base).abs() < 1e-3;
+            })
+            .or_insert((base, compatible));
+    }
+    let no_rope_ops = rope_by_layer.is_empty();
+    let synthetic_rope_base_for_layer = |layer: i32| -> Option<f32> {
+        if no_rope_ops {
+            return Some(1_000_000.0_f32);
+        }
+        if trace_rope_layers.contains(&layer) {
+            return None;
+        }
+        rope_by_layer
+            .get(&layer)
+            .and_then(|(base, compatible)| compatible.then_some(*base))
+    };
+    let rope_fusion_is_synthetic_covered = |fusion: &Fusion| -> bool {
+        let Some(layer) = fusion_layer_index(g, fusion) else {
+            return false;
+        };
+        synthetic_rope_base_for_layer(layer).is_some()
+    };
 
     // Retract Single(Quantize) for embed unconditionally; Single(RoPE)
     // only when the synthetic will supersede it. Prefill-tiled QMM
@@ -185,7 +269,7 @@ pub fn build_fusions(g: &Graph, meta: ModelMeta) -> Result<FusionGraph> {
     fusions.retain(|f: &Fusion| match &f.kind {
         FusionKind::Single(name) => match name.as_str() {
             "Quantize" => false,
-            "RoPE" => !rope_matches_synthetic,
+            "RoPE" => !rope_fusion_is_synthetic_covered(f),
             _ => true,
         },
         _ => true,
@@ -205,30 +289,35 @@ pub fn build_fusions(g: &Graph, meta: ModelMeta) -> Result<FusionGraph> {
     // the trace (`base` attr), not hardcoded — Qwen 2.5 has 1M, Llama
     // has 10K, Qwen 3.x has 1M, etc.
     {
-        let theta = rope_base;
         let n_layers = meta.num_hidden_layers as i32;
-        if rope_matches_synthetic {
-            for layer in 0..n_layers {
-                let semantic_inputs = qkv_inputs_by_layer.get(&layer);
-                fusions.push(Fusion {
-                    id: fusions.len() as u32,
-                    kind: FusionKind::RopeQDecode,
-                    op_ids: vec![],
-                    inputs: semantic_inputs
-                        .map(|(q, _, _)| vec![q.clone()])
-                        .unwrap_or_default(),
-                    outputs: vec![],
-                    attrs: FusionAttrs::RopeQDecode { theta },
-                    parallel_axes: vec![],
-                    layer_hint: Some(crate::graph::LayerTag::Layer(layer)),
-                });
+        for layer in 0..n_layers {
+            let Some(theta) = synthetic_rope_base_for_layer(layer) else {
+                continue;
+            };
+            let semantic_inputs = qkv_inputs_by_layer.get(&layer);
+            fusions.push(Fusion {
+                id: fusions.len() as u32,
+                kind: FusionKind::RopeQDecode,
+                op_ids: vec![],
+                inputs: semantic_inputs
+                    .map(|(q, _, _)| vec![q.clone()])
+                    .unwrap_or_default(),
+                outputs: vec![],
+                attrs: FusionAttrs::RopeQDecode { theta },
+                parallel_axes: vec![],
+                layer_hint: Some(crate::graph::LayerTag::Layer(layer)),
+            });
+            if let Some(kv_inputs) = semantic_inputs.and_then(|(_, k, v)| {
+                let k_layer = tensor_semantic_layer(g, k.source);
+                let v_layer = tensor_semantic_layer(g, v.source);
+                (k_layer == Some(layer) && v_layer == Some(layer))
+                    .then(|| vec![k.clone(), v.clone()])
+            }) {
                 fusions.push(Fusion {
                     id: fusions.len() as u32,
                     kind: FusionKind::RopeKvCacheStoreDecode,
                     op_ids: vec![],
-                    inputs: semantic_inputs
-                        .map(|(_, k, v)| vec![k.clone(), v.clone()])
-                        .unwrap_or_default(),
+                    inputs: kv_inputs,
                     outputs: vec![],
                     attrs: FusionAttrs::RopeKvCacheStoreDecode { theta },
                     parallel_axes: vec![],
@@ -236,13 +325,24 @@ pub fn build_fusions(g: &Graph, meta: ModelMeta) -> Result<FusionGraph> {
                 });
             }
         }
+        let embed_output_scale = if trace_rope_layers.is_empty() {
+            infer_decode_embed_output_scale(g, &meta)
+        } else {
+            // When trace-local q/k RMSNorm+RoPE producers must survive,
+            // the layer-0 embed-scale/RMSNorm preamble also remains live.
+            // In that case the graph applies the embedding scale itself;
+            // scaling in EmbedLookupDecode would multiply it twice.
+            1.0
+        };
         fusions.push(Fusion {
             id: fusions.len() as u32,
             kind: FusionKind::EmbedLookupDecode,
             op_ids: vec![],
             inputs: vec![],
             outputs: vec![],
-            attrs: FusionAttrs::EmbedLookupDecode,
+            attrs: FusionAttrs::EmbedLookupDecode {
+                output_scale: embed_output_scale,
+            },
             parallel_axes: vec![],
             layer_hint: Some(crate::graph::LayerTag::Embed),
         });
@@ -302,6 +402,326 @@ pub fn build_fusions(g: &Graph, meta: ModelMeta) -> Result<FusionGraph> {
         f.id = idx as u32;
     }
     Ok(FusionGraph { fusions, meta })
+}
+
+fn qkv_projection_outputs_feed_post_norm(
+    g: &Graph,
+    ud: &UseDef,
+    m: &crate::fusion::patterns::Match,
+) -> bool {
+    if !matches!(m.kind, FusionKind::RmsNormQkv) {
+        return false;
+    }
+
+    fn reaches_rmsnorm_through_views(g: &Graph, ud: &UseDef, tid: crate::graph::TensorId) -> bool {
+        let mut stack = vec![(tid, 0u8)];
+        let mut seen = std::collections::HashSet::new();
+        while let Some((cur, depth)) = stack.pop() {
+            if !seen.insert(cur) || depth > 6 {
+                continue;
+            }
+            for &op_id in ud.consumers.get(cur as usize).into_iter().flatten() {
+                let op = g.op(op_id);
+                if op.name == "RMSNorm" {
+                    return true;
+                }
+                if matches!(
+                    op.name.as_str(),
+                    "Reshape" | "Flatten" | "Unflatten" | "Squeeze" | "ExpandDims" | "AsContiguous"
+                ) {
+                    for &out in &op.outputs {
+                        stack.push((out, depth + 1));
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    m.outputs
+        .iter()
+        .filter(|b| matches!(b.role, "q" | "k" | "v"))
+        .any(|b| reaches_rmsnorm_through_views(g, ud, b.source))
+}
+
+fn op_ids_layer_hint(g: &Graph, op_ids: &[OpId]) -> Option<crate::graph::LayerTag> {
+    let mut tally: std::collections::BTreeMap<crate::graph::LayerTag, usize> = Default::default();
+    for &op_id in op_ids {
+        if let Some(tag) = g.ops.get(op_id as usize).and_then(|op| op.layer_id) {
+            *tally.entry(tag).or_insert(0) += 1;
+        }
+    }
+    tally
+        .into_iter()
+        .max_by_key(|(_, n)| *n)
+        .map(|(tag, _)| tag)
+}
+
+fn inline_rope_constant_freqs(g: &Graph, fusions: &mut [Fusion]) {
+    for fusion in fusions.iter_mut() {
+        let FusionKind::Single(name) = &fusion.kind else {
+            continue;
+        };
+        if name != "RoPE" || fusion.inputs.len() <= 2 {
+            continue;
+        }
+        let Some(freqs) = const_f32_vector(g, fusion.inputs[2].source, 0) else {
+            continue;
+        };
+        if freqs.is_empty() || freqs.len() > 256 {
+            continue;
+        }
+        let FusionAttrs::Single { op_attrs, .. } = &mut fusion.attrs else {
+            continue;
+        };
+        let crate::graph::Attrs::Rope { inline_freqs, .. } = op_attrs else {
+            continue;
+        };
+        *inline_freqs = Some(freqs);
+        fusion.inputs.remove(2);
+    }
+}
+
+fn const_f32_vector(g: &Graph, tid: crate::graph::TensorId, depth: u8) -> Option<Vec<f32>> {
+    let values = const_f64_vector(g, tid, depth)?;
+    Some(values.into_iter().map(|v| v as f32).collect())
+}
+
+fn const_f64_vector(g: &Graph, tid: crate::graph::TensorId, depth: u8) -> Option<Vec<f64>> {
+    if depth > 16 {
+        return None;
+    }
+    let tensor = g.tensors.get(tid as usize)?;
+    let elem_count = tensor
+        .shape
+        .iter()
+        .copied()
+        .map(|x| x.max(1) as usize)
+        .product::<usize>()
+        .max(1);
+    if elem_count > 256 {
+        return None;
+    }
+    if let Some(value) = tensor.scalar_value.as_ref() {
+        let v = match value {
+            crate::graph::ScalarValue::Bool(v) => {
+                if *v {
+                    1.0
+                } else {
+                    0.0
+                }
+            }
+            crate::graph::ScalarValue::Int(v) => *v as f64,
+            crate::graph::ScalarValue::Float(v) => *v,
+        };
+        return Some(vec![v]);
+    }
+    let op = tensor.producer.and_then(|id| g.ops.get(id as usize))?;
+    match op.name.as_str() {
+        "Arange" => {
+            let crate::graph::Attrs::Arange { start, stop, step } = &op.attrs else {
+                return None;
+            };
+            if *step == 0.0 {
+                return None;
+            }
+            let mut out = Vec::with_capacity(elem_count);
+            let mut cur = *start;
+            for _ in 0..elem_count {
+                if (*step > 0.0 && cur >= *stop) || (*step < 0.0 && cur <= *stop) {
+                    break;
+                }
+                out.push(cur);
+                cur += *step;
+            }
+            if out.len() == elem_count {
+                Some(out)
+            } else {
+                None
+            }
+        }
+        "Broadcast" => {
+            let input = *op.inputs.first()?;
+            let v = const_f64_vector(g, input, depth + 1)?;
+            if v.len() == elem_count {
+                Some(v)
+            } else if v.len() == 1 {
+                Some(vec![v[0]; elem_count])
+            } else {
+                None
+            }
+        }
+        "Reshape" | "Flatten" | "Unflatten" | "Squeeze" | "ExpandDims" | "AsContiguous" => {
+            let input = *op.inputs.first()?;
+            let v = const_f64_vector(g, input, depth + 1)?;
+            if v.len() == elem_count {
+                Some(v)
+            } else {
+                None
+            }
+        }
+        "Add" | "Subtract" | "Multiply" | "Divide" | "Power" | "Maximum" | "Minimum" => {
+            if op.inputs.len() < 2 {
+                return None;
+            }
+            let lhs = const_f64_vector(g, op.inputs[0], depth + 1)?;
+            let rhs = const_f64_vector(g, op.inputs[1], depth + 1)?;
+            const_binary(&lhs, &rhs, elem_count, op.name.as_str())
+        }
+        "Negative" => {
+            let input = *op.inputs.first()?;
+            let mut v = const_f64_vector(g, input, depth + 1)?;
+            if v.len() != elem_count {
+                return None;
+            }
+            for x in &mut v {
+                *x = -*x;
+            }
+            Some(v)
+        }
+        _ => None,
+    }
+}
+
+fn const_binary(lhs: &[f64], rhs: &[f64], n: usize, op: &str) -> Option<Vec<f64>> {
+    if !(lhs.len() == n || lhs.len() == 1) || !(rhs.len() == n || rhs.len() == 1) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        let a = if lhs.len() == 1 { lhs[0] } else { lhs[i] };
+        let b = if rhs.len() == 1 { rhs[0] } else { rhs[i] };
+        let v = match op {
+            "Add" => a + b,
+            "Subtract" => a - b,
+            "Multiply" => a * b,
+            "Divide" => a / b,
+            "Power" => a.powf(b),
+            "Maximum" => a.max(b),
+            "Minimum" => a.min(b),
+            _ => return None,
+        };
+        out.push(v);
+    }
+    Some(out)
+}
+
+fn const_scalar_f64(g: &Graph, tid: crate::graph::TensorId, depth: u8) -> Option<f64> {
+    if depth > 16 {
+        return None;
+    }
+    let tensor = g.tensors.get(tid as usize)?;
+    if let Some(value) = tensor.scalar_value.as_ref() {
+        return match value {
+            crate::graph::ScalarValue::Bool(v) => Some(if *v { 1.0 } else { 0.0 }),
+            crate::graph::ScalarValue::Int(v) => Some(*v as f64),
+            crate::graph::ScalarValue::Float(v) => Some(*v),
+        };
+    }
+    let op = tensor.producer.and_then(|id| g.ops.get(id as usize))?;
+    match op.name.as_str() {
+        "Broadcast" | "Reshape" | "Flatten" | "Unflatten" | "Squeeze" | "ExpandDims"
+        | "AsContiguous" => {
+            let input = *op.inputs.first()?;
+            const_scalar_f64(g, input, depth + 1)
+        }
+        "Add" | "Subtract" | "Multiply" | "Divide" | "Power" | "Maximum" | "Minimum" => {
+            if op.inputs.len() != 2 {
+                return None;
+            }
+            let lhs = const_scalar_f64(g, op.inputs[0], depth + 1)?;
+            let rhs = const_scalar_f64(g, op.inputs[1], depth + 1)?;
+            match op.name.as_str() {
+                "Add" => Some(lhs + rhs),
+                "Subtract" => Some(lhs - rhs),
+                "Multiply" => Some(lhs * rhs),
+                "Divide" => Some(lhs / rhs),
+                "Power" => Some(lhs.powf(rhs)),
+                "Maximum" => Some(lhs.max(rhs)),
+                "Minimum" => Some(lhs.min(rhs)),
+                _ => None,
+            }
+        }
+        "Negative" => {
+            let input = *op.inputs.first()?;
+            Some(-const_scalar_f64(g, input, depth + 1)?)
+        }
+        _ => None,
+    }
+}
+
+fn infer_decode_embed_output_scale(g: &Graph, meta: &ModelMeta) -> f32 {
+    fn depends_on_embed_weight(
+        g: &Graph,
+        meta: &ModelMeta,
+        tid: crate::graph::TensorId,
+        depth: u8,
+    ) -> bool {
+        if depth > 12 {
+            return false;
+        }
+        let Some(tensor) = g.tensors.get(tid as usize) else {
+            return false;
+        };
+        if tensor
+            .param_path
+            .as_deref()
+            .is_some_and(|p| p.ends_with("embed_tokens.weight"))
+            && tensor.shape.len() == 2
+            && tensor.shape.first().copied().unwrap_or_default() as u32 == meta.vocab_size
+        {
+            return true;
+        }
+        let Some(op) = tensor.producer.and_then(|id| g.ops.get(id as usize)) else {
+            return false;
+        };
+        if op.name == "Gather" && op.inputs.len() >= 2 {
+            return depends_on_embed_weight(g, meta, op.inputs[0], depth + 1);
+        }
+        if matches!(
+            op.name.as_str(),
+            "Squeeze"
+                | "ExpandDims"
+                | "Reshape"
+                | "Flatten"
+                | "Unflatten"
+                | "AsContiguous"
+                | "Quantize"
+        ) {
+            return op
+                .inputs
+                .iter()
+                .copied()
+                .any(|input| depends_on_embed_weight(g, meta, input, depth + 1));
+        }
+        false
+    }
+
+    for op in &g.ops {
+        if op.name != "Multiply" || op.inputs.len() != 2 || op.outputs.len() != 1 {
+            continue;
+        }
+        let Some(out) = g.tensors.get(op.outputs[0] as usize) else {
+            continue;
+        };
+        if out.shape.last().copied().unwrap_or_default() as u32 != meta.hidden_size {
+            continue;
+        }
+        for data_idx in 0..2 {
+            let data_tid = op.inputs[data_idx];
+            if !depends_on_embed_weight(g, meta, data_tid, 0) {
+                continue;
+            }
+            let scale_tid = op.inputs[1 - data_idx];
+            if let Some(value) = const_scalar_f64(g, scale_tid, 0) {
+                let scale = value as f32;
+                if scale.is_finite() && scale > 0.0 {
+                    return scale;
+                }
+            }
+        }
+    }
+    1.0
 }
 
 fn argmax_multi_tg(vocab_size: u32) -> Option<u32> {
@@ -374,15 +794,122 @@ fn append_prepared_kv_cache_store_decode(g: &Graph, fusions: &mut Vec<Fusion>) {
             .producer
             .map(|id| &g.ops[id as usize])
     };
-    let pre_transpose_input = |tid: crate::graph::TensorId| -> crate::graph::TensorId {
-        match producer(tid) {
-            Some(op) if op.name == "Transpose" && !op.inputs.is_empty() => op.inputs[0],
-            _ => tid,
+    let strip_prepared_kv_views =
+        |tid: crate::graph::TensorId, last_dim: i32| -> crate::graph::TensorId {
+            let mut cur = tid;
+            let mut seen = std::collections::HashSet::new();
+            while seen.insert(cur) {
+                let Some(op) = producer(cur) else {
+                    break;
+                };
+                if !matches!(
+                    op.name.as_str(),
+                    "Broadcast"
+                        | "ExpandDims"
+                        | "Squeeze"
+                        | "Transpose"
+                        | "AsContiguous"
+                        | "Flatten"
+                        | "Unflatten"
+                        | "Reshape"
+                ) || op.inputs.is_empty()
+                {
+                    break;
+                }
+                let next = op
+                    .inputs
+                    .iter()
+                    .copied()
+                    .find(|&input| {
+                        g.tensors
+                            .get(input as usize)
+                            .and_then(|t| t.shape.last().copied())
+                            == Some(last_dim)
+                    })
+                    .unwrap_or(op.inputs[0]);
+                cur = next;
+            }
+            cur
+        };
+    let has_rope_ancestor = |tid: crate::graph::TensorId| -> bool {
+        let mut cur = tid;
+        let mut seen = std::collections::HashSet::new();
+        while seen.insert(cur) {
+            let Some(op) = producer(cur) else {
+                return false;
+            };
+            if op.name == "RoPE" {
+                return true;
+            }
+            if !matches!(
+                op.name.as_str(),
+                "Broadcast"
+                    | "ExpandDims"
+                    | "Squeeze"
+                    | "Transpose"
+                    | "AsContiguous"
+                    | "Flatten"
+                    | "Unflatten"
+                    | "Reshape"
+            ) || op.inputs.is_empty()
+            {
+                return false;
+            }
+            cur = op.inputs[0];
         }
+        false
     };
+    let has_rmsnorm_ancestor = |tid: crate::graph::TensorId| -> bool {
+        let mut stack = vec![(tid, 0u8)];
+        let mut seen = std::collections::HashSet::new();
+        while let Some((cur, depth)) = stack.pop() {
+            if !seen.insert(cur) || depth > 10 {
+                continue;
+            }
+            let Some(op) = producer(cur) else {
+                continue;
+            };
+            if op.name == "RMSNorm" {
+                return true;
+            }
+            if !matches!(
+                op.name.as_str(),
+                "Broadcast"
+                    | "ExpandDims"
+                    | "Squeeze"
+                    | "Transpose"
+                    | "AsContiguous"
+                    | "Flatten"
+                    | "Unflatten"
+                    | "Reshape"
+                    | "RoPE"
+            ) {
+                continue;
+            }
+            for &input in &op.inputs {
+                stack.push((input, depth + 1));
+            }
+        }
+        false
+    };
+    let existing_kv_store_layers: std::collections::HashSet<i32> = fusions
+        .iter()
+        .filter(|fusion| {
+            matches!(
+                fusion.kind,
+                FusionKind::RopeKvCacheStoreDecode
+                    | FusionKind::RmsNormRopeKvCacheStoreDecode
+                    | FusionKind::KvCacheStoreDecode
+            )
+        })
+        .filter_map(|fusion| fusion_layer_index(g, fusion))
+        .collect();
 
     for sdpa in fusions.clone() {
-        if !matches!(sdpa.kind, FusionKind::SdpaDecode) || sdpa.inputs.len() < 3 {
+        let is_decode_sdpa = matches!(sdpa.kind, FusionKind::SdpaDecode);
+        let is_direct_sdpa =
+            matches!(&sdpa.kind, FusionKind::Single(name) if name == "ScaledDotProductAttention");
+        if (!is_decode_sdpa && !is_direct_sdpa) || sdpa.inputs.len() < 3 {
             continue;
         }
         let layer_idx = sdpa
@@ -402,6 +929,13 @@ fn append_prepared_kv_cache_store_decode(g: &Graph, fusions: &mut Vec<Fusion>) {
         let Some(layer_idx) = layer_idx else {
             continue;
         };
+        if is_direct_sdpa && existing_kv_store_layers.contains(&layer_idx) {
+            continue;
+        }
+        let direct_normed_kv = is_direct_sdpa && has_rmsnorm_ancestor(sdpa.inputs[1].source);
+        if is_direct_sdpa && !direct_normed_kv {
+            continue;
+        }
 
         let Some(qk_dim) = sdpa.inputs[0].shape.last().copied() else {
             continue;
@@ -409,21 +943,47 @@ fn append_prepared_kv_cache_store_decode(g: &Graph, fusions: &mut Vec<Fusion>) {
         let Some(v_dim) = sdpa.inputs[2].shape.last().copied() else {
             continue;
         };
-        // Standard MHA/GQA has qk_dim == v_dim and is covered by the
-        // RoPE+KV synthetic path. This primitive is for trace-prepared
-        // K/V with asymmetric SDPA dimensions, e.g. MLA qk=192, v=128.
-        if qk_dim == v_dim {
-            continue;
-        }
-
-        let k_current = pre_transpose_input(sdpa.inputs[1].source);
-        let v_current = pre_transpose_input(sdpa.inputs[2].source);
+        let scale = match sdpa.attrs {
+            FusionAttrs::SdpaDecode { scale, .. } => scale,
+            FusionAttrs::Single {
+                op_attrs: crate::graph::Attrs::ScaledDotProductAttention { scale },
+                ..
+            } => scale,
+            _ => (qk_dim as f32).powf(-0.5),
+        };
+        let k_current = strip_prepared_kv_views(sdpa.inputs[1].source, qk_dim);
+        let v_current = if direct_normed_kv {
+            sdpa.inputs[2].source
+        } else {
+            strip_prepared_kv_views(sdpa.inputs[2].source, v_dim)
+        };
         let k_shape = &g.tensors[k_current as usize].shape;
         let Some(k_dim) = k_shape.last().copied() else {
             continue;
         };
         if k_dim != qk_dim {
             continue;
+        }
+        // Standard full-dim RoPE MHA/GQA is covered by the synthetic
+        // RopeKvCacheStoreDecode path. Prepared-store is for trace-prepared
+        // K/V: asymmetric MLA, or partial/freqs RoPE where Single(RoPE)
+        // intentionally survives and has already produced the exact K row.
+        if qk_dim == v_dim && !has_rope_ancestor(k_current) {
+            continue;
+        }
+
+        if direct_normed_kv {
+            if let Some(existing) = fusions.iter_mut().find(|fusion| fusion.id == sdpa.id) {
+                existing.kind = FusionKind::SdpaDecode;
+                existing.attrs = FusionAttrs::SdpaDecode {
+                    scale,
+                    trace_q: true,
+                    q_split: None,
+                    q_transpose_split: false,
+                    q1_rope: None,
+                    mask: AttentionMask::Causal,
+                };
+            }
         }
 
         fusions.push(Fusion {
@@ -435,7 +995,10 @@ fn append_prepared_kv_cache_store_decode(g: &Graph, fusions: &mut Vec<Fusion>) {
                 boundary(g, v_current, "v_current"),
             ],
             outputs: vec![],
-            attrs: FusionAttrs::KvCacheStoreDecode,
+            attrs: FusionAttrs::KvCacheStoreDecode {
+                k1_rope: None,
+                kv_transpose_split: None,
+            },
             parallel_axes: vec![],
             layer_hint: Some(crate::graph::LayerTag::Layer(layer_idx)),
         });
@@ -729,6 +1292,10 @@ fn append_qwen3_next_attention_decode(g: &Graph, fusions: &mut Vec<Fusion>) {
             outputs: vec![boundary(g, sdpa_flat, "out")],
             attrs: FusionAttrs::SdpaDecode {
                 scale,
+                trace_q: false,
+                q_split: None,
+                q_transpose_split: false,
+                q1_rope: None,
                 mask: AttentionMask::Causal,
             },
             parallel_axes: vec![],
@@ -744,6 +1311,7 @@ fn boundary(g: &Graph, tid: crate::graph::TensorId, role: &'static str) -> Fusio
         role,
         shape: t.shape.clone(),
         dtype: t.dtype,
+        scalar_value: t.scalar_value.clone(),
     }
 }
 
@@ -759,32 +1327,42 @@ fn fusion_layer_index(g: &Graph, fusion: &Fusion) -> Option<i32> {
     })
 }
 
+fn tensor_semantic_layer(g: &Graph, tid: crate::graph::TensorId) -> Option<i32> {
+    let mut cur = tid;
+    let mut seen = std::collections::HashSet::new();
+    while seen.insert(cur) {
+        let tensor = g.tensors.get(cur as usize)?;
+        let op_id = tensor.producer?;
+        let op = g.ops.get(op_id as usize)?;
+        if let Some(crate::graph::LayerTag::Layer(layer)) = op.layer_id {
+            return Some(layer);
+        }
+        if !matches!(
+            op.name.as_str(),
+            "Reshape"
+                | "Flatten"
+                | "Unflatten"
+                | "Squeeze"
+                | "ExpandDims"
+                | "Transpose"
+                | "AsContiguous"
+                | "RoPE"
+                | "Slice"
+        ) || op.inputs.is_empty()
+        {
+            return None;
+        }
+        cur = op.inputs[0];
+    }
+    None
+}
+
 fn qkv_decode_inputs_by_layer(
     g: &Graph,
     fusions: &[Fusion],
 ) -> HashMap<i32, (FusionBoundary, FusionBoundary, FusionBoundary)> {
-    let mut out = HashMap::new();
-    for fusion in fusions {
-        if !matches!(fusion.kind, FusionKind::RmsNormQkv) {
-            continue;
-        }
-        let Some(layer) = fusion_layer_index(g, fusion) else {
-            continue;
-        };
-        let Some(q) = fusion.outputs.iter().find(|b| b.role == "q").cloned() else {
-            continue;
-        };
-        let Some(k) = fusion.outputs.iter().find(|b| b.role == "k").cloned() else {
-            continue;
-        };
-        let Some(v) = fusion.outputs.iter().find(|b| b.role == "v").cloned() else {
-            continue;
-        };
-        // If a layer somehow has multiple semantic QKV producers,
-        // keeping the first avoids guessing. The later sink pass will
-        // only absorb consumers whose input source matches.
-        out.entry(layer).or_insert((q, k, v));
-    }
+    let mut out: HashMap<i32, (i32, (FusionBoundary, FusionBoundary, FusionBoundary))> =
+        HashMap::new();
 
     let producer = |tid: crate::graph::TensorId| -> Option<&crate::graph::Op> {
         g.tensors
@@ -801,7 +1379,15 @@ fn qkv_decode_inputs_by_layer(
             };
             if !matches!(
                 op.name.as_str(),
-                "RoPE" | "Transpose" | "AsContiguous" | "Squeeze" | "ExpandDims"
+                "RoPE"
+                    | "Transpose"
+                    | "AsContiguous"
+                    | "Squeeze"
+                    | "ExpandDims"
+                    | "Broadcast"
+                    | "Reshape"
+                    | "Flatten"
+                    | "Unflatten"
             ) || op.inputs.is_empty()
             {
                 break;
@@ -810,26 +1396,70 @@ fn qkv_decode_inputs_by_layer(
         }
         cur
     };
+    let tensor_score = |layer: i32, tid: crate::graph::TensorId| -> i32 {
+        let mut score = 0;
+        if let Some(op) = producer(tid) {
+            score += 4;
+            if matches!(
+                op.name.as_str(),
+                "RMSNorm" | "RoPE" | "Transpose" | "Reshape" | "QuantizedMatmul" | "Matmul"
+            ) {
+                score += 1;
+            }
+            if op.layer_id == Some(crate::graph::LayerTag::Layer(layer)) {
+                score += 4;
+            }
+        }
+        if tensor_semantic_layer(g, tid) == Some(layer) {
+            score += 4;
+        }
+        score
+    };
+    let insert_candidate =
+        |out: &mut HashMap<i32, (i32, (FusionBoundary, FusionBoundary, FusionBoundary))>,
+         layer: i32,
+         score: i32,
+         q: FusionBoundary,
+         k: FusionBoundary,
+         v: FusionBoundary| {
+            let replace = out
+                .get(&layer)
+                .is_none_or(|(existing_score, _)| score > *existing_score);
+            if replace {
+                out.insert(layer, (score, (q, k, v)));
+            }
+        };
+    let debug_qkv = std::env::var("FUSEKIT_QKV_DEBUG").as_deref() == Ok("1");
 
-    for fusion in fusions {
-        let FusionKind::Single(name) = &fusion.kind else {
-            continue;
-        };
-        if name != "ScaledDotProductAttention" || fusion.inputs.len() < 3 {
+    for op in &g.ops {
+        if op.name != "ScaledDotProductAttention" || op.inputs.len() < 3 {
             continue;
         }
-        let Some(layer) = fusion_layer_index(g, fusion) else {
+        let Some(crate::graph::LayerTag::Layer(layer)) = op.layer_id else {
             continue;
         };
-        if out.contains_key(&layer) {
-            continue;
-        }
-        let q = strip_rope_transpose(fusion.inputs[0].source);
-        let k = strip_rope_transpose(fusion.inputs[1].source);
-        let v = strip_rope_transpose(fusion.inputs[2].source);
+        let q = strip_rope_transpose(op.inputs[0]);
+        let k = strip_rope_transpose(op.inputs[1]);
+        let v = strip_rope_transpose(op.inputs[2]);
         let q_shape = &g.tensors[q as usize].shape;
         let k_shape = &g.tensors[k as usize].shape;
         let v_shape = &g.tensors[v as usize].shape;
+        if debug_qkv {
+            eprintln!(
+                "[qkv-debug] raw-sdpa op={} layer={:?} q={} {:?} q_layer={:?} k={} {:?} k_layer={:?} v={} {:?} v_layer={:?}",
+                op.id,
+                op.layer_id,
+                q,
+                q_shape,
+                tensor_semantic_layer(g, q),
+                k,
+                k_shape,
+                tensor_semantic_layer(g, k),
+                v,
+                v_shape,
+                tensor_semantic_layer(g, v)
+            );
+        }
         if q_shape.len() < 3 || k_shape.len() < 3 || v_shape.len() < 3 {
             continue;
         }
@@ -845,14 +1475,108 @@ fn qkv_decode_inputs_by_layer(
         if q_last <= 0 || k_last <= 0 || v_last <= 0 || k_last != v_last {
             continue;
         }
-        out.insert(
+        let score = 32 + tensor_score(layer, q) + tensor_score(layer, k) + tensor_score(layer, v);
+        insert_candidate(
+            &mut out,
             layer,
-            (
-                boundary(g, q, "q"),
-                boundary(g, k, "k"),
-                boundary(g, v, "v"),
-            ),
+            score,
+            boundary(g, q, "q"),
+            boundary(g, k, "k"),
+            boundary(g, v, "v"),
         );
     }
-    out
+
+    for fusion in fusions {
+        let is_sdpa = matches!(fusion.kind, FusionKind::SdpaDecode)
+            || matches!(&fusion.kind, FusionKind::Single(name) if name == "ScaledDotProductAttention");
+        if !is_sdpa || fusion.inputs.len() < 3 {
+            continue;
+        }
+        let Some(layer) = fusion_layer_index(g, fusion) else {
+            continue;
+        };
+        let q = strip_rope_transpose(fusion.inputs[0].source);
+        let k = strip_rope_transpose(fusion.inputs[1].source);
+        let v = strip_rope_transpose(fusion.inputs[2].source);
+        let q_shape = &g.tensors[q as usize].shape;
+        let k_shape = &g.tensors[k as usize].shape;
+        let v_shape = &g.tensors[v as usize].shape;
+        if debug_qkv {
+            eprintln!(
+                "[qkv-debug] fusion-sdpa kind={:?} layer={:?} q={} {:?} q_layer={:?} k={} {:?} k_layer={:?} v={} {:?} v_layer={:?}",
+                fusion.kind,
+                fusion_layer_index(g, fusion),
+                q,
+                q_shape,
+                tensor_semantic_layer(g, q),
+                k,
+                k_shape,
+                tensor_semantic_layer(g, k),
+                v,
+                v_shape,
+                tensor_semantic_layer(g, v)
+            );
+        }
+        if q_shape.len() < 3 || k_shape.len() < 3 || v_shape.len() < 3 {
+            continue;
+        }
+        let Some(q_last) = q_shape.last().copied() else {
+            continue;
+        };
+        let Some(k_last) = k_shape.last().copied() else {
+            continue;
+        };
+        let Some(v_last) = v_shape.last().copied() else {
+            continue;
+        };
+        if q_last <= 0 || k_last <= 0 || v_last <= 0 || k_last != v_last {
+            continue;
+        }
+        let mut score = 16;
+        score += tensor_score(layer, q);
+        score += tensor_score(layer, k);
+        score += tensor_score(layer, v);
+        if matches!(&fusion.kind, FusionKind::Single(name) if name == "ScaledDotProductAttention") {
+            score += 4;
+        }
+        insert_candidate(
+            &mut out,
+            layer,
+            score,
+            boundary(g, q, "q"),
+            boundary(g, k, "k"),
+            boundary(g, v, "v"),
+        );
+    }
+
+    for fusion in fusions {
+        if !matches!(fusion.kind, FusionKind::RmsNormQkv) {
+            continue;
+        }
+        let Some(layer) = fusion_layer_index(g, fusion) else {
+            continue;
+        };
+        let Some(q) = fusion.outputs.iter().find(|b| b.role == "q").cloned() else {
+            continue;
+        };
+        let Some(k) = fusion.outputs.iter().find(|b| b.role == "k").cloned() else {
+            continue;
+        };
+        let Some(v) = fusion.outputs.iter().find(|b| b.role == "v").cloned() else {
+            continue;
+        };
+        // Fallback for synthetic/test graphs without a surviving SDPA edge.
+        // Real decode traces prefer the SDPA-derived semantic sources above:
+        // if Q/K/V pass through post-projection norms before attention, the
+        // strip walk stops at those norm outputs instead of the raw projection.
+        let score = 4
+            + tensor_score(layer, q.source)
+            + tensor_score(layer, k.source)
+            + tensor_score(layer, v.source);
+        insert_candidate(&mut out, layer, score, q, k, v);
+    }
+
+    out.into_iter()
+        .map(|(layer, (_, qkv))| (layer, qkv))
+        .collect()
 }

@@ -22,7 +22,7 @@ patch time  │    src/loader.rs        mx.export_function callback       │
             │                          + FusionKind::Single(op_name)    │
             │                              for unmatched ops             │
             ├───────────────────────────────────────────────────────────┤
-            │  Stage 3 — General op-semantic fusion (NEW)               │
+            │  Stage 3 — General op-semantic fusion                     │
             │    src/fusion/category.rs   op kind table + chain rules   │
             │    src/fusion/general.rs    producer→consumer merge       │
             │                          → FusionKind::FusedChain         │
@@ -38,7 +38,7 @@ patch time  │    src/loader.rs        mx.export_function callback       │
             ┌───────────────────────────────────────────────────────────┐
 runtime     │  Runtime — fusekit_runtime (Python ext + Rust dispatcher) │
 (decode     │    python_runtime/        pyo3 cdylib                      │
- hot path)  │    runtime/fusekit_runtime/ Python hook into mlx_lm       │
+ hot path)  │    python/fusekit_runtime/ Python hook into mlx_lm        │
             │       attach()  → install ICB on the loaded model         │
             │       per-token: submit_icb_async + wait_pending_icb      │
             └───────────────────────────────────────────────────────────┘
@@ -113,7 +113,7 @@ All weight-matmul patterns accept both `Matmul` and `QuantizedMatmul` and captur
 
 Runs **after** Stage 2. Walks the FusionGraph and merges adjacent `FusionKind::Single` (and `FusionKind::FusedChain`) fusions into bigger chains, using only op-semantic categories, single-consumer reachability, and shape compatibility.
 
-Gated by `FUSEKIT_GENERAL_FUSION=1` env var while the default-on policy is being validated.
+The CLI enables general fusion for the default `--patterns auto` path. `--patterns on` keeps the legacy hand-tuned pattern path available for comparison.
 
 ### Op categories (`src/fusion/category.rs`)
 
@@ -194,26 +194,17 @@ The fixed-point loop keeps merging until nothing can grow. CustomKernel and any 
 
 ### Current scope
 
-- ✅ Single↔Single pointwise pairs
-- ✅ FusedChain↔Single & Single↔FusedChain (N-step chains)
-- ✅ Heavy first-step (Matmul, QuantizedMatmul) → Pointwise tail
-- ✅ Batched Matmul (any `a_batch == b_batch`) → Pointwise tail
-- ✅ Reduction first-step (RMSNorm) → Pointwise tail. Body uses one
-  threadgroup per row with simdgroup_sum reduction; tail external
-  operands are shape-classified (`same-as-output`, `hidden-broadcast`,
-  `scalar`) and indexed accordingly.
-- ✅ View absorption (element-contiguous: Reshape, Flatten, Unflatten,
-  Squeeze, ExpandDims, AsContiguous)
-- ⏳ Softmax first-step
-- ⏳ Broadcast / Transpose absorption (stride math)
-- ⏳ Multi-output fan-out
+The general pass now covers pointwise/view chains, dense and quantized matmul
+tails, reduction fan-out, decode SDPA, Q/K/V and KV-cache sinks, routed MoE
+qMV/reduction paths, final-head lowering, and selected custom-kernel boundaries.
+Admission is based on graph semantics, tensor shape, dtype/quantization metadata,
+and target register/threadgroup-memory budgets rather than model names.
 
-### Empirical numbers
-
-| Model | FusionGraph fusions (Stage 2 only) | After Stage 3 | Chains | Notable absorptions |
-|---|---|---|---|---|
-| Qwen2.5-Coder-0.5B-4bit | 878 | 878 | 0 | Stage 2 pattern matchers already absorb everything reachable |
-| Qwen3.6-27B-4bit | 2469 | **1861** | **384** | 144 standalone QM → 0 (all chain heads), 16 batched Matmul (SDPA Q@Kᵀ) absorbed, 48 RMSNorms absorbed into Reduction-head chains, 320+ view+pointwise chains around the SSM body |
+Not every legal merge is profitable. Large fan-out, transposes, quantized
+weight-streaming schedules, and multi-row variants remain guarded by cost and
+correctness checks. Measured coverage belongs in benchmark artifacts rather
+than this architecture description; see [`../BENCHMARKS.md`](../BENCHMARKS.md)
+and the optimization logs.
 
 ---
 
@@ -268,31 +259,29 @@ Buffer signatures are typed from `ModelMeta::activation_dtype` (bf16 vs half) �
 
 ---
 
-## Runtime (`runtime/fusekit_runtime/` and `python_runtime/`)
+## Runtime (`python/fusekit_runtime/` and `python_runtime/`)
 
-This is the **currently incomplete piece** in the megakernel automation story.
+`fusekit patch` embeds and extracts the Python package plus native extension into
+`<model>/fusekit/runtime/`, then installs one `fusekit.pth` file in the bundled
+Python's user site-packages. The hook wraps `mlx_lm.load` only when a matching
+compiled artifact exists.
 
-### How runtime works today
+`task_graph.json` carries kernel names, launch geometry, ordered decode tasks,
+parameter source paths, scratch descriptions, scalar constants, side-effect
+bindings, and read/write metadata. The runtime uses that information to:
 
-`fusekit patch` extracts a Python package (`fusekit_runtime`) into `<model>/fusekit/runtime/` and installs a global hook (`~/.local/lib/python3.11/site-packages/fusekit.pth`) that monkey-patches `mlx_lm.load`. After load, fusekit's `attach()`:
+1. resolve model parameters and cache tensors against the live model;
+2. allocate/register scratch arenas and mutable uniform buffers;
+3. load `kernel.metallib` and build pipeline states in the PyO3 extension;
+4. pre-encode the decode dispatch list into an ICB with dependency barriers;
+5. update token/offset/cache state and submit asynchronously per step;
+6. fall back to mlx-lm when cache, sampler, shape, or correctness invariants do
+   not match a supported fast path.
 
-1. Loads `kernel.metallib` + `task_graph.json` into a Rust dispatcher (`python_runtime/` pyo3 cdylib).
-2. (Optionally) installs `fast_generate_step` to skip mlx-lm's per-token Python overhead.
-3. **For Qwen2.5-style models only**, the demo `scripts/replace_layer_full.py` script hand-patches each layer's forward to dispatch fusekit kernels in an ICB.
-
-### What's hand-written today vs what should be automatic
-
-The hand-written part in `scripts/replace_layer_full.py` knows about Qwen2.5's layer structure (which attribute is `attn.q_proj`, which scratch buffer is `q_buf`, which uniform is `offset`, …). This is the only thing that ties fusekit to a particular model family.
-
-To support arbitrary models — Qwen3.6 included — Stage 4 should emit, alongside `task_graph.json`, enough metadata for the runtime to build the ICB **without** any hand-written Python:
-
-- per-task: kernel name, grid, threadgroup, list of buffer bindings
-- per buffer binding: where the tensor lives at runtime (`model.layers[3].self_attn.q_proj.scales`, or a scratch buffer of given shape/dtype, or a uniform written each token)
-- task dependency edges
-
-The runtime hook then just walks task_graph.json, resolves tensors from the loaded model, allocates scratch and uniforms, builds the ICB once, and dispatches per token.
-
-This is the "D" step in the project's near-term roadmap. None of Stage 1-3 needs to change to make D work — the IR already has enough information, it just doesn't get serialised into a runtime-consumable form yet.
+The dispatch layer is graph/metadata driven. `scripts/replace_*` files are
+retained debug experiments and are not part of the installed runtime. Optional
+compiled variants under `<model>/fusekit/variants/` handle selected prefill and
+MTP active-row sizes while the root artifact remains the M=1 decode path.
 
 ---
 
@@ -312,8 +301,8 @@ src/
       …
     safety.rs                  SMEM budget check per FusionKind
     build.rs                   Stage 2 driver
-    category.rs                NEW — OpCategory + can_chain_into
-    general.rs                 NEW — Stage 3 merge pass
+    category.rs                OpCategory + can_chain_into
+    general.rs                 Stage 3 semantic merge/admission pass
 
   task/                        Stage 2.5: fusion → tasks (partitioning)
     build.rs
@@ -326,40 +315,26 @@ src/
       mod.rs                   emit_for dispatcher + act_ty + int4 GEMV helper
       rmsnorm_qkv.rs           Stage 2 pattern emitters
       …
-      single.rs                NEW — universal 1:1 op emitter (Pointwise, View,
+      single.rs                universal 1:1 op emitter (Pointwise, View,
                                Heavy, CustomKernel)
-      fused_chain.rs           NEW — Stage 3 chain emitter (Pointwise-first,
-                               Heavy-first)
+      fused_chain.rs           Stage 3 chain/fan-out emitter
 
-python_runtime/              pyo3 cdylib — Rust ICB dispatcher (loaded by Python)
-runtime/                     extracted into <model>/fusekit/runtime/ at patch time
-
-scripts/replace_layer_full.py  hand-written demo dispatcher (Qwen2.5 only) —
-                               will be removed once D lands.
+python/fusekit_runtime/      installed Python hook + graph-driven dispatcher
+python_runtime/              pyo3 cdylib — Metal/ICB bridge loaded by Python
+scripts/                     benchmark, correctness, profiling, and debug tools
 ```
 
 ---
 
-## Roadmap
+## Current engineering priorities
 
-Near-term (in order of "what makes Qwen3.6 get real speedup"):
-
-1. **D — Auto-install** (1–2 weeks)
-   Stage 4 emits task_graph.json with full binding metadata. Runtime hook becomes model-agnostic. Without this, Stage 3 fusions exist in the metallib but never get dispatched on novel models. Removes the hand-written `scripts/replace_layer_full.py`.
-
-2. **C — Reduction tail** (3–5 hours)
-   Allow Softmax / RMSNorm as Heavy-equivalent chain head. SMEM scratch + simdgroup_sum already used by Stage 2 emitters; lift those into the chain emitter.
-
-3. **B — Batched Matmul** (3–4 hours, plus C for the full SDPA win)
-   Relax `matmul_chain_shape_ok` and emit `(batch, M, N)` grid. With C, the general path discovers SDPA's `Q@Kᵀ → Multiply → Softmax → @V` chain and SdpaDecode becomes deprecable.
-
-4. **E (2 — Broadcast/Transpose absorption)** (2–3 hours)
-   Stride math inside chains; extends absorption past the easy element-contiguous views.
-
-Pattern matcher deprecation (when general can produce equal-or-better fusions automatically): the remaining gaps are
-
-- **automatic SMEM caching** for fan-out (one producer feeding several consumers — what `RmsNormQkv` does with its norm output across Q/K/V),
-- **vector loads** (`bfloat4` / `half4` × unroll based on shape divisibility),
-- **cost model** for size-sensitive trade-offs (SMEM budget, register pressure, dispatch count vs cache miss).
-
-Simdgroup-cooperative emit and parallel-axis selection are now in place for the Heavy/Reduction chain heads; closing fan-out + vector loads is what gets the chain emit on par with the hand-tuned `RmsNormQkv` / `RmsNormGateUpSwiglu` patterns. At that point `LinearResidual`, then `SdpaDecode`, then the rmsnorm-fused-MLP patterns become removable.
+1. Requalify the checked-in defaults on the advertised model matrix and archive
+   raw JSONL/logit evidence with each release.
+2. Improve q4 weight streaming and reduction-fanout kernels where long-context
+   Gemma/DeepSeek results remain near parity or regress.
+3. Turn prefill variants into a measured, documented path; no complete persisted
+   prefill table currently exists.
+4. Reduce compatibility code in the Python hook and retire debug-only replacement
+   scripts as equivalent graph-driven paths are proven.
+5. Keep fusion admission semantic and budget based while expanding automated
+   tests for emitted MSL, task-graph bindings, and cache transitions.

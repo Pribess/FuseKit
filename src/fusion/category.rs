@@ -99,8 +99,9 @@ pub fn categorize_name(name: &str) -> OpCategory {
     use OpCategory::*;
     match name {
         // ── Pointwise (binary / unary / ternary) ──
-        "Add" | "Multiply" | "Sigmoid" | "Exp" | "Negative" | "AsType" | "Select"
-        | "GreaterEqual" | "LogAddExp" => Pointwise,
+        "Add" | "Subtract" | "Multiply" | "Divide" | "Power" | "Maximum" | "Minimum"
+        | "Sigmoid" | "Tanh" | "Exp" | "Negative" | "AsType" | "Select" | "GreaterEqual"
+        | "LogAddExp" => Pointwise,
 
         // ── View-only (storage unchanged or stride-only) ──
         "Reshape" | "Flatten" | "Unflatten" | "Squeeze" | "ExpandDims" | "AsContiguous"

@@ -16,6 +16,12 @@ use std::process::Command;
 
 use crate::{omlx, paths, ui};
 
+// Embedded so `fusekit profile` works from a standalone release binary.
+const BASELINE_SCRIPT: &str = include_str!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/scripts/baseline_infer.py"
+));
+
 /// Outer entry: spawn xctrace, which re-execs this binary in
 /// `profile-inner` mode under recording.
 pub fn run(
@@ -74,7 +80,6 @@ pub fn run_inner(model: &str, prompt: &str, max_tokens: usize) -> Result<()> {
     let m = omlx::find_model(model)?;
     let python = paths::mlx_python_bin()?;
     let site_packages = paths::mlx_site_packages()?;
-    let script = locate_baseline_script()?;
 
     ui::step(format!(
         "baseline inference: {} tokens on {}",
@@ -82,39 +87,20 @@ pub fn run_inner(model: &str, prompt: &str, max_tokens: usize) -> Result<()> {
     ));
 
     let status = Command::new(&python)
-        .arg(&script)
+        .arg("-c")
+        .arg(BASELINE_SCRIPT)
         .arg(&m.path)
         .arg(prompt)
         .arg(max_tokens.to_string())
         .env("PYTHONUNBUFFERED", "1")
         .env("PYTHONPATH", &site_packages)
         .status()
-        .context("running baseline_infer.py")?;
+        .context("running embedded baseline inference driver")?;
 
     if !status.success() {
-        return Err(anyhow!("baseline_infer.py exited with {status}"));
+        return Err(anyhow!("baseline inference driver exited with {status}"));
     }
     Ok(())
-}
-
-fn locate_baseline_script() -> Result<PathBuf> {
-    // Look next to the executable first (release install), then fall
-    // back to the source-tree layout used during development. Matches
-    // `loader::locate_driver_script`'s contract.
-    let exe = std::env::current_exe()?;
-    let candidates = [
-        exe.parent().map(|p| p.join("scripts/baseline_infer.py")),
-        exe.parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("scripts/baseline_infer.py")),
-        Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/baseline_infer.py")),
-    ];
-    for c in candidates.into_iter().flatten() {
-        if c.is_file() {
-            return Ok(c);
-        }
-    }
-    Err(anyhow!("baseline_infer.py not found"))
 }
 
 fn timestamp_secs() -> u64 {

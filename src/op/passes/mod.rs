@@ -17,8 +17,7 @@ pub mod inplace;
 pub mod layout_inference;
 pub mod macros;
 
-pub use algebraic::{AlgebraicRewrites, Rewrite, RewriteRule};
-pub use cost::{estimate_op_cost, Cost};
+pub use algebraic::AlgebraicRewrites;
 pub use dce::DeadCodeElimination;
 pub use decode_specialize::DecodeL1Specialize;
 pub use inplace::InPlaceAnalysis;

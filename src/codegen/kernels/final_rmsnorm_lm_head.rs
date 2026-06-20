@@ -169,6 +169,7 @@ pub fn emit(
     let t = crate::codegen::kernels::act_ty(meta);
     let is_quant = quant.is_some();
     let norm_ty = norm_smem_ty(t, quant);
+    let rsqrt_fn = crate::codegen::kernels::rmsnorm_rsqrt_fn();
     let fn_name = function_name(fusion);
 
     w.line(format!(
@@ -221,7 +222,9 @@ pub fn emit(
     w.line("threadgroup float sum_sq_partial[32];");
     w.blank();
     crate::codegen::kernels::emit_rmsnorm_reduction(w, hidden, "x_row", "sum_sq_partial");
-    w.line("float rms_scale = metal::precise::rsqrt(sum_sq_partial[0] / float(HIDDEN) + EPS);");
+    w.line(format!(
+        "float rms_scale = {rsqrt_fn}(sum_sq_partial[0] / float(HIDDEN) + EPS);"
+    ));
     emit_norm_writeback_to_smem_ty(w, hidden, "x_row", "norm_w", t, norm_ty);
     w.blank();
 
@@ -354,7 +357,7 @@ fn dense_lm_head_k8_unroll_enabled(hidden: u32, vocab: u32) -> bool {
         && hidden.is_multiple_of(32)
 }
 
-fn final_head_target_tgs(meta: &ModelMeta, quant: Option<crate::fusion::ir::QuantInfo>) -> u64 {
+pub(crate) fn target_tgs(meta: &ModelMeta, quant: Option<crate::fusion::ir::QuantInfo>) -> u64 {
     let vocab = meta.vocab_size as u64;
     let chip = crate::target::current_chip();
     let b = chip.budgets();
@@ -367,7 +370,11 @@ fn final_head_target_tgs(meta: &ModelMeta, quant: Option<crate::fusion::ir::Quan
             && meta.hidden_size >= 2048
             && vocab >= 131_072 =>
         {
-            128
+            // Dense large-vocab heads are dominated by streaming the LM-head
+            // matrix. M5 late-token profiles on 4B-class bf16 heads favor a
+            // wider split: the extra per-slice RMSNorm/finalize work is
+            // smaller than the gained vocab parallelism.
+            256
         }
         Some(q)
             if matches!(chip, crate::target::ChipModel::M5)
@@ -391,10 +398,10 @@ fn final_head_target_tgs(meta: &ModelMeta, quant: Option<crate::fusion::ir::Quan
                 && q.bits == 8
                 && (2048..=4096).contains(&meta.hidden_size) =>
         {
-            // Mid-size q8 LM heads are dominated by streaming the vocab
-            // matrix, but too many scan slices spend more time in the
-            // per-slice reduction/finalize path. L512 M5 profiles favored 32
-            // slices over 48/64 for this hidden-width class.
+            // Mid-size q8 heads still stream a large vocab matrix, but
+            // L512 late-token profiles show 64 slices repeat RMSNorm and
+            // finalize work enough to erase the qMV win. Keep the split
+            // budgeted by hidden/quant shape rather than model identity.
             32
         }
         _ => 64,
@@ -423,10 +430,11 @@ fn emit_argmax_pair(
         .map(|b| crate::target::current_chip().active_rows_before_last(&b.shape))
         .unwrap_or(1)
         .max(1);
-    let n_tgs = final_head_target_tgs(meta, quant);
+    let n_tgs = target_tgs(meta, quant);
     let t = crate::codegen::kernels::act_ty(meta);
     let is_quant = quant.is_some();
     let norm_ty = norm_smem_ty(t, quant);
+    let rsqrt_fn = crate::codegen::kernels::rmsnorm_rsqrt_fn();
     let scan_name = argmax_function_name(fusion);
 
     w.line(format!(
@@ -471,7 +479,9 @@ fn emit_argmax_pair(
     w.line(format!("threadgroup {norm_ty} norm_y[HIDDEN];"));
     w.line("threadgroup float sum_sq_partial[32];");
     crate::codegen::kernels::emit_rmsnorm_reduction(w, hidden, "x_row", "sum_sq_partial");
-    w.line("float rms_scale = metal::precise::rsqrt(sum_sq_partial[0] / float(HIDDEN) + EPS);");
+    w.line(format!(
+        "float rms_scale = {rsqrt_fn}(sum_sq_partial[0] / float(HIDDEN) + EPS);"
+    ));
     emit_norm_writeback_to_smem_ty(w, hidden, "x_row", "norm_w", t, norm_ty);
     w.blank();
 

@@ -58,6 +58,7 @@ pub fn capture_with_seq(model_dir: &Path, seq_len: u32) -> Result<RawGraph> {
         .to_str()
         .ok_or_else(|| anyhow!("non-UTF8 model_dir: {}", model_dir.display()))?
         .to_owned();
+    let allow_extra_shared_kv = gemma4_has_extra_shared_kv_weights(model_dir);
 
     let raw = Python::with_gil(|py| -> Result<RawGraph> {
         // Inject the oMLX site-packages so `import mlx_lm` resolves.
@@ -70,14 +71,36 @@ pub fn capture_with_seq(model_dir: &Path, seq_len: u32) -> Result<RawGraph> {
         path.insert(0, site_packages.to_str().unwrap())
             .map_err(map_pyerr)?;
 
-        // Load the model.
-        let mlx_lm = py.import_bound("mlx_lm").map_err(map_pyerr)?;
-        let load_result = mlx_lm
-            .getattr("load")
-            .map_err(map_pyerr)?
-            .call1((model_dir_str.as_str(),))
-            .map_err(map_pyerr)?;
-        let model = load_result.get_item(0).map_err(map_pyerr)?;
+        // Load the model. Gemma4 E*B exports can include K/V tensors for
+        // layers that the config marks as KV-shared. The model semantics are
+        // the shared-KV config; the extra tensors are harmless checkpoint
+        // baggage, so capture uses non-strict loading only for that verified
+        // config/weight shape.
+        let model = if allow_extra_shared_kv {
+            let pathlib = py.import_bound("pathlib").map_err(map_pyerr)?;
+            let model_path = pathlib
+                .getattr("Path")
+                .map_err(map_pyerr)?
+                .call1((model_dir_str.as_str(),))
+                .map_err(map_pyerr)?;
+            let utils = py.import_bound("mlx_lm.utils").map_err(map_pyerr)?;
+            let kwargs = PyDict::new_bound(py);
+            kwargs.set_item("strict", false).map_err(map_pyerr)?;
+            let load_result = utils
+                .getattr("load_model")
+                .map_err(map_pyerr)?
+                .call((model_path,), Some(&kwargs))
+                .map_err(map_pyerr)?;
+            load_result.get_item(0).map_err(map_pyerr)?
+        } else {
+            let mlx_lm = py.import_bound("mlx_lm").map_err(map_pyerr)?;
+            let load_result = mlx_lm
+                .getattr("load")
+                .map_err(map_pyerr)?
+                .call1((model_dir_str.as_str(),))
+                .map_err(map_pyerr)?;
+            load_result.get_item(0).map_err(map_pyerr)?
+        };
 
         // Multi-token prefill dummy. Decode-time patterns
         // (`SdpaDecode`, `RopeKvCacheStoreDecode`, …) gate on the
@@ -215,6 +238,60 @@ pub fn capture_with_seq(model_dir: &Path, seq_len: u32) -> Result<RawGraph> {
         None => std::env::remove_var("FUSEKIT_DISABLE_HOOK"),
     }
     raw
+}
+
+fn gemma4_has_extra_shared_kv_weights(model_dir: &Path) -> bool {
+    let Ok(config_text) = std::fs::read_to_string(model_dir.join("config.json")) else {
+        return false;
+    };
+    let Ok(config) = serde_json::from_str::<serde_json::Value>(&config_text) else {
+        return false;
+    };
+    let text_config = config
+        .get("text_config")
+        .unwrap_or(&serde_json::Value::Null);
+    let model_type = config
+        .get("model_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let text_model_type = text_config
+        .get("model_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if model_type != "gemma4" && text_model_type != "gemma4_text" {
+        return false;
+    }
+    let Some(num_layers) = text_config
+        .get("num_hidden_layers")
+        .and_then(|v| v.as_u64())
+    else {
+        return false;
+    };
+    let Some(shared_layers) = text_config
+        .get("num_kv_shared_layers")
+        .and_then(|v| v.as_u64())
+    else {
+        return false;
+    };
+    if num_layers == 0 || shared_layers == 0 || shared_layers > num_layers {
+        return false;
+    }
+    let first_shared = num_layers - shared_layers;
+    let Ok(index_text) = std::fs::read_to_string(model_dir.join("model.safetensors.index.json"))
+    else {
+        return false;
+    };
+    let Ok(index) = serde_json::from_str::<serde_json::Value>(&index_text) else {
+        return false;
+    };
+    let Some(weight_map) = index.get("weight_map").and_then(|v| v.as_object()) else {
+        return false;
+    };
+    let layer_marker = format!(".layers.{first_shared}.self_attn.");
+    weight_map.keys().any(|key| {
+        key.contains(&layer_marker)
+            && (key.contains(".k_proj.") || key.contains(".v_proj.") || key.contains(".k_norm."))
+    })
 }
 
 fn extract_scalar_value(arr: &pyo3::Bound<'_, pyo3::PyAny>) -> Option<ScalarValue> {
@@ -710,6 +787,21 @@ fn parse_attrs(name: &str, args: &[serde_json::Value]) -> Attrs {
             .map(|target_shape| Attrs::Broadcast { target_shape })
             .unwrap_or(Attrs::Unknown),
 
+        "Slice" => {
+            if args.len() >= 3 {
+                let start = int_array(&args[0]).unwrap_or_default();
+                let stop = int_array(&args[1]).unwrap_or_default();
+                let stride = int_array(&args[2]).unwrap_or_default();
+                Attrs::Slice {
+                    start,
+                    stop,
+                    stride,
+                }
+            } else {
+                Attrs::Unknown
+            }
+        }
+
         "Split" => {
             // mlx Split carries the split axis as its first scalar
             // argument on current mlx-lm traces. If it is absent, the
@@ -787,6 +879,7 @@ fn parse_attrs(name: &str, args: &[serde_json::Value]) -> Attrs {
                     traditional,
                     base,
                     scale,
+                    inline_freqs: None,
                 }
             } else {
                 Attrs::Unknown

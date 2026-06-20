@@ -243,6 +243,10 @@ fn emit_impl(
         ));
         next_slot += 1;
         w.line(format!(
+            "constant uint       &write_offset [[buffer({next_slot})]],"
+        ));
+        next_slot += 1;
+        w.line(format!(
             "constant uint       &capacity     [[buffer({next_slot})]],"
         ));
     }
@@ -424,6 +428,10 @@ fn emit_impl(
     // simd_lane/simd_id were declared during norm; reuse them.
     w.line("uint sgs_per_tg = tg_size / 32u;");
     w.line("uint g = row_gid * sgs_per_tg + simd_id;");
+    if decode_sinks.is_some() {
+        w.line("uint pos = offset + row;");
+        w.line("uint cache_offset = (write_offset + row) % capacity;");
+    }
     if decode_sinks.is_some() && quant_cache_sink {
         w.line("uint q_tgs = (Q_PAIRS + sgs_per_tg - 1u) / sgs_per_tg;");
         w.line("if (row_gid < q_tgs) {");
@@ -451,7 +459,7 @@ fn emit_impl(
         w.line(format!("float hi = float({t}(acc_q_hi));"));
         w.line("float d_norm = float(pair_idx) / float(HALF);");
         w.line("float inv_freq = metal::exp2(-d_norm * BASE_LOG2);");
-        w.line("float angle = float(offset + row) * inv_freq;");
+        w.line("float angle = float(pos) * inv_freq;");
         w.line("float c = metal::fast::cos(angle);");
         w.line("float s = metal::fast::sin(angle);");
         w.line(format!("q_row[q_lo] = {t}(lo * c - hi * s);"));
@@ -509,7 +517,7 @@ fn emit_impl(
         w.line(format!("float hi = float({t}(acc_kq_hi));"));
         w.line("float d_norm = float(pair_idx) / float(HALF);");
         w.line("float inv_freq = metal::exp2(-d_norm * BASE_LOG2);");
-        w.line("float angle = float(offset + row) * inv_freq;");
+        w.line("float angle = float(pos) * inv_freq;");
         w.line("float c = metal::fast::cos(angle);");
         w.line("float s = metal::fast::sin(angle);");
         w.line("kv_qrow[pair_idx] = lo * c - hi * s;");
@@ -546,7 +554,6 @@ fn emit_impl(
         w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
         w.pop_indent();
         w.line("}");
-        w.line("uint cache_offset = offset + row;");
         w.line("uint co_packed = kh * capacity * CACHE_N_WORDS + cache_offset * CACHE_N_WORDS;");
         w.line("uint co_meta = kh * capacity * CACHE_N_GROUPS + cache_offset * CACHE_N_GROUPS;");
         w.line("for (uint wi = tid; wi < CACHE_N_WORDS; wi += tg_size) {");
@@ -629,7 +636,7 @@ fn emit_impl(
         w.line(format!("float hi = float({t}(acc_q_hi));"));
         w.line("float d_norm = float(pair_idx) / float(HALF);");
         w.line("float inv_freq = metal::exp2(-d_norm * BASE_LOG2);");
-        w.line("float angle = float(offset + row) * inv_freq;");
+        w.line("float angle = float(pos) * inv_freq;");
         w.line("float c = metal::fast::cos(angle);");
         w.line("float s = metal::fast::sin(angle);");
         w.line(format!("q_row[q_lo] = {t}(lo * c - hi * s);"));
@@ -660,10 +667,10 @@ fn emit_impl(
         w.line(format!("float hi = float({t}(acc_k_hi));"));
         w.line("float d_norm = float(pair_idx) / float(HALF);");
         w.line("float inv_freq = metal::exp2(-d_norm * BASE_LOG2);");
-        w.line("float angle = float(offset + row) * inv_freq;");
+        w.line("float angle = float(pos) * inv_freq;");
         w.line("float c = metal::fast::cos(angle);");
         w.line("float s = metal::fast::sin(angle);");
-        w.line("uint cache_base = kh * capacity * HEAD_DIM + (offset + row) * HEAD_DIM;");
+        w.line("uint cache_base = kh * capacity * HEAD_DIM + cache_offset * HEAD_DIM;");
         w.line(format!(
             "cache_keys[cache_base + pair_idx] = {t}(lo * c - hi * s);"
         ));
@@ -686,7 +693,7 @@ fn emit_impl(
         }
         w.line("uint vh = i / HEAD_DIM;");
         w.line("uint vd = i - vh * HEAD_DIM;");
-        w.line("uint cache_off = vh * capacity * HEAD_DIM + (offset + row) * HEAD_DIM + vd;");
+        w.line("uint cache_off = vh * capacity * HEAD_DIM + cache_offset * HEAD_DIM + vd;");
         w.line(format!("cache_values[cache_off] = {t}(acc_v);"));
         w.pop_indent();
         w.line("}");

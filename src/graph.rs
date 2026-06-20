@@ -140,6 +140,12 @@ pub enum Attrs {
         traditional: bool,
         base: f32,
         scale: f32,
+        /// Optional compile-time `freqs` vector for traces where
+        /// `mx.fast.rope` receives a small constant frequency tensor
+        /// instead of deriving frequencies from `base`. This is still
+        /// graph-semantic: the compiler only fills it by evaluating a
+        /// pure constant producer subgraph.
+        inline_freqs: Option<Vec<f32>>,
     },
     ScaledDotProductAttention {
         scale: f32,

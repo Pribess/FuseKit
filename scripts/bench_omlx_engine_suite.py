@@ -16,19 +16,33 @@ import time
 from pathlib import Path
 
 
-DEFAULT_MODELS = [
-    "/Users/pribess/.omlx/models/mlx-community/Qwen2.5-Coder-0.5B-Instruct-bf16",
-    "/Users/pribess/.omlx/models/mlx-community/Qwen2.5-Coder-0.5B-Instruct-4bit",
-    "/Users/pribess/.omlx/models/mlx-community/Qwen2.5-Coder-0.5B-Instruct-8bit",
-    "/Users/pribess/.omlx/models/mlx-community/Qwen3.5-4B-bf16",
-    "/Users/pribess/.omlx/models/mlx-community/Qwen3.5-4B-4bit",
-    "/Users/pribess/.omlx/models/mlx-community/Qwen3.5-4B-8bit",
+WORKSPACE = Path(__file__).resolve().parents[1]
+OMLX_APP = Path(os.environ.get("FUSEKIT_MLX_APP", "/Applications/oMLX.app")).expanduser()
+OMLX_MODEL_ROOT = Path(
+    os.environ.get("FUSEKIT_OMLX_DIR", Path.home() / ".omlx/models")
+).expanduser()
+DEFAULT_MODEL_IDS = [
+    "mlx-community/Qwen2.5-Coder-0.5B-Instruct-bf16",
+    "mlx-community/Qwen2.5-Coder-0.5B-Instruct-4bit",
+    "mlx-community/Qwen2.5-Coder-0.5B-Instruct-8bit",
+    "mlx-community/Qwen3.5-4B-bf16",
+    "mlx-community/Qwen3.5-4B-4bit",
+    "mlx-community/Qwen3.5-4B-8bit",
 ]
+DEFAULT_MODELS = [str(OMLX_MODEL_ROOT / model) for model in DEFAULT_MODEL_IDS]
 
-PYTHON = "/Applications/oMLX.app/Contents/Python/cpython-3.11/bin/python3.11"
-PYTHONPATH = (
-    "/Applications/oMLX.app/Contents/Resources:"
-    "/Applications/oMLX.app/Contents/Python/framework-mlx-framework/lib/python3.11/site-packages"
+PYTHON = os.environ.get(
+    "FUSEKIT_PYTHON",
+    str(OMLX_APP / "Contents/Python/cpython-3.11/bin/python3.11"),
+)
+PYTHONPATH = os.pathsep.join(
+    [
+        str(OMLX_APP / "Contents/Resources"),
+        str(
+            OMLX_APP
+            / "Contents/Python/framework-mlx-framework/lib/python3.11/site-packages"
+        ),
+    ]
 )
 
 METRIC_RE = re.compile(
@@ -193,7 +207,7 @@ def main() -> int:
     parser.add_argument(
         "--workspace",
         type=Path,
-        default=Path("/Users/pribess/Documents/workspace/fusekit"),
+        default=WORKSPACE,
     )
     parser.add_argument("--tokens", type=int, nargs="+", default=[64, 256])
     parser.add_argument("--repeat", type=int, default=5)

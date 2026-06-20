@@ -41,10 +41,7 @@ pub mod module;
 pub mod op;
 pub mod passes;
 
-pub use module::{Module, ModuleMetaValue, Partition, Tensor};
-pub use op::{Attr, AttrValue, ChainStep, Op, OpKind};
 pub use passes::{
-    estimate_op_cost, AlgebraicRewrites, Cost, DeadCodeElimination, DecodeL1Specialize,
-    InPlaceAnalysis, KvSliceUpdateContiguous, LayoutInference, NoOpPass, Pass, PassError,
-    PassManager, Rewrite, RewriteRule, RmsNormFastRsqrt, SoftmaxMaxStable,
+    AlgebraicRewrites, DeadCodeElimination, DecodeL1Specialize, InPlaceAnalysis,
+    KvSliceUpdateContiguous, LayoutInference, PassManager, RmsNormFastRsqrt, SoftmaxMaxStable,
 };

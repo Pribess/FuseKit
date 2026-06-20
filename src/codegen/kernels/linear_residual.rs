@@ -37,9 +37,15 @@ pub fn emit(
     // which is the transposed view.
     let x = &fusion.inputs[0];
     let y = &fusion.outputs[0];
+    let has_extra_residual = if quant.is_some() {
+        fusion.inputs.len() == 6
+    } else {
+        fusion.inputs.len() == 4
+    };
+    let residual_idx = if quant.is_some() { 4 } else { 2 };
     let residual_shape = fusion
         .inputs
-        .last()
+        .get(residual_idx)
         .map(|b| b.shape.as_slice())
         .unwrap_or(&[]);
     let m = *x
@@ -71,12 +77,22 @@ pub fn emit(
         w.line(format!("device const {t}   *W_scales  [[buffer(2)]],"));
         w.line(format!("device const {t}   *W_biases  [[buffer(3)]],"));
         w.line(format!("device const {t} *residual  [[buffer(4)]],"));
-        w.line(format!("device {t}       *y         [[buffer(5)]],"));
+        if has_extra_residual {
+            w.line(format!("device const {t} *residual_extra [[buffer(5)]],"));
+            w.line(format!("device {t}       *y         [[buffer(6)]],"));
+        } else {
+            w.line(format!("device {t}       *y         [[buffer(5)]],"));
+        }
     } else {
         w.line(format!("device const {t} *x        [[buffer(0)]],"));
         w.line(format!("device const {t} *W        [[buffer(1)]],"));
         w.line(format!("device const {t} *residual [[buffer(2)]],"));
-        w.line(format!("device {t}       *y        [[buffer(3)]],"));
+        if has_extra_residual {
+            w.line(format!("device const {t} *residual_extra [[buffer(3)]],"));
+            w.line(format!("device {t}       *y        [[buffer(4)]],"));
+        } else {
+            w.line(format!("device {t}       *y        [[buffer(3)]],"));
+        }
     }
     w.line("uint3 tid     [[thread_position_in_threadgroup]],");
     w.line("uint3 tg_size [[threads_per_threadgroup]],");
@@ -98,8 +114,9 @@ pub fn emit(
     ));
     w.blank();
 
-    if let Some((k_dim, out_dim, active_rows, bits, group_size)) =
-        crate::codegen::kernels::linear_residual_nax_shape(fusion)
+    if let Some((k_dim, out_dim, active_rows, bits, group_size)) = (!has_extra_residual)
+        .then(|| crate::codegen::kernels::linear_residual_nax_shape(fusion))
+        .flatten()
     {
         let aligned_n = if out_dim.is_multiple_of(64) {
             "true"
@@ -160,7 +177,9 @@ pub fn emit(
                 "fusekit_qmv_fast_residual_m_tail_impl"
             };
             w.writeln(format_args!(
-                "{helper}<{t}, {group_size}, {bits}, {qmv_sgs}, {qmv_cols_per_sg}, {token_rows}, 1>(W_packed, W_scales, W_biases, x, residual, y, int(M), int(N), int({active_rows}), tg_pos, simd_gid, simd_lid);"
+                "{helper}<{t}, {group_size}, {bits}, {qmv_sgs}, {qmv_cols_per_sg}, {token_rows}, 1, {}>(W_packed, W_scales, W_biases, x, residual, {}, y, int(M), int(N), int({active_rows}), tg_pos, simd_gid, simd_lid);",
+                if has_extra_residual { 1 } else { 0 },
+                if has_extra_residual { "residual_extra" } else { "residual" }
             ));
         } else if active_rows == 1
             && matches!(bits, 4 | 8)
@@ -170,11 +189,15 @@ pub fn emit(
         {
             w.line("threadgroup float fusekit_x_smem[1024];");
             w.writeln(format_args!(
-                "fusekit_qmv_fast_residual_tgx_impl<{t}, {group_size}, {bits}, {qmv_sgs}, {qmv_cols_per_sg}, 1>(W_packed, W_scales, W_biases, x, residual, y, fusekit_x_smem, int(M), int(N), tg_pos, tid.x, tg_size.x, simd_gid, simd_lid);"
+                "fusekit_qmv_fast_residual_tgx_impl<{t}, {group_size}, {bits}, {qmv_sgs}, {qmv_cols_per_sg}, 1, {}>(W_packed, W_scales, W_biases, x, residual, {}, y, fusekit_x_smem, int(M), int(N), tg_pos, tid.x, tg_size.x, simd_gid, simd_lid);",
+                if has_extra_residual { 1 } else { 0 },
+                if has_extra_residual { "residual_extra" } else { "residual" }
             ));
         } else {
             w.writeln(format_args!(
-                "fusekit_qmv_fast_residual_impl<{t}, {group_size}, {bits}, {qmv_sgs}, {qmv_cols_per_sg}, 1>(W_packed, W_scales, W_biases, x, residual, y, int(M), int(N), tg_pos, simd_gid, simd_lid);"
+                "fusekit_qmv_fast_residual_impl<{t}, {group_size}, {bits}, {qmv_sgs}, {qmv_cols_per_sg}, 1, {}>(W_packed, W_scales, W_biases, x, residual, {}, y, int(M), int(N), tg_pos, simd_gid, simd_lid);",
+                if has_extra_residual { 1 } else { 0 },
+                if has_extra_residual { "residual_extra" } else { "residual" }
             ));
         }
         w.line("return;");
@@ -187,7 +210,12 @@ pub fn emit(
     w.line("uint simd_lane = tid.x % 32u;");
     w.line("uint simd_id   = tid.x / 32u;");
     w.line("uint sgs_per_tg = tg_size.x / 32u;");
-    let dense_rows = 1u32;
+    let chip_rows = crate::target::current_chip().dense_gemv_rows_per_simdgroup(m, n);
+    let dense_rows = if quant.is_none() && n >= chip_rows && n % chip_rows == 0 {
+        chip_rows
+    } else {
+        1
+    };
     w.writeln(format_args!("constexpr uint DENSE_ROWS = {dense_rows}u;"));
     w.line("uint flat = (tg_pos.x * sgs_per_tg + simd_id) * DENSE_ROWS;");
     w.line("if (flat >= ACTIVE_ROWS * N) return;");
@@ -344,7 +372,12 @@ pub fn emit(
         w.line("}");
     } else {
         w.line(format!(
-            "if (simd_lane == 0u) y[row * N + i] = {t}(acc + float(residual[residual_i]));"
+            "if (simd_lane == 0u) {{ {t} y0 = {t}(acc + float(residual[residual_i])); y[row * N + i] = {}; }}",
+            if has_extra_residual {
+                format!("{t}(float(y0) + float(residual_extra[row * N + i]))")
+            } else {
+                "y0".to_string()
+            }
         ));
     }
 
@@ -372,6 +405,7 @@ mod tests {
             role,
             shape,
             dtype,
+            scalar_value: None,
         }
     }
 
@@ -380,6 +414,7 @@ mod tests {
             model_type: "test".into(),
             hidden_size: n,
             num_hidden_layers: 1,
+            num_kv_shared_layers: 0,
             num_attention_heads: 1,
             num_key_value_heads: 1,
             head_dim: 1,

@@ -354,14 +354,12 @@ fn scale_inplace_f32(ptr: usize, n: usize, scale: f32) -> PyResult<()> {
     // Apple Silicon unified memory makes this a real zero-copy share
     // with the originating mx.array.
     let nbytes = n * std::mem::size_of::<f32>();
-    let buf = unsafe {
-        device.new_buffer_with_bytes_no_copy(
-            ptr as *const std::ffi::c_void,
-            nbytes as u64,
-            MTLResourceOptions::StorageModeShared,
-            None,
-        )
-    };
+    let buf = device.new_buffer_with_bytes_no_copy(
+        ptr as *const std::ffi::c_void,
+        nbytes as u64,
+        MTLResourceOptions::StorageModeShared,
+        None,
+    );
     let scale_val: f32 = scale;
     let buf_scale = device.new_buffer_with_data(
         &scale_val as *const f32 as *const _,
@@ -418,7 +416,7 @@ fn dispatch_kernel(
 
     let mtl_bufs: Vec<metal::Buffer> = buffers
         .iter()
-        .map(|&(ptr, nbytes)| unsafe {
+        .map(|&(ptr, nbytes)| {
             d.device.new_buffer_with_bytes_no_copy(
                 ptr as *const std::ffi::c_void,
                 nbytes as u64,
@@ -515,7 +513,7 @@ fn build_icb(
         if let Some(&idx) = buf_cache.get(&cache_key) {
             return (resident_bufs[idx].clone(), idx, offset);
         }
-        let buf = registered.map(|(buf, _, _)| buf).unwrap_or_else(|| unsafe {
+        let buf = registered.map(|(buf, _, _)| buf).unwrap_or_else(|| {
             d.device.new_buffer_with_bytes_no_copy(
                 ptr as *const c_void,
                 nbytes as u64,
@@ -628,7 +626,7 @@ fn update_icb_bindings(
         } else {
             let mtl_buf = registered_match
                 .map(|(buffer, _, _)| buffer)
-                .unwrap_or_else(|| unsafe {
+                .unwrap_or_else(|| {
                     d.device.new_buffer_with_bytes_no_copy(
                         ptr as *const c_void,
                         nbytes as u64,
@@ -1327,7 +1325,7 @@ fn decode_chunk_gpu_chain(
             .ok()
             .as_deref()
             .map(|v| v != "0")
-            .unwrap_or(true);
+            .unwrap_or(false);
         if split_encoders {
             for _ in 0..count {
                 let enc = cmd.new_compute_command_encoder();
@@ -1697,14 +1695,12 @@ fn register_host_buffer(handle: usize, ptr: usize, nbytes: usize) -> PyResult<()
     {
         return Ok(());
     }
-    let buffer = unsafe {
-        d.device.new_buffer_with_bytes_no_copy(
-            ptr as *const c_void,
-            nbytes as u64,
-            MTLResourceOptions::StorageModeShared,
-            None,
-        )
-    };
+    let buffer = d.device.new_buffer_with_bytes_no_copy(
+        ptr as *const c_void,
+        nbytes as u64,
+        MTLResourceOptions::StorageModeShared,
+        None,
+    );
     d.registered_host_buffers.push(RegisteredHostBuffer {
         base: ptr,
         nbytes,
@@ -1757,7 +1753,7 @@ fn dispatch_batch(
         let buf = if let Some(buf) = buf_cache.get(&cache_key) {
             buf.clone()
         } else {
-            let buf = registered.map(|(buf, _, _)| buf).unwrap_or_else(|| unsafe {
+            let buf = registered.map(|(buf, _, _)| buf).unwrap_or_else(|| {
                 dev.new_buffer_with_bytes_no_copy(
                     ptr as *const c_void,
                     nbytes as u64,
@@ -1854,7 +1850,7 @@ fn dispatch_test_kernel(
     // mx.array's underlying storage.
     let mtl_bufs: Vec<metal::Buffer> = buffers
         .iter()
-        .map(|&(ptr, nbytes)| unsafe {
+        .map(|&(ptr, nbytes)| {
             device.new_buffer_with_bytes_no_copy(
                 ptr as *const std::ffi::c_void,
                 nbytes as u64,

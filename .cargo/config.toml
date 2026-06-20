@@ -1,6 +1,6 @@
-# Point pyo3-build-config at the oMLX-bundled cpython-3.11.
-# Without this, pyo3 picks up /usr/bin/python3 (macOS 3.9) and fails
-# the abi3-py311 floor. Users with a different oMLX install location
-# can override by exporting PYO3_PYTHON before `cargo build`.
+# Point pyo3-build-config at the standard oMLX-bundled CPython 3.11.
+# Without this, pyo3 may pick up an older system Python and fail the
+# abi3-py311 floor. For a nonstandard app location, export both
+# PYO3_PYTHON and FUSEKIT_MLX_APP before invoking Cargo.
 [env]
 PYO3_PYTHON = "/Applications/oMLX.app/Contents/Python/cpython-3.11/bin/python3.11"

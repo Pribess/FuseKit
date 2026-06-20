@@ -162,6 +162,7 @@ impl Pattern for RmsNormGateUpSwigluDown {
                 role,
                 shape: t.shape.clone(),
                 dtype: t.dtype,
+                scalar_value: t.scalar_value.clone(),
             }
         };
 

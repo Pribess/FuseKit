@@ -119,6 +119,24 @@ pub fn prelude(w: &mut MslWriter) {
             0
         };
         w.line(format!("#define FUSEKIT_QMV_FAST_QDOT_Q{bits} {enabled}"));
+        let pair_key = format!("FUSEKIT_QMV_FAST_PAIR_QDOT_Q{bits}");
+        let pair_enabled = std::env::var(&pair_key)
+            .ok()
+            .map(|v| v.as_str() != "0")
+            .unwrap_or(enabled != 0);
+        w.line(format!(
+            "#define FUSEKIT_QMV_FAST_PAIR_QDOT_Q{bits} {}",
+            if pair_enabled { 1 } else { 0 }
+        ));
+        let tg2_key = format!("FUSEKIT_QMV_FAST_TG2_QDOT_Q{bits}");
+        let tg2_enabled = std::env::var(&tg2_key)
+            .ok()
+            .map(|v| v.as_str() != "0")
+            .unwrap_or(enabled != 0);
+        w.line(format!(
+            "#define FUSEKIT_QMV_FAST_TG2_QDOT_Q{bits} {}",
+            if tg2_enabled { 1 } else { 0 }
+        ));
     }
     for bits in [4u32, 8u32] {
         let key = format!("FUSEKIT_QMV_FAST_PACKS_Q{bits}");
@@ -341,9 +359,14 @@ METAL_FUNC void fusekit_qparam_pair_load(
       const device T* bl = biases + row * in_vec_size_g;
 
       U s;
-	      U b;
-	      fusekit_qparam_pair_load<T, U, scale_step_per_thread, bits>(
-	          sl, bl, simd_lid, &s, &b);
+      U b;
+      if constexpr (bits == 4) {
+        s = U(sl[0]);
+        b = U(bl[0]);
+      } else {
+        fusekit_qparam_pair_load<T, U, scale_step_per_thread, bits>(
+            sl, bl, simd_lid, &s, &b);
+      }
 	      if (bits == 4 && !FUSEKIT_QMV_FAST_QDOT_Q4) {
 	        const device uint32_t* ws32 = (const device uint32_t*)wl;
 	        U accum = 0;
@@ -413,6 +436,176 @@ METAL_FUNC void fusekit_qparam_pair_load(
     if (simd_lid == 0) {
       y[row] = static_cast<T>(result[row]);
     }
+	  }
+	}
+
+	template <typename U, int bits>
+	METAL_FUNC void fusekit_dequant_sub8_affine(
+	    const device uint8_t* w,
+	    U scale,
+	    U bias,
+	    thread U* out) {
+	  if constexpr (bits == 4) {
+	    for (int i = 0; i < 4; i++) {
+	      uint8_t wi = w[i];
+	      out[2 * i] = scale * U(wi & 0x0fu) + bias;
+	      out[2 * i + 1] = scale * U((wi >> 4) & 0x0fu) + bias;
+	    }
+	  } else if constexpr (bits == 8) {
+	    for (int i = 0; i < 8; i++) {
+	      out[i] = scale * U(w[i]) + bias;
+	    }
+	  }
+	}
+
+	template <typename T, int group_size, int bits, int vecs_per_tg, int k_lanes>
+	METAL_FUNC void fusekit_qmv_wide_impl(
+	    const device uint32_t* w,
+	    const device T* scales,
+	    const device T* biases,
+	    const device T* x,
+	    device T* y,
+	    const int in_vec_size,
+	    const int out_vec_size,
+	    const int active_rows,
+	    uint3 tid,
+	    uint simd_gid,
+	    uint simd_lid) {
+	  constexpr int num_simdgroups = 2;
+	  constexpr int results_per_simdgroup = SIMD_SIZE / k_lanes;
+	  constexpr int sub = 8;
+	  typedef float U;
+
+	  const short k_lane = simd_lid % k_lanes;
+	  const short sg_row = simd_lid / k_lanes;
+	  const int out_row = tid.y * (results_per_simdgroup * num_simdgroups) +
+	      results_per_simdgroup * simd_gid + sg_row;
+	  const int vec0 = tid.x * vecs_per_tg;
+	  const int row = min(out_row, out_vec_size - 1);
+
+	  const int in_vec_size_w = in_vec_size * bits / 8;
+	  const int in_vec_size_g = in_vec_size / group_size;
+	  const device uint8_t* wrow = (const device uint8_t*)w + row * in_vec_size_w;
+	  const device T* srow = scales + row * in_vec_size_g;
+	  const device T* brow = biases + row * in_vec_size_g;
+
+	  const device T* xv[vecs_per_tg];
+	  for (int v = 0; v < vecs_per_tg; v++) {
+	    xv[v] = x + min(vec0 + v, active_rows - 1) * in_vec_size;
+	  }
+
+	  thread U result[vecs_per_tg];
+	  for (int v = 0; v < vecs_per_tg; v++) {
+	    result[v] = 0;
+	  }
+
+	  for (int g = k_lane; g < in_vec_size_g; g += k_lanes) {
+	    U scale = U(srow[g]);
+	    U bias = U(brow[g]);
+	    for (int sc = 0; sc < group_size / sub; sc++) {
+	      const int k0 = g * group_size + sc * sub;
+	      const device uint8_t* wc = wrow + k0 * bits / 8;
+	      thread U w_dq[sub];
+	      fusekit_dequant_sub8_affine<U, bits>(wc, scale, bias, w_dq);
+	      for (int v = 0; v < vecs_per_tg; v++) {
+	        const device T* xc = xv[v] + k0;
+	        U acc = 0;
+	        for (int i = 0; i < sub; i++) {
+	          acc += U(xc[i]) * w_dq[i];
+	        }
+	        result[v] += acc;
+	      }
+	    }
+	  }
+
+	  for (int v = 0; v < vecs_per_tg; v++) {
+	    if constexpr (k_lanes >= 32) {
+	      result[v] += simd_shuffle_down(result[v], 16);
+	    }
+	    if constexpr (k_lanes >= 16) {
+	      result[v] += simd_shuffle_down(result[v], 8);
+	    }
+	    if constexpr (k_lanes >= 8) {
+	      result[v] += simd_shuffle_down(result[v], 4);
+	    }
+	    if constexpr (k_lanes >= 4) {
+	      result[v] += simd_shuffle_down(result[v], 2);
+	    }
+	    if constexpr (k_lanes >= 2) {
+	      result[v] += simd_shuffle_down(result[v], 1);
+	    }
+	  }
+
+	  if (k_lane == 0 && out_row < out_vec_size) {
+	    for (int v = 0; v < vecs_per_tg; v++) {
+	      if (vec0 + v < active_rows) {
+	        y[(vec0 + v) * out_vec_size + out_row] = static_cast<T>(result[v]);
+	      }
+	    }
+	  }
+	}
+
+	template <typename T, int group_size, int bits>
+	METAL_FUNC void fusekit_qmv_fast_exact_impl(
+	    const device uint32_t* w,
+	    const device T* scales,
+	    const device T* biases,
+	    const device T* x,
+	    device T* y,
+	    const int in_vec_size,
+	    const int out_vec_size,
+	    uint3 tid,
+	    uint simd_gid,
+	    uint simd_lid) {
+	  constexpr int packs_per_thread = bits == 2 ? 1 : 2;
+	  constexpr int num_simdgroups = 2;
+	  constexpr int results_per_simdgroup = 4;
+	  constexpr int pack_factor = get_pack_factor<bits, 32>();
+	  constexpr int bytes_per_pack = get_bytes_per_pack<bits, 32>();
+	  constexpr int values_per_thread = pack_factor * packs_per_thread;
+	  constexpr int block_size = values_per_thread * SIMD_SIZE;
+	  constexpr int scale_step_per_thread = group_size / values_per_thread;
+
+	  const device uint8_t* ws = (const device uint8_t*)w;
+	  typedef float U;
+
+	  thread U x_thread[values_per_thread];
+	  thread U result[results_per_simdgroup] = {0};
+
+	  const int in_vec_size_w = in_vec_size * bytes_per_pack / pack_factor;
+	  const int in_vec_size_g = in_vec_size / group_size;
+	  const int out_row = tid.y * (num_simdgroups * results_per_simdgroup) +
+	      simd_gid * results_per_simdgroup;
+
+	  ws += out_row * in_vec_size_w + simd_lid * packs_per_thread * bytes_per_pack;
+	  scales += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+	  biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
+	  x += tid.x * in_vec_size + simd_lid * values_per_thread;
+	  y += tid.x * out_vec_size + out_row;
+
+	  for (int k = 0; k < in_vec_size; k += block_size) {
+	    U sum = load_vector<T, U, values_per_thread, bits>(x, x_thread);
+
+	    for (int row = 0; row < results_per_simdgroup; row++) {
+	      auto wl = (const device uint8_t*)(ws + row * in_vec_size_w);
+	      const device T* sl = scales + row * in_vec_size_g;
+	      const device T* bl = biases + row * in_vec_size_g;
+	      U s = sl[0];
+	      U b = bl[0];
+	      result[row] += qdot<U, values_per_thread, bits>(wl, x_thread, s, b, sum);
+	    }
+
+	    ws += block_size * bytes_per_pack / pack_factor;
+	    scales += block_size / group_size;
+	    biases += block_size / group_size;
+	    x += block_size;
+	  }
+
+	  for (int row = 0; row < results_per_simdgroup; row++) {
+	    result[row] = simd_sum(result[row]);
+	    if (simd_lid == 0) {
+	      y[row] = static_cast<T>(result[row]);
+	    }
 	  }
 	}
 
@@ -930,6 +1123,7 @@ METAL_FUNC void fusekit_qparam_pair_load(
 	    const device T* biases_up,
 	    const device T* x,
 	    device T* y,
+	    const float y_scale,
 	    const int in_vec_size,
 	    const int out_vec_size,
 	    const int active_rows,
@@ -1027,7 +1221,7 @@ METAL_FUNC void fusekit_qparam_pair_load(
 	        bu = U(bul[0]);
 	      }
 
-		      if (bits == 4 && !FUSEKIT_QMV_M_QDOT_Q4) {
+			      if (bits == 4 && !FUSEKIT_QMV_M_QDOT_Q4) {
 	        const device uint16_t* wg16 = (const device uint16_t*)wgl;
 	        const device uint16_t* wu16 = (const device uint16_t*)wul;
 	        thread U accum_gate[token_rows];
@@ -1096,7 +1290,7 @@ METAL_FUNC void fusekit_qparam_pair_load(
 	          U u = U(static_cast<T>(up));
 	          U sig = 1.0f / (1.0f + exp(-g));
 	          y[(row_base + r) * out_vec_size + out_row + col] =
-	              static_cast<T>((sig * g) * u);
+	              static_cast<T>(((sig * g) * u) * y_scale);
 	        }
 	      }
 	    }
@@ -1187,7 +1381,7 @@ METAL_FUNC void fusekit_qparam_pair_load(
 	      fusekit_qparam_pair_load<T, U, scale_step_per_thread, bits>(
 	          sl, bl, simd_lid, &s, &b);
 
-		      if (bits == 4 && !FUSEKIT_QMV_M_QDOT_Q4) {
+			      if (bits == 4 && !FUSEKIT_QMV_M_QDOT_Q4) {
 	        const device uint16_t* ws16 = (const device uint16_t*)wl;
 	        thread U accum[token_rows];
 	        for (int r = 0; r < token_rows; r++) {
@@ -1395,7 +1589,7 @@ METAL_FUNC void fusekit_qparam_pair_load(
 	      fusekit_qparam_pair_load<T, U, scale_step_per_thread, bits>(
 	          sl1, bl1, simd_lid, &s1, &b1);
 
-		      if (bits == 4 && !FUSEKIT_QMV_M_QDOT_Q4) {
+			      if (bits == 4 && !FUSEKIT_QMV_M_QDOT_Q4) {
 	        const device uint16_t* ws016 = (const device uint16_t*)wl0;
 	        const device uint16_t* ws116 = (const device uint16_t*)wl1;
 	        thread U accum0[token_rows];
@@ -2129,7 +2323,7 @@ template <
     const int BM = 32,
     const int BK = 32,
     const int BN = 32>
-METAL_FUNC void fusekit_qmm_t_impl(
+	METAL_FUNC void fusekit_qmm_t_impl(
     const device uint32_t* w,
     const device T* scales,
     const device T* biases,
@@ -2241,11 +2435,11 @@ METAL_FUNC void fusekit_qmm_t_impl(
     mma_op.store_result_safe(y, N, short2(num_outs, num_els));
   } else {
     mma_op.store_result(y, N);
-  }
-}
+	  }
+	}
 
-template <typename T, typename AccT>
-struct FusekitSwigluEpilogue {
+	template <typename T, typename AccT>
+	struct FusekitSwigluEpilogue {
   METAL_FUNC T apply(AccT gate_acc, T up_val) const {
     float g = float(T(gate_acc));
     float sig = float(T(1.0f / (1.0f + exp(-g))));
@@ -2447,13 +2641,15 @@ template <
     int bits,
     int num_simdgroups,
     int results_per_simdgroup,
-    int no_prod_round>
+    int no_prod_round,
+    int extra_residual>
 METAL_FUNC void fusekit_qmv_fast_residual_impl(
     const device uint32_t* w,
     const device T* scales,
     const device T* biases,
     const device T* x,
     const device T* residual,
+    const device T* residual_extra,
     device T* y,
     const int in_vec_size,
     const int out_vec_size,
@@ -2485,6 +2681,7 @@ METAL_FUNC void fusekit_qmv_fast_residual_impl(
   biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
   x += tid.x * in_vec_size + simd_lid * values_per_thread;
   residual += tid.x * out_vec_size + out_row;
+  residual_extra += tid.x * out_vec_size + out_row;
   y += tid.x * out_vec_size + out_row;
 
   for (int k = 0; k < in_vec_size; k += block_size) {
@@ -2560,13 +2757,20 @@ METAL_FUNC void fusekit_qmv_fast_residual_impl(
   for (int row = 0; row < results_per_simdgroup; row++) {
     result[row] = simd_sum(result[row]);
     if (simd_lid == 0) {
+      T y0;
       if (no_prod_round != 0) {
-        y[row] = static_cast<T>(
+        y0 = static_cast<T>(
             result[row] + static_cast<U>(residual[row]));
       } else {
         T prod = static_cast<T>(result[row]);
-        y[row] = static_cast<T>(
+        y0 = static_cast<T>(
             static_cast<U>(prod) + static_cast<U>(residual[row]));
+      }
+      if (extra_residual != 0) {
+        y[row] = static_cast<T>(
+            static_cast<U>(y0) + static_cast<U>(residual_extra[row]));
+      } else {
+        y[row] = y0;
       }
     }
   }
@@ -2578,13 +2782,15 @@ template <
     int bits,
     int num_simdgroups,
     int results_per_simdgroup,
-    int no_prod_round>
+    int no_prod_round,
+    int extra_residual>
 METAL_FUNC void fusekit_qmv_fast_residual_tgx_impl(
     const device uint32_t* w,
     const device T* scales,
     const device T* biases,
     const device T* x,
     const device T* residual,
+    const device T* residual_extra,
     device T* y,
     threadgroup float* x_smem,
     const int in_vec_size,
@@ -2618,6 +2824,7 @@ METAL_FUNC void fusekit_qmv_fast_residual_tgx_impl(
   biases += out_row * in_vec_size_g + simd_lid / scale_step_per_thread;
   const device T* x_row = x + tg_pos.x * in_vec_size;
   residual += tg_pos.x * out_vec_size + out_row;
+  residual_extra += tg_pos.x * out_vec_size + out_row;
   y += tg_pos.x * out_vec_size + out_row;
 
   for (int k = 0; k < in_vec_size; k += block_size) {
@@ -2667,13 +2874,20 @@ METAL_FUNC void fusekit_qmv_fast_residual_tgx_impl(
   for (int row = 0; row < results_per_simdgroup; row++) {
     result[row] = simd_sum(result[row]);
     if (simd_lid == 0) {
+      T y0;
       if (no_prod_round != 0) {
-        y[row] = static_cast<T>(
+        y0 = static_cast<T>(
             result[row] + static_cast<U>(residual[row]));
       } else {
         T prod = static_cast<T>(result[row]);
-        y[row] = static_cast<T>(
+        y0 = static_cast<T>(
             static_cast<U>(prod) + static_cast<U>(residual[row]));
+      }
+      if (extra_residual != 0) {
+        y[row] = static_cast<T>(
+            static_cast<U>(y0) + static_cast<U>(residual_extra[row]));
+      } else {
+        y[row] = y0;
       }
     }
   }
@@ -2686,13 +2900,15 @@ template <
 	    int num_simdgroups,
 	    int results_per_simdgroup,
 	    int token_rows,
-	    int no_prod_round>
+	    int no_prod_round,
+	    int extra_residual>
 METAL_FUNC void fusekit_qmv_fast_residual_m_impl(
     const device uint32_t* w,
     const device T* scales,
     const device T* biases,
     const device T* x,
     const device T* residual,
+    const device T* residual_extra,
     device T* y,
     const int in_vec_size,
     const int out_vec_size,
@@ -2780,8 +2996,9 @@ METAL_FUNC void fusekit_qmv_fast_residual_m_impl(
                 (x_thread[r][8 * i] * (wlo & 0x000fu) +
                  x_thread[r][8 * i + 1] * (wlo & 0x00f0u) +
                  x_thread[r][8 * i + 2] * (wlo & 0x0f00u) +
-                 x_thread[r][8 * i + 3] * (wlo & 0xf000u) +
-                 x_thread[r][8 * i + 4] * (whi & 0x000fu) +
+                 x_thread[r][8 * i + 3] * (wlo & 0xf000u));
+            accum[r] +=
+                (x_thread[r][8 * i + 4] * (whi & 0x000fu) +
                  x_thread[r][8 * i + 5] * (whi & 0x00f0u) +
                  x_thread[r][8 * i + 6] * (whi & 0x0f00u) +
                  x_thread[r][8 * i + 7] * (whi & 0xf000u));
@@ -2869,13 +3086,20 @@ METAL_FUNC void fusekit_qmv_fast_residual_m_impl(
 	        result[r][col] = simd_sum(result[r][col]);
 	        if (simd_lid == 0) {
 	          int row_off = (row_base + r) * out_vec_size + out_idx;
+	          T y0;
 	          if (no_prod_round != 0) {
-	            y[row_off] = static_cast<T>(
+	            y0 = static_cast<T>(
 	                result[r][col] + static_cast<U>(residual[row_off]));
 	          } else {
 	            T prod = static_cast<T>(result[r][col]);
-	            y[row_off] = static_cast<T>(
+	            y0 = static_cast<T>(
 	                static_cast<U>(prod) + static_cast<U>(residual[row_off]));
+	          }
+	          if (extra_residual != 0) {
+	            y[row_off] = static_cast<T>(
+	                static_cast<U>(y0) + static_cast<U>(residual_extra[row_off]));
+	          } else {
+	            y[row_off] = y0;
 	          }
 	        }
 	      }
@@ -2919,13 +3143,15 @@ template <
     int num_simdgroups,
     int results_per_simdgroup,
     int token_rows,
-    int no_prod_round>
+    int no_prod_round,
+    int extra_residual>
 METAL_FUNC void fusekit_qmv_fast_residual_m_tail_impl(
     const device uint32_t* w,
     const device T* scales,
     const device T* biases,
     const device T* x,
     const device T* residual,
+    const device T* residual_extra,
     device T* y,
     const int in_vec_size,
     const int out_vec_size,
@@ -3120,13 +3346,20 @@ METAL_FUNC void fusekit_qmv_fast_residual_m_tail_impl(
         result[r][col] = simd_sum(result[r][col]);
         if (simd_lid == 0) {
           int row_off = (row_base + r) * out_vec_size + out_idx;
+          T y0;
           if (no_prod_round != 0) {
-            y[row_off] = static_cast<T>(
+            y0 = static_cast<T>(
                 result[r][col] + static_cast<U>(residual[row_off]));
           } else {
             T prod = static_cast<T>(result[r][col]);
-            y[row_off] = static_cast<T>(
+            y0 = static_cast<T>(
                 static_cast<U>(prod) + static_cast<U>(residual[row_off]));
+          }
+          if (extra_residual != 0) {
+            y[row_off] = static_cast<T>(
+                static_cast<U>(y0) + static_cast<U>(residual_extra[row_off]));
+          } else {
+            y[row_off] = y0;
           }
         }
       }
@@ -3334,7 +3567,7 @@ METAL_FUNC void fusekit_qmv_fast_tg2_partial_impl(
 	  float result1 = 0.0f;
 
 	  for (int k = 0; k < in_vec_size; k += block_size) {
-    if constexpr (bits == 4 && !FUSEKIT_QMV_FAST_QDOT_Q4) {
+    if constexpr (bits == 4 && !FUSEKIT_QMV_FAST_TG2_QDOT_Q4) {
       float sum = 0.0f;
       const device uint32_t* ws0_32 = (const device uint32_t*)ws0;
       const device uint32_t* ws1_32 = (const device uint32_t*)ws1;

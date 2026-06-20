@@ -13,7 +13,7 @@
 
 use crate::codegen::msl::MslWriter;
 use crate::fusion::ir::ChainStep;
-use crate::graph::Dtype;
+use crate::graph::{Dtype, ScalarValue};
 
 use super::{BufferAccess, BufferSlot, EmitCtx, KernelPiece};
 
@@ -27,6 +27,12 @@ pub struct PointwiseChain {
     /// chains are not always activation-typed: shape/frequency helper
     /// graphs often stay float32 even inside fp16/bf16 models.
     pub input_tys: Vec<String>,
+    /// Logical shape for each external input boundary. Used only to pick
+    /// scalar `[0]` loads after general-fusion direct-view rewrites.
+    pub input_shapes: Vec<Vec<i32>>,
+    /// Captured scalar value for each external input boundary, when known.
+    /// Used for semantic scalar lowering such as Power(x, 2/3).
+    pub input_scalars: Vec<Option<ScalarValue>>,
     /// MSL scalar type for the output buffer.
     pub output_ty: String,
     /// Steps in execution order. Each `step.op_name` lowers via
@@ -73,12 +79,14 @@ impl KernelPiece for PointwiseChain {
         let n_steps = self.steps.len();
         for (idx, step) in self.steps.iter().enumerate() {
             let is_last = idx + 1 == n_steps;
-            let expr = render_pointwise_expr_for_chain(step).unwrap_or_else(|| {
-                // Mirror the legacy emit's hard failure mode: emitter
-                // assertion in the metallib so the build doesn't ship
-                // a silently-wrong kernel.
-                format!("/* unsupported pointwise op `{}` */ 0.0f", step.op_name)
-            });
+            let expr =
+                render_pointwise_expr_for_chain(step, &self.input_shapes, &self.input_scalars)
+                    .unwrap_or_else(|| {
+                        // Mirror the legacy emit's hard failure mode: emitter
+                        // assertion in the metallib so the build doesn't ship
+                        // a silently-wrong kernel.
+                        format!("/* unsupported pointwise op `{}` */ 0.0f", step.op_name)
+                    });
             if is_last {
                 w.writeln(format_args!("out0[i] = {t}({expr});", t = self.output_ty));
             } else {
@@ -100,12 +108,38 @@ fn round_expr_to_dtype(dtype: Dtype, fallback_t: &'static str, expr: &str) -> St
 /// Mirror of `fused_chain::render_pointwise_expr`. Duplicated here so
 /// the piece is self-contained and the legacy emitter can be removed
 /// without dragging this function with it.
-fn render_pointwise_expr_for_chain(step: &ChainStep) -> Option<String> {
+fn scalar_to_f64(value: &ScalarValue) -> Option<f64> {
+    match value {
+        ScalarValue::Bool(v) => Some(if *v { 1.0 } else { 0.0 }),
+        ScalarValue::Int(v) => Some(*v as f64),
+        ScalarValue::Float(v) => Some(*v),
+    }
+}
+
+fn scalar_near(value: f64, expected: f64) -> bool {
+    (value - expected).abs() <= 1.0e-6
+}
+
+fn render_pointwise_expr_for_chain(
+    step: &ChainStep,
+    input_shapes: &[Vec<i32>],
+    input_scalars: &[Option<ScalarValue>],
+) -> Option<String> {
     use crate::fusion::ir::ChainOperand;
     let operand = |op: &ChainOperand| -> String {
         match op {
             ChainOperand::External { buffer_index } => {
-                format!("float(in{}[i])", buffer_index)
+                let is_scalar = input_shapes
+                    .get(*buffer_index as usize)
+                    .is_some_and(|shape| {
+                        shape.is_empty()
+                            || shape.iter().map(|&d| i64::from(d.max(1))).product::<i64>() == 1
+                    });
+                if is_scalar {
+                    format!("float(in{}[0])", buffer_index)
+                } else {
+                    format!("float(in{}[i])", buffer_index)
+                }
             }
             ChainOperand::Register { step_index } => format!("r{}", step_index),
         }
@@ -118,10 +152,29 @@ fn render_pointwise_expr_for_chain(step: &ChainStep) -> Option<String> {
         "Subtract" => Some(format!("{} - {}", a?, b?)),
         "Multiply" => Some(format!("{} * {}", a?, b?)),
         "Divide" => Some(format!("{} / {}", a?, b?)),
-        "Power" => Some(format!("pow({}, {})", a?, b?)),
+        "Power" => {
+            let base = a?;
+            let exponent = step.inputs.get(1).and_then(|op| match op {
+                ChainOperand::External { buffer_index } => input_scalars
+                    .get(*buffer_index as usize)
+                    .and_then(|v| v.as_ref())
+                    .and_then(scalar_to_f64),
+                ChainOperand::Register { .. } => None,
+            });
+            if let Some(exp) = exponent {
+                if scalar_near(exp, 2.0) {
+                    return Some(format!("(({base}) * ({base}))"));
+                }
+                if scalar_near(exp, 3.0) {
+                    return Some(format!("(({base}) * ({base}) * ({base}))"));
+                }
+            }
+            Some(format!("pow({}, {})", base, b?))
+        }
         "Maximum" => Some(format!("max({}, {})", a?, b?)),
         "Minimum" => Some(format!("min({}, {})", a?, b?)),
-        "Sigmoid" => Some(format!("(1.0f / (1.0f + exp(-{})))", a?)),
+        "Sigmoid" => Some(format!("(1.0f / (1.0f + metal::fast::exp(-{})))", a?)),
+        "Tanh" => Some(format!("metal::fast::tanh(clamp({}, -20.0f, 20.0f))", a?)),
         "Exp" => Some(format!("exp({})", a?)),
         "Negative" => Some(format!("(-{})", a?)),
         "LogAddExp" => Some(format!(

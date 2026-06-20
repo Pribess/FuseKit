@@ -317,6 +317,40 @@ impl ChipModel {
         }
     }
 
+    /// Output columns each routed-expert reduce simdgroup computes.
+    /// This path multiplies route activations by the expert down
+    /// projection and sums TOP_K routes. Adjacent output columns share
+    /// the same route activation row, so a small column tile cuts
+    /// activation reloads without changing routing semantics. Keep it
+    /// conservative: every extra column costs one accumulator and one
+    /// route partial per active route.
+    pub fn routed_reduce_cols_per_simdgroup(
+        self,
+        bits: u32,
+        k_dim: u32,
+        out_dim: u32,
+        top_k: u32,
+    ) -> u32 {
+        if let Some(n) = std::env::var("FUSEKIT_ROUTED_REDUCE_COLS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .filter(|&n| n >= 1 && n <= 4)
+        {
+            let mut n = n.min(out_dim.max(1));
+            while n > 1 && !out_dim.is_multiple_of(n) {
+                n -= 1;
+            }
+            return n.max(1);
+        }
+        if !matches!(bits, 4 | 8) || k_dim < 1024 || out_dim < 1024 || top_k < 2 {
+            return 1;
+        }
+        match self {
+            ChipModel::M3 | ChipModel::M4 => 2,
+            ChipModel::M1 | ChipModel::M2 | ChipModel::M5 | ChipModel::Unknown => 1,
+        }
+    }
+
     /// Active token rows a quantized small-M GEMM simdgroup computes
     /// for a single output column. This is the M dimension counterpart
     /// of `gemv_rows_per_simdgroup()`: it shares one quantized weight
@@ -390,15 +424,22 @@ impl ChipModel {
         1
     }
 
+    /// Default simdgroups per threadgroup for routed quantized GEMV
+    /// kernels. Keep this independent of sweep knobs so correctness
+    /// critical reductions can ask for the hardware budget without
+    /// inheriting a global launch override.
+    pub fn gatherqmm_default_simdgroups_per_tg(self) -> u32 {
+        let b = self.budgets();
+        b.preferred_simdgroups_per_tg
+            .min(b.max_simdgroups_per_tg)
+            .max(2)
+    }
+
     /// Simdgroups per threadgroup for Single(GatherQMM). This mirrors
     /// `kernel_threadgroup_for`'s generic Single path so emit-time
     /// shape heuristics stay aligned with dispatch sizing.
     pub fn gatherqmm_simdgroups_per_tg(self) -> u32 {
-        let b = self.budgets();
-        let default = b
-            .preferred_simdgroups_per_tg
-            .min(b.max_simdgroups_per_tg)
-            .max(2);
+        let default = self.gatherqmm_default_simdgroups_per_tg();
         std::env::var("FUSEKIT_TG_SGS")
             .ok()
             .and_then(|s| s.trim().parse::<u32>().ok())

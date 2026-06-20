@@ -51,7 +51,7 @@ impl KernelPiece for SwigluActivation {
         w.push_indent();
         w.line("float g = float(gate[i]);");
         w.line("float u = float(up[i]);");
-        w.line("float s = 1.0f / (1.0f + exp(-g));");
+        w.line("float s = 1.0f / (1.0f + metal::fast::exp(-g));");
         w.writeln(format_args!("out[i] = {}(s * g * u);", ctx.act_ty));
         w.pop_indent();
         w.line("}");
@@ -72,6 +72,7 @@ mod tests {
             model_type: "qwen2".into(),
             hidden_size: 896,
             num_hidden_layers: 24,
+            num_kv_shared_layers: 0,
             num_attention_heads: 14,
             num_key_value_heads: 2,
             head_dim: 64,

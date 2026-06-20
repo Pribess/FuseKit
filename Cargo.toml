@@ -4,13 +4,30 @@
 # is then embedded into the fusekit binary at compile time via
 # `include_bytes!` from runtime_payload.rs.
 members = ["python_runtime"]
+resolver = "2"
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.lints.rust]
+# objc 0.2 expands macros containing this legacy feature probe in the
+# destination crate. Declare it as an expected cfg value until metal-rs
+# moves to objc2.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("cargo-clippy"))'] }
 
 [package]
 name = "fusekit"
-version = "0.0.1"
-edition = "2021"
-description = "Apple Metal megakernel compiler for mlx-lm models"
-license = "MIT OR Apache-2.0"
+version.workspace = true
+edition.workspace = true
+description = "Apple Metal kernel-fusion compiler and runtime for mlx-lm models"
+license.workspace = true
+readme = "README.md"
+publish = false
+
+[lints]
+workspace = true
 
 [[bin]]
 name = "fusekit"
@@ -35,3 +52,8 @@ half = "2"
 pyo3 = { version = "0.22", features = ["abi3-py311"] }
 objc = "0.2.7"
 safetensors = "0.7.0"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

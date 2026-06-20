@@ -1,6 +1,6 @@
 //! Build script for fusekit.
 //!
-//! Two responsibilities:
+//! Three responsibilities:
 //!   1. Wire pyo3 (embedded cpython-3.11) to the oMLX-bundled libpython
 //!      so the patch-time graph capture can run mlx_lm in-process.
 //!   2. Compile our `metal/*.metal` kernels into a single `metallib`
@@ -11,6 +11,21 @@
 use std::path::PathBuf;
 
 fn main() {
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos")
+        || std::env::var("CARGO_CFG_TARGET_ARCH").as_deref() != Ok("aarch64")
+    {
+        panic!("fusekit builds only for Apple-silicon macOS (aarch64-apple-darwin)");
+    }
+
+    for name in [
+        "FUSEKIT_MLX_APP",
+        "FUSEKIT_PYTHON_ROOT",
+        "FUSEKIT_LIBPYTHON",
+        "PYO3_PYTHON",
+        "MACOSX_DEPLOYMENT_TARGET",
+    ] {
+        println!("cargo:rerun-if-env-changed={name}");
+    }
     println!("cargo:rerun-if-changed=python/fusekit_runtime/__init__.py");
     println!("cargo:rerun-if-changed=python/fusekit_runtime/dispatch.py");
 
@@ -18,34 +33,40 @@ fn main() {
     // `/install/lib/...` build prefix; the new Apple linker dropped
     // `-Wl,-change`, so we copy the dylib into OUT_DIR and rewrite the
     // copy's id to `@rpath/libpython3.11.dylib`. At runtime dyld looks
-    // for that @rpath which we point at the bundle.
-    let py_root = std::path::Path::new("/Applications/oMLX.app/Contents/Python/cpython-3.11");
-    let py_lib_src = py_root.join("lib").join("libpython3.11.dylib");
-    if py_lib_src.is_file() {
-        let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR from cargo");
-        let fixed = std::path::Path::new(&out_dir).join("libpython3.11.dylib");
-        std::fs::copy(&py_lib_src, &fixed).expect("copy libpython3.11.dylib to OUT_DIR");
-        let status = std::process::Command::new("install_name_tool")
-            .args(["-id", "@rpath/libpython3.11.dylib", fixed.to_str().unwrap()])
-            .status()
-            .expect("invoke install_name_tool");
-        assert!(status.success(), "install_name_tool -id failed");
-
-        println!("cargo:rustc-link-search=native={}", out_dir);
-        println!(
-            "cargo:rustc-link-arg=-Wl,-rpath,{}",
-            py_root.join("lib").display()
-        );
-    } else {
+    // for that @rpath, which points back at the detected oMLX bundle.
+    let py_root = find_python_root();
+    let py_lib_src = std::env::var_os("FUSEKIT_LIBPYTHON")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| py_root.join("lib/libpython3.11.dylib"));
+    if !py_lib_src.is_file() {
         panic!(
-            "expected oMLX-bundled libpython at {} — is oMLX.app installed?",
+            "expected oMLX-bundled libpython at {} (set FUSEKIT_PYTHON_ROOT or FUSEKIT_LIBPYTHON)",
             py_lib_src.display()
         );
     }
 
-    // Align with the oMLX-bundled dylibs' deployment target.
-    std::env::set_var("MACOSX_DEPLOYMENT_TARGET", "26.0");
-    println!("cargo:rustc-link-arg=-mmacosx-version-min=26.0");
+    let out_dir = PathBuf::from(std::env::var_os("OUT_DIR").expect("OUT_DIR from cargo"));
+    let fixed = out_dir.join("libpython3.11.dylib");
+    std::fs::copy(&py_lib_src, &fixed).expect("copy libpython3.11.dylib to OUT_DIR");
+    let status = std::process::Command::new("install_name_tool")
+        .args(["-id", "@rpath/libpython3.11.dylib"])
+        .arg(&fixed)
+        .status()
+        .expect("invoke install_name_tool");
+    assert!(status.success(), "install_name_tool -id failed");
+
+    println!("cargo:rustc-link-search=native={}", out_dir.display());
+    println!(
+        "cargo:rustc-link-arg=-Wl,-rpath,{}",
+        py_root.join("lib").display()
+    );
+
+    // Align with the oMLX-bundled dylibs' deployment target while allowing
+    // source builders to override it explicitly.
+    let deployment_target =
+        std::env::var("MACOSX_DEPLOYMENT_TARGET").unwrap_or_else(|_| "26.0".to_string());
+    std::env::set_var("MACOSX_DEPLOYMENT_TARGET", &deployment_target);
+    println!("cargo:rustc-link-arg=-mmacosx-version-min={deployment_target}");
 
     for framework in ["Metal", "Foundation", "QuartzCore"] {
         println!("cargo:rustc-link-lib=framework={framework}");
@@ -53,6 +74,62 @@ fn main() {
 
     compile_metal_kernels();
     build_python_runtime_native();
+}
+
+fn find_python_root() -> PathBuf {
+    if let Some(path) = std::env::var_os("FUSEKIT_LIBPYTHON") {
+        let library = PathBuf::from(path);
+        if library.is_file() {
+            if let Some(root) = library.parent().and_then(|lib| lib.parent()) {
+                return root.to_path_buf();
+            }
+        }
+        panic!(
+            "FUSEKIT_LIBPYTHON is not a valid dylib path: {}",
+            library.display()
+        );
+    }
+
+    if let Some(path) = std::env::var_os("FUSEKIT_PYTHON_ROOT") {
+        let root = PathBuf::from(path);
+        if root.is_dir() {
+            return root;
+        }
+        panic!("FUSEKIT_PYTHON_ROOT is not a directory: {}", root.display());
+    }
+
+    if let Some(path) = std::env::var_os("FUSEKIT_MLX_APP") {
+        let root = PathBuf::from(path).join("Contents/Python/cpython-3.11");
+        if root.is_dir() {
+            return root;
+        }
+        panic!("oMLX Python runtime not found under {}", root.display());
+    }
+
+    if let Some(path) = std::env::var_os("PYO3_PYTHON") {
+        let python = PathBuf::from(path);
+        if let Some(root) = python.parent().and_then(|bin| bin.parent()) {
+            if root.join("lib/libpython3.11.dylib").is_file() {
+                return root.to_path_buf();
+            }
+        }
+    }
+
+    let mut candidates = vec![PathBuf::from(
+        "/Applications/oMLX.app/Contents/Python/cpython-3.11",
+    )];
+    if let Some(home) = std::env::var_os("HOME") {
+        candidates
+            .push(PathBuf::from(home).join("Applications/oMLX.app/Contents/Python/cpython-3.11"));
+    }
+    candidates
+        .into_iter()
+        .find(|path| path.join("lib/libpython3.11.dylib").is_file())
+        .unwrap_or_else(|| {
+            panic!(
+                "could not find oMLX's Python 3.11 runtime; install oMLX.app or set FUSEKIT_MLX_APP"
+            )
+        })
 }
 
 /// Build the `fusekit_runtime_native` cdylib (pyo3 extension) and
@@ -129,8 +206,7 @@ fn compile_metal_kernels() {
     {
         Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim().to_string(),
         _ => {
-            println!("cargo:warning=Metal toolchain not found via xcrun — skipping kernel build");
-            return;
+            panic!("Metal toolchain not found via xcrun; install the full Xcode toolchain");
         }
     };
     let metallib_bin = std::process::Command::new("xcrun")
@@ -143,10 +219,8 @@ fn compile_metal_kernels() {
                 .then(|| String::from_utf8_lossy(&o.stdout).trim().to_string())
         });
 
-    let Ok(entries) = std::fs::read_dir(&metal_dir) else {
-        println!("cargo:warning=no metal/ directory — skipping kernel build");
-        return;
-    };
+    let entries = std::fs::read_dir(&metal_dir)
+        .unwrap_or_else(|e| panic!("read Metal source directory {}: {e}", metal_dir.display()));
 
     let mut air_files = Vec::new();
     for entry in entries.flatten() {
@@ -173,9 +247,11 @@ fn compile_metal_kernels() {
         air_files.push(air);
     }
 
-    if air_files.is_empty() {
-        return;
-    }
+    assert!(
+        !air_files.is_empty(),
+        "no .metal sources found under {}",
+        metal_dir.display()
+    );
     let lib_path = out_dir.join("fusekit_kernels.metallib");
     if let Some(metallib_bin) = metallib_bin {
         let status = std::process::Command::new(&metallib_bin)

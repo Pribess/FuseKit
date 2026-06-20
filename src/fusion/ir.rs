@@ -24,7 +24,7 @@
 //! the structured parameters needed for codegen. Pointers and grid
 //! decisions belong to the Stage 3 `Task` IR.
 
-use crate::graph::{Dtype, OpId, TensorId};
+use crate::graph::{Dtype, OpId, ScalarValue, TensorId};
 
 pub type FusionId = u32;
 
@@ -78,6 +78,10 @@ pub struct FusionBoundary {
     pub role: &'static str,
     pub shape: Vec<i32>,
     pub dtype: Dtype,
+    /// Captured value for scalar constant boundaries. General fusion
+    /// may remap constants into merged kernels, so codegen cannot
+    /// depend on looking them up through the original graph alone.
+    pub scalar_value: Option<ScalarValue>,
 }
 
 /// What kind of fusion this is. Codegen branches on this to pick the
@@ -252,6 +256,18 @@ pub struct QkvDecodeSinks {
     pub theta: f32,
 }
 
+/// RoPE parameters captured from `mx.fast.rope` when a trace-local
+/// RoPE can be sunk into a semantic consumer. This is op-level
+/// metadata, not a model-name pattern.
+#[derive(Debug, Clone)]
+pub struct RopeInfo {
+    pub dims: u32,
+    pub traditional: bool,
+    pub base: f32,
+    pub scale: f32,
+    pub inline_freqs: Option<Vec<f32>>,
+}
+
 /// Pattern-specific parameters, populated by the matcher. Codegen
 /// `match`es on this to fetch the right values without revisiting the
 /// Stage 1 IR.
@@ -276,6 +292,20 @@ pub enum FusionAttrs {
     },
     SdpaDecode {
         scale: f32,
+        trace_q: bool,
+        /// Split-Q input layout for trace-bound attention. When set,
+        /// `inputs[0]` and `inputs[1]` are concatenated along the last
+        /// dimension to form logical Q; SDPA reads both directly instead
+        /// of materializing a Concatenate scratch row.
+        q_split: Option<u32>,
+        /// The split Q inputs are last-dimension slices of the same
+        /// pre-transpose packed source laid out as `[B,S,H,Q0+Q1]`.
+        /// SDPA indexes that source directly as `(query_row, head, dim)`.
+        q_transpose_split: bool,
+        /// Optional RoPE to apply to Q1 before it participates in logical
+        /// Q. Used when `RoPE(q1) -> Concatenate -> SdpaDecode.Q` is
+        /// dataflow-isolated.
+        q1_rope: Option<RopeInfo>,
         mask: AttentionMask,
     },
     SdpaPrefill {
@@ -312,7 +342,19 @@ pub enum FusionAttrs {
     RopeKvCacheStoreDecode {
         theta: f32,
     },
-    KvCacheStoreDecode,
+    KvCacheStoreDecode {
+        /// Optional RoPE applied to split-K part1 while writing the
+        /// current token into the cache. This represents graph-local
+        /// `RoPE(k_part1)` sunk into the semantic cache-store primitive;
+        /// admission is by dataflow/attrs, not model name.
+        k1_rope: Option<RopeInfo>,
+        /// Optional direct read from the pre-transpose packed K/V source.
+        /// When set, split-K input0 and V input2 alias the same
+        /// `[B, S, H, K0+V]` tensor and the value stores start at this
+        /// K0 dimension. Admission is by TransposeSplit axes, tensor
+        /// shapes, and cache-store semantic roles, not by model name.
+        kv_transpose_split: Option<u32>,
+    },
     RmsNormRopeQGateDecode {
         eps: f32,
         theta: f32,
@@ -323,7 +365,14 @@ pub enum FusionAttrs {
         theta: f32,
         rope_dims: u32,
     },
-    EmbedLookupDecode,
+    EmbedLookupDecode {
+        /// Optional scalar applied immediately after token embedding.
+        /// Some model families scale embeddings by sqrt(hidden_size);
+        /// this is inferred from the captured graph as
+        /// `Gather(embed_tokens, token) -> Multiply(_, scalar)`, not
+        /// from model names.
+        output_scale: f32,
+    },
     ArraysCacheShiftAppendDecode {
         cache_index: u32,
         state_len: u32,
@@ -360,9 +409,13 @@ pub enum FusionAttrs {
     RoutedQmvSwiglu {
         gate: QmvFanoutTarget,
         up: QmvFanoutTarget,
+        pre_scale_route_weight: bool,
     },
     RoutedQmvReduce {
         target: QmvFanoutTarget,
+        input_preweighted: bool,
+        residual_linear: Option<QmvFanoutTarget>,
+        has_extra_residual: bool,
     },
     /// Per-layer megakernel attrs. Carries the layer index (used for
     /// per-layer cache routing at the runtime) plus the shared per-block
@@ -410,7 +463,7 @@ pub struct ChainStep {
     pub output_dtype: Dtype,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChainOperand {
     /// Read from kernel `buffer(N)` — an external input to the fusion.
     External { buffer_index: u32 },
@@ -473,6 +526,7 @@ pub struct ModelMeta {
     pub model_type: String,
     pub hidden_size: u32,
     pub num_hidden_layers: u32,
+    pub num_kv_shared_layers: u32,
     pub num_attention_heads: u32,
     pub num_key_value_heads: u32,
     pub head_dim: u32,
@@ -551,7 +605,9 @@ impl ModelMeta {
         use anyhow::Context;
         let text =
             std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
-        let root: serde_json::Value = serde_json::from_str(&text).context("parse config.json")?;
+        let mut root: serde_json::Value =
+            serde_json::from_str(&text).context("parse config.json")?;
+        augment_missing_text_meta_from_safetensors(path, &mut root);
         let mut meta = Self::from_value(&root)?;
         if meta.quant_bits.is_some() {
             if let Some(dtype) = infer_quant_activation_dtype_from_safetensors(path) {
@@ -601,6 +657,9 @@ impl ModelMeta {
             .or_else(|| pick_root("num_hidden_layers"))
             .ok_or_else(|| anyhow::anyhow!("config missing num_hidden_layers"))?
             as u32;
+        let num_kv_shared_layers = pick("num_kv_shared_layers")
+            .or_else(|| pick_root("num_kv_shared_layers"))
+            .unwrap_or(0) as u32;
         let intermediate_size = pick("intermediate_size")
             .or_else(|| pick_root("intermediate_size"))
             .ok_or_else(|| anyhow::anyhow!("config missing intermediate_size"))?
@@ -673,6 +732,7 @@ impl ModelMeta {
             model_type,
             hidden_size,
             num_hidden_layers,
+            num_kv_shared_layers,
             num_attention_heads,
             num_key_value_heads,
             head_dim,
@@ -686,6 +746,129 @@ impl ModelMeta {
             activation_dtype,
         })
     }
+}
+
+fn augment_missing_text_meta_from_safetensors(
+    config_path: &std::path::Path,
+    root: &mut serde_json::Value,
+) {
+    let Some(dir) = config_path.parent() else {
+        return;
+    };
+    let Some(shapes) = infer_text_weight_shapes(dir) else {
+        return;
+    };
+
+    let target = if root.get("text_config").is_some() {
+        root.get_mut("text_config").and_then(|v| v.as_object_mut())
+    } else {
+        root.as_object_mut()
+    };
+    let Some(target) = target else {
+        return;
+    };
+
+    if !target.contains_key("vocab_size") {
+        if let Some(vocab) = shapes.vocab_size {
+            target.insert("vocab_size".to_string(), serde_json::json!(vocab));
+        }
+    }
+    if !target.contains_key("head_dim") {
+        if let Some(head_dim) = shapes.head_dim {
+            target.insert("head_dim".to_string(), serde_json::json!(head_dim));
+        }
+    }
+    if !target.contains_key("num_attention_heads") {
+        if let (Some(q_dim), Some(head_dim)) = (shapes.q_dim, shapes.head_dim) {
+            if head_dim > 0 && q_dim % head_dim == 0 {
+                target.insert(
+                    "num_attention_heads".to_string(),
+                    serde_json::json!(q_dim / head_dim),
+                );
+            }
+        }
+    }
+    if !target.contains_key("num_key_value_heads") {
+        if let (Some(k_dim), Some(head_dim)) = (shapes.k_dim, shapes.head_dim) {
+            if head_dim > 0 && k_dim % head_dim == 0 {
+                target.insert(
+                    "num_key_value_heads".to_string(),
+                    serde_json::json!(k_dim / head_dim),
+                );
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct TextWeightShapes {
+    vocab_size: Option<u64>,
+    q_dim: Option<u64>,
+    k_dim: Option<u64>,
+    head_dim: Option<u64>,
+}
+
+fn infer_text_weight_shapes(dir: &std::path::Path) -> Option<TextWeightShapes> {
+    use std::io::Read;
+
+    let mut paths: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.ends_with(".safetensors"))
+                .unwrap_or(false)
+        })
+        .collect();
+    paths.sort();
+
+    let mut out = TextWeightShapes::default();
+    for path in paths {
+        let Ok(mut file) = std::fs::File::open(&path) else {
+            continue;
+        };
+        let mut len_buf = [0u8; 8];
+        if file.read_exact(&mut len_buf).is_err() {
+            continue;
+        }
+        let header_len = u64::from_le_bytes(len_buf) as usize;
+        let mut header_buf = vec![0u8; header_len];
+        if file.read_exact(&mut header_buf).is_err() {
+            continue;
+        }
+        let Ok(header) = serde_json::from_slice::<serde_json::Value>(&header_buf) else {
+            continue;
+        };
+        let Some(obj) = header.as_object() else {
+            continue;
+        };
+        for (key, value) in obj {
+            if key == "__metadata__" || key.starts_with("vision_tower.") {
+                continue;
+            }
+            let Some(shape) = value.get("shape").and_then(|v| v.as_array()) else {
+                continue;
+            };
+            let dim0 = shape.first().and_then(|v| v.as_u64());
+            if out.vocab_size.is_none() && key.ends_with("embed_tokens.weight") {
+                out.vocab_size = dim0;
+            } else if out.q_dim.is_none() && key.ends_with(".layers.0.self_attn.q_proj.weight") {
+                out.q_dim = dim0;
+            } else if out.k_dim.is_none() && key.ends_with(".layers.0.self_attn.k_proj.weight") {
+                out.k_dim = dim0;
+            } else if out.head_dim.is_none()
+                && (key.ends_with(".layers.0.self_attn.q_norm.weight")
+                    || key.ends_with(".layers.0.self_attn.k_norm.weight"))
+            {
+                out.head_dim = dim0;
+            }
+        }
+    }
+
+    (out.vocab_size.is_some()
+        || (out.q_dim.is_some() && out.k_dim.is_some() && out.head_dim.is_some()))
+    .then_some(out)
 }
 
 fn mtp_info_from_config(mtp_num_hidden_layers: u32, num_nextn_predict_layers: u32) -> MtpInfo {

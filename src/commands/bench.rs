@@ -1,10 +1,14 @@
 //! `fusekit bench` — fixed-length mlx-lm/fusekit benchmark.
 
 use anyhow::{anyhow, Context, Result};
-use std::path::PathBuf;
 use std::process::Command;
 
 use crate::{omlx, paths, ui};
+
+// Keep the installed CLI self-contained. Source builds and release archives
+// execute the exact same benchmark driver without relying on a neighboring
+// `scripts/` directory.
+const BENCH_SCRIPT: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/scripts/bench.py"));
 
 pub struct BenchOptions<'a> {
     pub model: &'a str,
@@ -32,7 +36,6 @@ pub fn run(opts: BenchOptions<'_>) -> Result<()> {
     let m = omlx::find_model(opts.model)?;
     let python = paths::mlx_python_bin()?;
     let site_packages = paths::mlx_site_packages()?;
-    let script = locate_bench_script()?;
 
     ui::ok(format!("model: {} ({})", m.name, m.path.display()));
     if opts.raw {
@@ -44,7 +47,8 @@ pub fn run(opts: BenchOptions<'_>) -> Result<()> {
     }
 
     let mut cmd = Command::new(&python);
-    cmd.arg(&script)
+    cmd.arg("-c")
+        .arg(BENCH_SCRIPT)
         .arg(&m.path)
         .args(["--tokens", &opts.tokens.to_string()])
         .args(["--prompt", opts.prompt])
@@ -69,26 +73,9 @@ pub fn run(opts: BenchOptions<'_>) -> Result<()> {
         cmd.env("FUSEKIT_PROFILE_KERNELS", "1");
     }
 
-    let status = cmd.status().context("running bench.py")?;
+    let status = cmd.status().context("running embedded benchmark driver")?;
     if !status.success() {
-        return Err(anyhow!("bench.py exited with {status}"));
+        return Err(anyhow!("benchmark driver exited with {status}"));
     }
     Ok(())
-}
-
-fn locate_bench_script() -> Result<PathBuf> {
-    let exe = std::env::current_exe()?;
-    let candidates = [
-        exe.parent().map(|p| p.join("scripts/bench.py")),
-        exe.parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("scripts/bench.py")),
-        Some(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("scripts/bench.py")),
-    ];
-    for c in candidates.into_iter().flatten() {
-        if c.is_file() {
-            return Ok(c);
-        }
-    }
-    Err(anyhow!("bench.py not found"))
 }

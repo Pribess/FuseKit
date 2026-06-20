@@ -47,6 +47,7 @@ pub fn emit_simdgroup_matmul_inner(
     k_const: &str,
     a_stride_expr: &str,
     n_stride_expr: &str,
+    b_transpose: bool,
     t: &str,
 ) {
     w.line("{");
@@ -63,9 +64,15 @@ pub fn emit_simdgroup_matmul_inner(
         "metal::simdgroup_load(a_tile, {a_ptr_expr} + k, {a_stride_expr});"
     ));
     // B tile: row stride is N. Start at (k, n_base).
-    w.writeln(format_args!(
-        "metal::simdgroup_load(b_tile, {b_ptr_expr} + k * {n_stride_expr}, {n_stride_expr});"
-    ));
+    if b_transpose {
+        w.writeln(format_args!(
+            "metal::simdgroup_load(b_tile, {b_ptr_expr} + k, {n_stride_expr}, ulong2(0, 0), true);"
+        ));
+    } else {
+        w.writeln(format_args!(
+            "metal::simdgroup_load(b_tile, {b_ptr_expr} + k * {n_stride_expr}, {n_stride_expr});"
+        ));
+    }
     w.writeln(format_args!(
         "simdgroup_multiply_accumulate({acc}, a_tile, b_tile, {acc});"
     ));

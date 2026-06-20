@@ -31,8 +31,21 @@ pub fn emit(
         bail!("rope_kv_cache_store emitter: attrs mismatch");
     };
 
-    let n_kv = meta.num_key_value_heads;
-    let head_dim = meta.head_dim;
+    let k_shape = fusion
+        .inputs
+        .first()
+        .map(|b| b.shape.as_slice())
+        .unwrap_or(&[]);
+    let head_dim = k_shape
+        .last()
+        .copied()
+        .unwrap_or(meta.head_dim as i32)
+        .max(1) as u32;
+    let n_kv = k_shape
+        .get(k_shape.len().saturating_sub(2))
+        .copied()
+        .unwrap_or(meta.num_key_value_heads as i32)
+        .max(1) as u32;
     let half = head_dim / 2;
     let t = crate::codegen::kernels::act_ty(meta);
     let fn_name = function_name(fusion);
@@ -54,7 +67,8 @@ pub fn emit(
     w.line(format!("device {t}       *cache_keys   [[buffer(2)]],"));
     w.line(format!("device {t}       *cache_values [[buffer(3)]],"));
     w.line("constant uint       &offset       [[buffer(4)]],");
-    w.line("constant uint       &capacity     [[buffer(5)]],");
+    w.line("constant uint       &write_offset [[buffer(5)]],");
+    w.line("constant uint       &capacity     [[buffer(6)]],");
     w.line("uint tid     [[thread_position_in_threadgroup]],");
     w.line("uint tg_size [[threads_per_threadgroup]],");
     w.line("uint gid     [[threadgroup_position_in_grid]]");
@@ -78,6 +92,7 @@ pub fn emit(
     w.line("uint row = g / TOKEN_RANGE;");
     w.line("uint local = g - row * TOKEN_RANGE;");
     w.line("if (row >= ACTIVE_M) return;");
+    w.line("uint cache_row = (write_offset + row) % capacity;");
     // K work: g ∈ [0, K_RANGE) — apply RoPE pair-rotation, write to cache slot.
     // V work: g ∈ [K_RANGE, V_RANGE) — straight copy to cache slot.
     w.line("bool is_k = (local < K_RANGE);");
@@ -104,7 +119,7 @@ pub fn emit(
     // ── Write K (rotated) into cache_keys[0, kh, offset, kd] ──
     w.line("if (is_k) {");
     w.push_indent();
-    w.line("uint cache_off = kh * capacity * HEAD_DIM + (offset + row) * HEAD_DIM + kd;");
+    w.line("uint cache_off = kh * capacity * HEAD_DIM + cache_row * HEAD_DIM + kd;");
     w.line(format!("cache_keys[cache_off] = {t}(k_result);"));
     w.pop_indent();
     w.line("}");
@@ -114,7 +129,7 @@ pub fn emit(
     w.push_indent();
     w.line("uint vh = v_idx / HEAD_DIM;");
     w.line("uint vd = v_idx % HEAD_DIM;");
-    w.line("uint cache_off = vh * capacity * HEAD_DIM + (offset + row) * HEAD_DIM + vd;");
+    w.line("uint cache_off = vh * capacity * HEAD_DIM + cache_row * HEAD_DIM + vd;");
     w.line(format!(
         "cache_values[cache_off] = {t}(V[(row * N_KV * HEAD_DIM) + v_idx]);"
     ));

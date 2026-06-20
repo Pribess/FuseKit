@@ -29,7 +29,6 @@
 //! identity holds. Emits an `algorithmic_form` attribute on the
 //! affected op so downstream codegen can specialise.
 
-use crate::graph::Attrs;
 use crate::op::module::Module;
 use crate::op::op::{AttrValue, Op, OpKind};
 use crate::op::passes::algebraic::{Rewrite, RewriteRule};

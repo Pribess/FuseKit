@@ -23,9 +23,10 @@ pub fn emit(
     if !matches!(fusion.kind, FusionKind::EmbedLookupDecode) {
         bail!("embed_lookup_decode emitter: wrong kind {:?}", fusion.kind);
     }
-    if !matches!(fusion.attrs, FusionAttrs::EmbedLookupDecode) {
+    let FusionAttrs::EmbedLookupDecode { output_scale } = &fusion.attrs else {
         bail!("embed_lookup_decode emitter: attrs mismatch");
-    }
+    };
+    let output_scale = *output_scale;
 
     let hidden = meta.hidden_size;
     let t = crate::codegen::kernels::act_ty(meta);
@@ -42,8 +43,8 @@ pub fn emit(
         .filter(|(bits, group)| matches!(*bits, 4 | 8) && *group > 0);
 
     w.line(format!(
-        "// Fusion #{}: EmbedLookupDecode (active_m = {}, hidden = {}, dt = {})",
-        fusion.id, active_m, hidden, t
+        "// Fusion #{}: EmbedLookupDecode (active_m = {}, hidden = {}, dt = {}, output_scale = {})",
+        fusion.id, active_m, hidden, t, output_scale
     ));
     w.line(format!("kernel void {fn_name}("));
     w.push_indent();
@@ -66,6 +67,9 @@ pub fn emit(
     w.push_indent();
     w.writeln(format_args!("constexpr uint ACTIVE_M = {active_m};"));
     w.writeln(format_args!("constexpr uint HIDDEN = {hidden};"));
+    w.writeln(format_args!(
+        "constexpr float OUTPUT_SCALE = {output_scale:e}f;"
+    ));
     w.blank();
     w.line("uint i = gid * tg_size + tid;");
     w.line("if (i >= ACTIVE_M * HIDDEN) return;");
@@ -85,9 +89,13 @@ pub fn emit(
         w.line("uint g = d / GROUP;");
         w.line("float s = float(embed_scales[token_id * N_GROUPS + g]);");
         w.line("float b = float(embed_biases[token_id * N_GROUPS + g]);");
-        w.line(format!("x[row * HIDDEN + d] = {t}(float(q) * s + b);"));
+        w.line(format!(
+            "x[row * HIDDEN + d] = {t}((float(q) * s + b) * OUTPUT_SCALE);"
+        ));
     } else {
-        w.line("x[row * HIDDEN + d] = embed_table[token_id * HIDDEN + d];");
+        w.line(format!(
+            "x[row * HIDDEN + d] = {t}(float(embed_table[token_id * HIDDEN + d]) * OUTPUT_SCALE);"
+        ));
     }
     w.pop_indent();
     w.line("}");

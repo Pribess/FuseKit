@@ -94,11 +94,23 @@ pub fn emit_metallib(
     let mut w = MslWriter::new();
     prelude(&mut w);
 
+    let mut emit_fusions = fg.fusions.clone();
+    for fusion in &mut emit_fusions {
+        for boundary in fusion.inputs.iter_mut().chain(fusion.outputs.iter_mut()) {
+            if boundary.scalar_value.is_none() {
+                boundary.scalar_value = graph
+                    .tensors
+                    .get(boundary.source as usize)
+                    .and_then(|t| t.scalar_value.clone());
+            }
+        }
+    }
+
     // Per-variant kernel functions. Tasks sharing (kind, shape,
     // partition) emit one shared MSL function.
     let mut seen: std::collections::HashSet<String> = Default::default();
     for task in &tg.tasks {
-        let fusion = &fg.fusions[task.fusion as usize];
+        let fusion = &emit_fusions[task.fusion as usize];
         let name = variant_name(fusion, &task.partition);
         if seen.insert(name) {
             kernels::emit_for(fusion, &task.partition, meta, &mut w)?;
@@ -116,7 +128,7 @@ pub fn emit_metallib(
         use crate::fusion::ir::FusionKind;
         let mut seen_quant: std::collections::HashSet<String> = Default::default();
         for task in &tg.tasks {
-            let fusion = &fg.fusions[task.fusion as usize];
+            let fusion = &emit_fusions[task.fusion as usize];
             match fusion.kind {
                 FusionKind::SdpaDecode => {
                     for bits in [4u32, 8u32] {

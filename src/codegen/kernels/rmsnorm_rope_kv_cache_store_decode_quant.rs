@@ -38,8 +38,21 @@ pub fn emit(
         bail!("rmsnorm_rope_kv_cache_store_quant: only bits in {{4, 8}}, got {bits}");
     }
 
-    let n_kv = meta.num_key_value_heads;
-    let head_dim = meta.head_dim;
+    let k_shape = fusion
+        .inputs
+        .first()
+        .map(|b| b.shape.as_slice())
+        .unwrap_or(&[]);
+    let n_kv = k_shape
+        .get(k_shape.len().saturating_sub(2))
+        .copied()
+        .unwrap_or(meta.num_key_value_heads as i32)
+        .max(1) as u32;
+    let head_dim = k_shape
+        .last()
+        .copied()
+        .unwrap_or(meta.head_dim as i32)
+        .max(1) as u32;
     let dims = rope_dims.min(head_dim);
     let half = (dims / 2).max(1);
     let active_m = fusion
@@ -86,7 +99,8 @@ pub fn emit(
         "device {t}       *cache_values_biases [[buffer(8)]],"
     ));
     w.line("constant uint      &offset             [[buffer(9)]],");
-    w.line("constant uint      &capacity           [[buffer(10)]],");
+    w.line("constant uint      &write_offset       [[buffer(10)]],");
+    w.line("constant uint      &capacity           [[buffer(11)]],");
     w.line("uint tid       [[thread_position_in_threadgroup]],");
     w.line("uint tg_size   [[threads_per_threadgroup]],");
     w.line("uint group_id  [[threadgroup_position_in_grid]]");
@@ -124,7 +138,8 @@ pub fn emit(
     w.line("uint head = is_v ? (local_group - N_KV) : local_group;");
     w.line("if (head >= N_KV) return;");
     w.line("uint base = (row * N_KV + head) * HEAD_DIM;");
-    w.line("uint cache_offset = offset + row;");
+    w.line("uint pos = offset + row;");
+    w.line("uint cache_offset = (write_offset + row) % capacity;");
     w.blank();
 
     w.line("if (!is_v) {");
@@ -158,7 +173,7 @@ pub fn emit(
     w.line("float hi = float(k_proj[base + pair_idx + HALF]) * rms_scale * float(k_weight[pair_idx + HALF]);");
     w.line("float d_norm = float(pair_idx) / float(HALF);");
     w.line("float inv_freq = metal::exp2(-d_norm * BASE_LOG2);");
-    w.line("float angle = float(cache_offset) * inv_freq;");
+    w.line("float angle = float(pos) * inv_freq;");
     w.line("float c = metal::fast::cos(angle);");
     w.line("float s = metal::fast::sin(angle);");
     w.line("val = (d < HALF) ? (lo * c - hi * s) : (hi * c + lo * s);");

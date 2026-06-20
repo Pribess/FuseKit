@@ -210,6 +210,11 @@ pub fn run(model: &str, chip: Option<&str>, force: bool) -> Result<()> {
             model_type: meta.model_type.clone(),
             hidden_size: meta.hidden_size,
             num_hidden_layers: meta.num_hidden_layers,
+            num_kv_shared_layers: meta.num_kv_shared_layers,
+            num_attention_heads: meta.num_attention_heads,
+            num_key_value_heads: meta.num_key_value_heads,
+            head_dim: meta.head_dim,
+            vocab_size: meta.vocab_size,
             mtp: meta.mtp.clone(),
         },
         stats: CompileStats {

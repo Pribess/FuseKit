@@ -34,8 +34,21 @@ pub fn emit(
         bail!("rope_q_decode emitter: attrs mismatch");
     };
 
-    let n_heads = meta.num_attention_heads;
-    let head_dim = meta.head_dim;
+    let q_shape = fusion
+        .inputs
+        .first()
+        .map(|b| b.shape.as_slice())
+        .unwrap_or(&[]);
+    let head_dim = q_shape
+        .last()
+        .copied()
+        .unwrap_or(meta.head_dim as i32)
+        .max(1) as u32;
+    let n_heads = q_shape
+        .get(q_shape.len().saturating_sub(2))
+        .copied()
+        .unwrap_or(meta.num_attention_heads as i32)
+        .max(1) as u32;
     let half = head_dim / 2;
     let t = crate::codegen::kernels::act_ty(meta);
     let fn_name = function_name(fusion);

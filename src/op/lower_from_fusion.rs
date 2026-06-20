@@ -198,6 +198,7 @@ mod tests {
             head_dim: 64,
             intermediate_size: 4864,
             num_hidden_layers: 24,
+            num_kv_shared_layers: 0,
             vocab_size: 151936,
             quant_group_size: None,
             quant_bits: None,
@@ -214,6 +215,7 @@ mod tests {
             role,
             shape,
             dtype: Dtype::F16,
+            scalar_value: None,
         }
     }
 
@@ -327,6 +329,10 @@ mod tests {
                 outputs: vec![mk_boundary(4, "out", vec![1, 14, 1, 64])],
                 attrs: FusionAttrs::SdpaDecode {
                     scale: 0.125,
+                    trace_q: false,
+                    q_split: None,
+                    q_transpose_split: false,
+                    q1_rope: None,
                     mask: AttentionMask::Causal,
                 },
                 parallel_axes: vec![],
@@ -350,8 +356,26 @@ mod tests {
 fn lower_attrs(f: &Fusion) -> BTreeMap<String, AttrValue> {
     let mut attrs = BTreeMap::new();
     match &f.attrs {
-        FusionAttrs::SdpaDecode { scale, mask } => {
+        FusionAttrs::SdpaDecode {
+            scale,
+            trace_q,
+            q_split,
+            q_transpose_split,
+            q1_rope,
+            mask,
+        } => {
             attrs.insert("scale".into(), AttrValue::F32(*scale));
+            attrs.insert("trace_q".into(), AttrValue::Bool(*trace_q));
+            if let Some(q_split) = q_split {
+                attrs.insert("q_split".into(), AttrValue::U32(*q_split));
+            }
+            attrs.insert(
+                "q_transpose_split".into(),
+                AttrValue::Bool(*q_transpose_split),
+            );
+            if let Some(info) = q1_rope {
+                attrs.insert("q1_rope_dims".into(), AttrValue::U32(info.dims));
+            }
             attrs.insert("mask".into(), AttrValue::String(format!("{mask:?}")));
         }
         FusionAttrs::RopeQDecode { theta } | FusionAttrs::RopeKvCacheStoreDecode { theta } => {

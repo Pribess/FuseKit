@@ -35,6 +35,71 @@ import mlx.core as mx
 DEFAULT_PROMPT = "Repeat the word token forever: token token token"
 
 
+def install_gemma4_shared_kv_filter() -> None:
+    """Let raw Gemma4 MLX loads ignore shared-layer K/V tensors.
+
+    Some exported Gemma4 checkpoints keep K/V tensors for layers that the
+    mlx-lm config marks as KV-shared. FuseKit's runtime installs this filter
+    for normal runs, but this profiler starts with the hook disabled so it can
+    measure raw MLX. Install the load-only filter here as measurement plumbing.
+    """
+
+    try:
+        from mlx_lm.models import gemma4_text
+    except Exception:
+        return
+
+    model_cls = getattr(gemma4_text, "Model", None)
+    original = getattr(model_cls, "sanitize", None)
+    if model_cls is None or original is None:
+        return
+    if getattr(original, "_fusekit_profile_gemma4_shared_kv_filter", False):
+        return
+
+    def layer_index(key: str) -> int | None:
+        marker = ".layers."
+        pos = key.find(marker)
+        if pos < 0:
+            return None
+        tail = key[pos + len(marker) :]
+        dot = tail.find(".")
+        if dot <= 0:
+            return None
+        try:
+            return int(tail[:dot])
+        except ValueError:
+            return None
+
+    def sanitize(self, weights):
+        sanitized = original(self, weights)
+        args = getattr(self, "args", None)
+        try:
+            num_layers = int(getattr(args, "num_hidden_layers", 0) or 0)
+            shared_layers = int(getattr(args, "num_kv_shared_layers", 0) or 0)
+        except (TypeError, ValueError):
+            return sanitized
+        first_shared = num_layers - shared_layers
+        if num_layers <= 0 or shared_layers <= 0 or first_shared < 0:
+            return sanitized
+
+        return {
+            key: value
+            for key, value in sanitized.items()
+            if not (
+                (idx := layer_index(key)) is not None
+                and idx >= first_shared
+                and (
+                    ".self_attn.k_proj." in key
+                    or ".self_attn.v_proj." in key
+                    or ".self_attn.k_norm." in key
+                )
+            )
+        }
+
+    sanitize._fusekit_profile_gemma4_shared_kv_filter = True
+    model_cls.sanitize = sanitize
+
+
 @dataclass
 class Stat:
     total_s: float = 0.0
@@ -332,6 +397,7 @@ def main() -> int:
         flush=True,
     )
 
+    install_gemma4_shared_kv_filter()
     install_wrappers(args.include_modules)
 
     from mlx_lm import load

@@ -1,9 +1,13 @@
 [package]
 name = "fusekit_runtime_native"
-version = "0.0.1"
-edition = "2021"
+version.workspace = true
+edition.workspace = true
 description = "Rust dispatcher backing the fusekit_runtime Python package"
-license = "MIT OR Apache-2.0"
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
 
 [lib]
 # `extension-module` Python extension — produces a .dylib that's loaded

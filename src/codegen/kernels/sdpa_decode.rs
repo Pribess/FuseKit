@@ -25,7 +25,7 @@
 use anyhow::{bail, Result};
 
 use crate::codegen::msl::MslWriter;
-use crate::fusion::ir::{Fusion, FusionAttrs, FusionKind, ModelMeta};
+use crate::fusion::ir::{Fusion, FusionAttrs, FusionKind, ModelMeta, RopeInfo};
 use crate::task::ir::PartitionPlan;
 
 /// Largest kv_len the legacy two-pass path statically allocates scratch
@@ -70,34 +70,89 @@ pub fn flash_decoding_enabled_for(
     {
         return false;
     }
+    // V_DIM=512 is correctness-safe with the two-dispatch path, but
+    // profiling showed the extra partial/combine traffic loses e2e time.
+    // Keep the default to shapes where the kernel is a measured win.
+    let v_dim_supported = v_dim <= 256;
     if std::env::var("FUSEKIT_FORCE_SDPA_FLASH_DECODING").as_deref() == Ok("1") {
-        return true;
+        return v_dim_supported;
     }
 
-    // Flash-decoding splits one decode head across KV chunks and then
-    // merges global partials with an atomic counter. That wins when
-    // there are too few head TGs to fill the GPU, but the fixed
-    // partial/counter roundtrip is too expensive for small Qwen2-style
-    // decode heads (M=1, <=16 heads, 64-wide Q/K/V). In that shape the
-    // legacy one-TG-per-head path is faster at L512 while using much
-    // less scratch bandwidth. This is semantic/shape-based, not a
-    // model-name special case.
-    let small_decode_head = active_m == 1 && n_heads <= 16 && qk_dim <= 64 && v_dim <= 64;
-    !small_decode_head
+    // Flash-decoding is shape-capability gated, not model gated. The
+    // multi-chunk fast path is emitted as two ordered dispatches
+    // (partial -> combine), so cross-threadgroup visibility relies on
+    // the command boundary instead of unsupported device acquire/release
+    // atomics inside a single kernel.
+    let _ = (n_heads, qk_dim, active_m);
+    v_dim_supported
 }
 
 pub fn emit(
     fusion: &Fusion,
+    partition: &PartitionPlan,
+    meta: &ModelMeta,
+    w: &mut MslWriter,
+) -> Result<()> {
+    emit_with_function_name(fusion, partition, meta, w, function_name(fusion))
+}
+
+pub fn emit_with_function_name(
+    fusion: &Fusion,
     _partition: &PartitionPlan,
     meta: &ModelMeta,
     w: &mut MslWriter,
+    fn_name: String,
+) -> Result<()> {
+    emit_with_function_name_mode(fusion, meta, w, fn_name.clone(), SdpaEmitMode::Main)?;
+    if sdpa_flash_capable_for_fusion(fusion, meta) {
+        emit_with_function_name_mode(
+            fusion,
+            meta,
+            w,
+            format!("{fn_name}_partial"),
+            SdpaEmitMode::FlashPartial,
+        )?;
+        emit_with_function_name_mode(
+            fusion,
+            meta,
+            w,
+            format!("{fn_name}_combine"),
+            SdpaEmitMode::FlashCombine,
+        )?;
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SdpaEmitMode {
+    Main,
+    FlashPartial,
+    FlashCombine,
+}
+
+fn emit_with_function_name_mode(
+    fusion: &Fusion,
+    meta: &ModelMeta,
+    w: &mut MslWriter,
+    fn_name: String,
+    mode: SdpaEmitMode,
 ) -> Result<()> {
     if !matches!(fusion.kind, FusionKind::SdpaDecode) {
         bail!("sdpa_decode emitter: wrong kind {:?}", fusion.kind);
     }
-    let FusionAttrs::SdpaDecode { scale, .. } = fusion.attrs else {
+    let FusionAttrs::SdpaDecode {
+        scale,
+        trace_q,
+        q_split,
+        q_transpose_split,
+        q1_rope,
+        ..
+    } = &fusion.attrs
+    else {
         bail!("sdpa_decode emitter: attrs mismatch");
     };
+    let scale = *scale;
+    let trace_q = *trace_q;
 
     let q_shape = fusion
         .inputs
@@ -109,9 +164,42 @@ pub fn emit(
         .first()
         .map(|b| b.shape.as_slice())
         .unwrap_or(&[]);
+    let split_q = q_split.is_some() && fusion.inputs.len() >= 4;
+    let q_transpose_split = split_q && *q_transpose_split;
+    let q0_dim = if q_transpose_split {
+        q_split.unwrap_or(0).max(1)
+    } else {
+        q_shape
+            .last()
+            .copied()
+            .unwrap_or(meta.head_dim as i32)
+            .max(1) as u32
+    };
+    let q1_shape = if split_q {
+        fusion
+            .inputs
+            .get(1)
+            .map(|b| b.shape.as_slice())
+            .unwrap_or(&[])
+    } else {
+        &[][..]
+    };
+    let q1_dim = if q_transpose_split {
+        q_shape
+            .last()
+            .copied()
+            .unwrap_or((q0_dim + meta.head_dim) as i32)
+            .max(q0_dim as i32) as u32
+            - q0_dim
+    } else if split_q {
+        q1_shape.last().copied().unwrap_or(0).max(0) as u32
+    } else {
+        0
+    };
+    let v_input_idx = if split_q { 3 } else { 2 };
     let v_shape = fusion
         .inputs
-        .get(2)
+        .get(v_input_idx)
         .map(|b| b.shape.as_slice())
         .unwrap_or(&[]);
     let inputless_semantic_decode = fusion.inputs.is_empty();
@@ -119,6 +207,8 @@ pub fn emit(
     let n_kv_heads = meta.num_key_value_heads;
     let qk_dim = if inputless_semantic_decode {
         meta.head_dim
+    } else if split_q {
+        q0_dim + q1_dim
     } else {
         q_shape
             .last()
@@ -136,20 +226,22 @@ pub fn emit(
             .unwrap_or(meta.head_dim as i32)
             .max(1) as u32
     };
-    let active_m = out_shape
-        .get(0..)
-        .filter(|s| !s.is_empty())
-        .map(|s| crate::target::current_chip().active_tokens_for_shape(s))
-        .unwrap_or_else(|| crate::target::current_chip().active_m_for_unshaped(8))
-        .max(1);
-    let direct_scaled_q = (scale - 1.0).abs() < f32::EPSILON && !inputless_semantic_decode;
-    let q_head_major = inputless_semantic_decode
-        || direct_scaled_q
-        || infer_q_head_major(q_shape, n_heads, active_m, qk_dim);
+    let active_m = active_rows_for_shape(out_shape, n_heads, v_dim);
+    let direct_scaled_q = trace_q && !inputless_semantic_decode;
+    let q_head_major = !q_transpose_split
+        && (inputless_semantic_decode
+            || direct_scaled_q
+            || infer_head_major_layout(q_shape, n_heads, qk_dim));
+    let out_head_major = infer_head_major_layout(out_shape, n_heads, v_dim);
     let q_seq = if q_head_major {
         trace_q_head_stride(q_shape).max(1)
     } else {
         1
+    };
+    let out_trace_seq = if out_head_major {
+        trace_q_head_stride(out_shape).max(1)
+    } else {
+        active_m
     };
     let out_seq = active_m;
     let heads_per_kv = n_heads / n_kv_heads;
@@ -158,13 +250,19 @@ pub fn emit(
     } else {
         scale
     };
+    let q1_rope = if split_q { q1_rope.as_ref() } else { None };
     let t = crate::codegen::kernels::act_ty(meta);
 
     // Flash-Decoding splits each query head's KV across MAX_CHUNKS TGs;
     // the grid is `n_heads × MAX_CHUNKS` and `gid` decomposes into
     // `head_id × MAX_CHUNKS + chunk_id`. The single-TG-per-head emits
     // keep their existing `head_id = gid` convention.
-    let flash_decoding = flash_decoding_enabled_for(n_heads, n_kv_heads, qk_dim, v_dim, active_m);
+    let flash_decoding = match mode {
+        SdpaEmitMode::Main => {
+            flash_decoding_enabled_for(n_heads, n_kv_heads, qk_dim, v_dim, active_m)
+        }
+        SdpaEmitMode::FlashPartial | SdpaEmitMode::FlashCombine => true,
+    };
     // Bake layer_idx so each layer's SDPA kernel indexes into the
     // shared global partials/counter buffers at its own offset. Allows
     // ONE global buffer instead of n_layers per-layer scratches.
@@ -176,26 +274,39 @@ pub fn emit(
         })
         .unwrap_or(0);
 
-    let fn_name = function_name(fusion);
     w.line(format!(
-        "// Fusion #{}: SdpaDecode (n_heads={}, n_kv={}, qk_dim={}, v_dim={}, scale={}, layer={}, flash_decoding={})",
-        fusion.id, n_heads, n_kv_heads, qk_dim, v_dim, scale, layer_idx, flash_decoding
+        "// Fusion #{}: SdpaDecode::{:?} (n_heads={}, n_kv={}, qk_dim={}, v_dim={}, scale={}, layer={}, flash_decoding={})",
+        fusion.id, mode, n_heads, n_kv_heads, qk_dim, v_dim, scale, layer_idx, flash_decoding
     ));
     w.line(format!("kernel void {fn_name}("));
     w.push_indent();
-    w.line(format!("device const {t} *Q         [[buffer(0)]],"));
-    w.line(format!("device const {t} *K         [[buffer(1)]],"));
-    w.line(format!("device const {t} *V         [[buffer(2)]],"));
-    w.line("constant uint       &kv_len    [[buffer(3)]],");
-    // capacity = stride between kv_heads in the cache layout
-    // (1, n_kv, capacity, head_dim). For the legacy contiguous layout
-    // pass capacity == kv_len; for cache-resident dispatch pass the
-    // cache's allocated capacity.
-    w.line("constant uint       &capacity  [[buffer(4)]],");
-    w.line(format!("device {t}       *out       [[buffer(5)]],"));
-    if flash_decoding {
-        w.line("device float       *partials  [[buffer(6)]],");
-        w.line("device atomic_uint *counter   [[buffer(7)]],");
+    if split_q {
+        w.line(format!("device const {t} *Q0        [[buffer(0)]],"));
+        w.line(format!("device const {t} *Q1        [[buffer(1)]],"));
+        w.line(format!("device const {t} *K         [[buffer(2)]],"));
+        w.line(format!("device const {t} *V         [[buffer(3)]],"));
+        w.line("constant uint       &kv_len    [[buffer(4)]],");
+        w.line("constant uint       &capacity  [[buffer(5)]],");
+        w.line(format!("device {t}       *out       [[buffer(6)]],"));
+        if flash_decoding {
+            w.line("device float       *partials  [[buffer(7)]],");
+            w.line("device atomic_uint *counter   [[buffer(8)]],");
+        }
+    } else {
+        w.line(format!("device const {t} *Q         [[buffer(0)]],"));
+        w.line(format!("device const {t} *K         [[buffer(1)]],"));
+        w.line(format!("device const {t} *V         [[buffer(2)]],"));
+        w.line("constant uint       &kv_len    [[buffer(3)]],");
+        // capacity = stride between kv_heads in the cache layout
+        // (1, n_kv, capacity, head_dim). For the legacy contiguous layout
+        // pass capacity == kv_len; for cache-resident dispatch pass the
+        // cache's allocated capacity.
+        w.line("constant uint       &capacity  [[buffer(4)]],");
+        w.line(format!("device {t}       *out       [[buffer(5)]],"));
+        if flash_decoding {
+            w.line("device float       *partials  [[buffer(6)]],");
+            w.line("device atomic_uint *counter   [[buffer(7)]],");
+        }
     }
     w.line("uint tid       [[thread_position_in_threadgroup]],");
     w.line("uint tg_size   [[threads_per_threadgroup]],");
@@ -205,9 +316,14 @@ pub fn emit(
     w.push_indent();
 
     w.writeln(format_args!("constexpr uint QK_DIM      = {qk_dim};"));
+    w.writeln(format_args!("constexpr uint Q0_DIM      = {q0_dim};"));
+    w.writeln(format_args!("constexpr uint Q1_DIM      = {q1_dim};"));
     w.writeln(format_args!("constexpr uint V_DIM       = {v_dim};"));
     w.writeln(format_args!("constexpr uint Q_SEQ       = {q_seq};"));
     w.writeln(format_args!("constexpr uint OUT_SEQ     = {out_seq};"));
+    w.writeln(format_args!(
+        "constexpr uint OUT_TRACE_SEQ = {out_trace_seq};"
+    ));
     w.writeln(format_args!("constexpr uint N_HEADS     = {n_heads};"));
     w.writeln(format_args!("constexpr uint N_KV_HEADS  = {n_kv_heads};"));
     w.writeln(format_args!(
@@ -215,11 +331,20 @@ pub fn emit(
         if q_head_major { "true" } else { "false" }
     ));
     w.writeln(format_args!(
+        "constexpr bool OUT_HEAD_MAJOR = {};",
+        if out_head_major { "true" } else { "false" }
+    ));
+    w.writeln(format_args!(
         "constexpr uint HEADS_PER_KV = {heads_per_kv};"
     ));
     w.writeln(format_args!("constexpr float SCALE      = {scale};"));
     w.writeln(format_args!("constexpr uint MAX_KV_LEN  = {MAX_KV_LEN};"));
     w.writeln(format_args!("constexpr uint BLOCK       = {FLASH_BLOCK};"));
+    w.writeln(format_args!(
+        "constexpr bool Q_TRANSPOSE_SPLIT = {};",
+        if q_transpose_split { "true" } else { "false" }
+    ));
+    emit_q1_rope_constants(w, q1_rope, q1_dim);
     if flash_decoding {
         w.writeln(format_args!(
             "constexpr uint KV_CHUNK    = {FLASH_DEC_CHUNK};"
@@ -250,20 +375,29 @@ pub fn emit(
     // `n_heads × ceil(kv_len/KV_CHUNK)` and avoiding the legacy
     // `MAX_KV_LEN` scores buffer in threadgroup memory. Set
     // FUSEKIT_SDPA_LEGACY=1 to restore the old two-pass path for A/B.
-    if flash_decoding {
-        emit_flash_decoding(w, t);
-    } else {
-        w.line("uint query_row = head_id / N_HEADS;");
-        w.line("uint head_id_real = head_id - query_row * N_HEADS;");
-        w.line("if (query_row >= OUT_SEQ) return;");
-        w.line("uint kv_len_eff = kv_len + query_row;");
-        w.line("uint kv_head = head_id_real / HEADS_PER_KV;");
-        w.blank();
-        let use_flash = std::env::var_os("FUSEKIT_SDPA_FLASH").is_some();
-        if use_flash {
-            emit_flash_online(w, t);
-        } else {
-            emit_legacy_two_pass(w, t);
+    match mode {
+        SdpaEmitMode::FlashPartial => {
+            emit_flash_partial(w, t, split_q, q_transpose_split, q1_rope, q1_dim);
+        }
+        SdpaEmitMode::FlashCombine => {
+            emit_flash_combine(w, t);
+        }
+        SdpaEmitMode::Main if flash_decoding => {
+            emit_flash_decoding(w, t, split_q, q_transpose_split, q1_rope, q1_dim);
+        }
+        SdpaEmitMode::Main => {
+            w.line("uint query_row = head_id / N_HEADS;");
+            w.line("uint head_id_real = head_id - query_row * N_HEADS;");
+            w.line("if (query_row >= OUT_SEQ) return;");
+            w.line("uint kv_len_eff = kv_len + query_row;");
+            w.line("uint kv_head = head_id_real / HEADS_PER_KV;");
+            w.blank();
+            let use_flash = std::env::var_os("FUSEKIT_SDPA_FLASH").is_some();
+            if use_flash {
+                emit_flash_online(w, t, split_q, q_transpose_split, q1_rope, q1_dim);
+            } else {
+                emit_legacy_two_pass(w, t, split_q, q_transpose_split, q1_rope, q1_dim);
+            }
         }
     }
 
@@ -273,11 +407,72 @@ pub fn emit(
     Ok(())
 }
 
+fn sdpa_flash_capable_for_fusion(fusion: &Fusion, meta: &ModelMeta) -> bool {
+    let q_shape = fusion
+        .inputs
+        .first()
+        .map(|b| b.shape.as_slice())
+        .unwrap_or(&[]);
+    let out_shape = fusion
+        .outputs
+        .first()
+        .map(|b| b.shape.as_slice())
+        .unwrap_or(&[]);
+    let q_split = matches!(
+        fusion.attrs,
+        FusionAttrs::SdpaDecode {
+            q_split: Some(_),
+            ..
+        }
+    ) && fusion.inputs.len() >= 4;
+    let q0_dim = q_shape
+        .last()
+        .copied()
+        .unwrap_or(meta.head_dim as i32)
+        .max(1) as u32;
+    let q1_dim = if q_split {
+        fusion
+            .inputs
+            .get(1)
+            .and_then(|b| b.shape.last().copied())
+            .unwrap_or(0)
+            .max(0) as u32
+    } else {
+        0
+    };
+    let qk_dim = if fusion.inputs.is_empty() {
+        meta.head_dim
+    } else if q_split {
+        q0_dim + q1_dim
+    } else {
+        q0_dim
+    };
+    let v_dim = if fusion.inputs.is_empty() {
+        meta.head_dim
+    } else {
+        fusion
+            .inputs
+            .get(if q_split { 3 } else { 2 })
+            .and_then(|b| b.shape.last().copied())
+            .or_else(|| out_shape.last().copied())
+            .unwrap_or(meta.head_dim as i32)
+            .max(1) as u32
+    };
+    let active_m = active_rows_for_shape(out_shape, meta.num_attention_heads, v_dim);
+    flash_decoding_enabled_for(
+        meta.num_attention_heads,
+        meta.num_key_value_heads,
+        qk_dim,
+        v_dim,
+        active_m,
+    )
+}
+
 pub fn function_name(fusion: &Fusion) -> String {
     format!("fusekit_sdpa_decode_f{}", fusion.id)
 }
 
-fn trace_q_head_stride(q_shape: &[i32]) -> u32 {
+pub fn trace_q_head_stride(q_shape: &[i32]) -> u32 {
     if q_shape.len() >= 3 {
         q_shape[q_shape.len() - 2].max(1) as u32
     } else {
@@ -285,24 +480,181 @@ fn trace_q_head_stride(q_shape: &[i32]) -> u32 {
     }
 }
 
-fn infer_q_head_major(q_shape: &[i32], n_heads: u32, active_m: u32, qk_dim: u32) -> bool {
-    if q_shape.len() < 3 {
+pub fn infer_head_major_layout(shape: &[i32], n_heads: u32, last_dim: u32) -> bool {
+    if shape.len() < 3 || n_heads == 0 {
         return false;
     }
-    let Some(&last) = q_shape.last() else {
+    let Some(&last) = shape.last() else {
         return false;
     };
-    if last.max(1) as u32 != qk_dim {
+    if last.max(1) as u32 != last_dim {
         return false;
     }
-    if trace_q_head_stride(q_shape).max(1) != active_m.max(1) {
-        return false;
-    }
-    let head_prefix = q_shape[..q_shape.len() - 2]
+    let head_prefix = shape[..shape.len() - 2]
         .iter()
         .map(|&d| d.max(1) as u64)
         .product::<u64>();
-    head_prefix == n_heads.max(1) as u64
+    head_prefix >= n_heads as u64 && head_prefix % n_heads as u64 == 0
+}
+
+pub fn active_rows_for_shape(shape: &[i32], n_heads: u32, last_dim: u32) -> u32 {
+    let trace_m = trace_rows_for_shape(shape, n_heads, last_dim);
+    crate::target::current_chip().active_m(trace_m).max(1)
+}
+
+pub fn trace_rows_for_shape(shape: &[i32], n_heads: u32, last_dim: u32) -> u32 {
+    if infer_head_major_layout(shape, n_heads, last_dim) {
+        let seq = trace_q_head_stride(shape).max(1) as u64;
+        let head_prefix = shape[..shape.len() - 2]
+            .iter()
+            .map(|&d| d.max(1) as u64)
+            .product::<u64>()
+            .max(1);
+        return ((head_prefix / n_heads.max(1) as u64) * seq)
+            .max(1)
+            .min(u32::MAX as u64) as u32;
+    }
+    if shape.len() >= 3 {
+        shape[1].max(1) as u32
+    } else if shape.len() >= 2 {
+        shape[shape.len() - 2].max(1) as u32
+    } else {
+        1
+    }
+}
+
+fn q1_rope_active(info: Option<&RopeInfo>, q1_dim: u32) -> Option<&RopeInfo> {
+    let info = info?;
+    if info.dims.min(q1_dim) >= 2 {
+        Some(info)
+    } else {
+        None
+    }
+}
+
+fn emit_q1_rope_constants(w: &mut MslWriter, info: Option<&RopeInfo>, q1_dim: u32) {
+    let active = q1_rope_active(info, q1_dim);
+    if let Some(info) = active {
+        let dims = info.dims.min(q1_dim);
+        let half = dims / 2;
+        let log2_base = (info.base as f64).log2() as f32;
+        w.line("constexpr bool Q1_ROPE      = true;");
+        w.writeln(format_args!("constexpr uint Q1_ROPE_DIMS = {dims};"));
+        w.writeln(format_args!("constexpr uint Q1_ROPE_HALF = {half};"));
+        w.writeln(format_args!(
+            "constexpr float Q1_ROPE_BASE_LOG2 = {log2_base:e}f;"
+        ));
+        w.writeln(format_args!(
+            "constexpr float Q1_ROPE_SCALE = {};",
+            info.scale
+        ));
+        w.writeln(format_args!(
+            "constexpr bool Q1_ROPE_TRADITIONAL = {};",
+            if info.traditional { "true" } else { "false" }
+        ));
+        if let Some(freqs) = info.inline_freqs.as_ref().filter(|freqs| !freqs.is_empty()) {
+            let vals = freqs
+                .iter()
+                .map(|v| format!("{v:.9e}f"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            w.writeln(format_args!("constexpr bool Q1_ROPE_INLINE_FREQS = true;"));
+            w.writeln(format_args!(
+                "const float q1_inline_freqs[{}] = {{ {vals} }};",
+                freqs.len()
+            ));
+        } else {
+            w.line("constexpr bool Q1_ROPE_INLINE_FREQS = false;");
+        }
+    } else {
+        w.line("constexpr bool Q1_ROPE      = false;");
+        w.line("constexpr uint Q1_ROPE_DIMS = 0;");
+        w.line("constexpr uint Q1_ROPE_HALF = 0;");
+        w.line("constexpr float Q1_ROPE_BASE_LOG2 = 0.0f;");
+        w.line("constexpr float Q1_ROPE_SCALE = 1.0f;");
+        w.line("constexpr bool Q1_ROPE_TRADITIONAL = false;");
+        w.line("constexpr bool Q1_ROPE_INLINE_FREQS = false;");
+    }
+}
+
+fn emit_split_q_stage(
+    w: &mut MslWriter,
+    t: &str,
+    q_transpose_split: bool,
+    q1_rope: Option<&RopeInfo>,
+    q1_dim: u32,
+) {
+    w.line("threadgroup float q_local[QK_DIM];");
+    if q_transpose_split {
+        w.line(format!(
+            "device const {t}* q_pack_base = Q0 + ((query_row * N_HEADS + head_id_real) * QK_DIM);"
+        ));
+        w.line(format!("device const {t}* q0_base = q_pack_base;"));
+        w.line(format!("device const {t}* q1_base = q_pack_base + Q0_DIM;"));
+    } else {
+        w.line(format!(
+        "device const {t}* q0_base = Q0 + ((Q_HEAD_MAJOR ? (((query_row / Q_SEQ) * N_HEADS + head_id_real) * Q_SEQ + (query_row % Q_SEQ)) : (query_row * N_HEADS + head_id_real)) * Q0_DIM);"
+    ));
+        w.line(format!(
+            "device const {t}* q1_base = Q1 + ((Q_HEAD_MAJOR ? (((query_row / Q_SEQ) * N_HEADS + head_id_real) * Q_SEQ + (query_row % Q_SEQ)) : (query_row * N_HEADS + head_id_real)) * Q1_DIM);"
+        ));
+    }
+    w.line("for (uint d = tid; d < QK_DIM; d += tg_size) {");
+    w.push_indent();
+    if q1_rope_active(q1_rope, q1_dim).is_some() {
+        w.line("if (d < Q0_DIM) {");
+        w.push_indent();
+        w.line("q_local[d] = float(q0_base[d]);");
+        w.pop_indent();
+        w.line("} else {");
+        w.push_indent();
+        w.line("uint q1d = d - Q0_DIM;");
+        w.line("if (q1d >= Q1_ROPE_DIMS) {");
+        w.push_indent();
+        w.line("q_local[d] = float(q1_base[q1d]);");
+        w.pop_indent();
+        w.line("} else {");
+        w.push_indent();
+        w.line("uint pair_idx = Q1_ROPE_TRADITIONAL ? (q1d / 2u) : ((q1d < Q1_ROPE_HALF) ? q1d : (q1d - Q1_ROPE_HALF));");
+        w.line("float d_norm = float(pair_idx) / float(Q1_ROPE_HALF);");
+        if let Some(info) = q1_rope
+            .and_then(|info| info.inline_freqs.as_ref())
+            .filter(|freqs| !freqs.is_empty())
+            .map(|_| q1_rope.unwrap())
+        {
+            let n = info
+                .inline_freqs
+                .as_ref()
+                .map(|freqs| freqs.len())
+                .unwrap_or(1);
+            w.writeln(format_args!(
+                "uint freq_idx = (pair_idx < {n}u) ? pair_idx : {}u;",
+                n.saturating_sub(1)
+            ));
+            w.line("float inv_freq = Q1_ROPE_SCALE / q1_inline_freqs[freq_idx];");
+        } else {
+            w.line("float inv_freq = metal::exp2(-d_norm * Q1_ROPE_BASE_LOG2) * Q1_ROPE_SCALE;");
+        }
+        w.line("float angle = float((kv_len > 0u ? (kv_len - 1u) : 0u) + query_row) * inv_freq;");
+        w.line("float c = metal::fast::cos(angle);");
+        w.line("float s = metal::fast::sin(angle);");
+        w.line("uint lo_idx = Q1_ROPE_TRADITIONAL ? (pair_idx * 2u) : pair_idx;");
+        w.line("uint hi_idx = Q1_ROPE_TRADITIONAL ? (lo_idx + 1u) : (pair_idx + Q1_ROPE_HALF);");
+        w.line("float lo = float(q1_base[lo_idx]);");
+        w.line("float hi = float(q1_base[hi_idx]);");
+        w.line("bool lo_lane = Q1_ROPE_TRADITIONAL ? ((q1d & 1u) == 0u) : (q1d < Q1_ROPE_HALF);");
+        w.line("q_local[d] = lo_lane ? (lo * c - hi * s) : (hi * c + lo * s);");
+        w.pop_indent();
+        w.line("}");
+        w.pop_indent();
+        w.line("}");
+    } else {
+        w.line("q_local[d] = (d < Q0_DIM) ? float(q0_base[d]) : float(q1_base[d - Q0_DIM]);");
+    }
+    w.pop_indent();
+    w.line("}");
+    w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
+    w.blank();
 }
 
 /// Flash-Decoding: each (head, kv_chunk) TG runs the flash 2-pass over
@@ -322,7 +674,56 @@ fn infer_q_head_major(q_shape: &[i32], n_heads: u32, active_m: u32, qk_dim: u32)
 /// kernel argument `head_id` (kept for signature compatibility with
 /// the non-flash-decoding emit) is the COMPOUND gid; we re-decompose
 /// it here.
-fn emit_flash_decoding(w: &mut MslWriter, t: &str) {
+fn emit_flash_decoding(
+    w: &mut MslWriter,
+    t: &str,
+    split_q: bool,
+    q_transpose_split: bool,
+    q1_rope: Option<&RopeInfo>,
+    q1_dim: u32,
+) {
+    emit_flash_partial_phase(
+        w,
+        t,
+        split_q,
+        q_transpose_split,
+        q1_rope,
+        q1_dim,
+        true,
+        true,
+    );
+}
+
+fn emit_flash_partial(
+    w: &mut MslWriter,
+    t: &str,
+    split_q: bool,
+    q_transpose_split: bool,
+    q1_rope: Option<&RopeInfo>,
+    q1_dim: u32,
+) {
+    emit_flash_partial_phase(
+        w,
+        t,
+        split_q,
+        q_transpose_split,
+        q1_rope,
+        q1_dim,
+        false,
+        false,
+    );
+}
+
+fn emit_flash_partial_phase(
+    w: &mut MslWriter,
+    t: &str,
+    split_q: bool,
+    q_transpose_split: bool,
+    q1_rope: Option<&RopeInfo>,
+    q1_dim: u32,
+    atomic_combine: bool,
+    safe_online_on_multichunk: bool,
+) {
     w.line("// Flash-Decoding: per-(head, chunk) TG → global partials + atomic combine.");
     // Re-decompose head_id (which is gid here, since Metal pinned the
     // dispatch axis to threadgroup_position_in_grid).
@@ -338,6 +739,24 @@ fn emit_flash_decoding(w: &mut MslWriter, t: &str) {
     w.line("uint active_chunks = (kv_len_eff + KV_CHUNK - 1u) / KV_CHUNK;");
     w.blank();
 
+    // Cross-threadgroup partial combine needs a device-memory ordering
+    // contract that this Metal toolchain cannot express for device
+    // atomics. Keep the flash-decoding entrypoint and grid shape, but
+    // route multi-chunk contexts through the single-TG online-softmax
+    // body so correctness does not depend on relaxed inter-TG partial
+    // visibility. The branch is runtime/shape based; active_chunks==1
+    // still uses the lower-overhead partial path below.
+    if safe_online_on_multichunk {
+        w.line("if (active_chunks > 1u) {");
+        w.push_indent();
+        w.line("if (chunk_id != 0u) return;");
+        emit_flash_online(w, t, split_q, q_transpose_split, q1_rope, q1_dim);
+        w.line("return;");
+        w.pop_indent();
+        w.line("}");
+        w.blank();
+    }
+
     // Empty-chunk early exit. These TGs don't touch the counter so
     // `active_chunks - 1` always identifies the last ACTIVE chunk.
     w.line("if (kv_start >= kv_len_eff) return;");
@@ -348,12 +767,19 @@ fn emit_flash_decoding(w: &mut MslWriter, t: &str) {
     w.line("threadgroup float s_block[BLOCK];");
     w.line("threadgroup float reduce_buf[32];");
     w.blank();
+    if split_q {
+        emit_split_q_stage(w, t, q_transpose_split, q1_rope, q1_dim);
+    }
 
-    // Per-thread state mirrors the single-TG flash emit: each thread
-    // tid < V_DIM owns one output dim; threads ≥ V_DIM help in
-    // Stage 1 reductions only.
-    w.line("bool owns_d = tid < V_DIM;");
-    w.line("float o_d = 0.0f;");
+    // Per-thread output state: most heads use one output column per
+    // thread, while V_DIM=512 on a 256-thread TG lets each thread own a
+    // second column at `tid + tg_size`.
+    w.line("bool owns_d0 = tid < V_DIM;");
+    w.line("uint d0 = tid;");
+    w.line("bool owns_d1 = (tid + tg_size) < V_DIM;");
+    w.line("uint d1 = tid + tg_size;");
+    w.line("float o_d0 = 0.0f;");
+    w.line("float o_d1 = 0.0f;");
     w.line("float m = -INFINITY;");
     w.line("float l = 0.0f;");
     w.blank();
@@ -370,15 +796,21 @@ fn emit_flash_decoding(w: &mut MslWriter, t: &str) {
     w.push_indent();
     w.line("uint kv = block + tid;");
     w.line(format!(
-        "device const {t}* q_row = Q + ((Q_HEAD_MAJOR ? (head_id_real * Q_SEQ + query_row) : (query_row * N_HEADS + head_id_real)) * QK_DIM);"
-    ));
-    w.line(format!(
         "device const {t}* k_row = K + (kv_head * capacity + kv) * QK_DIM;"
     ));
+    if !split_q {
+        w.line(format!(
+            "device const {t}* q_row = Q + ((Q_HEAD_MAJOR ? (((query_row / Q_SEQ) * N_HEADS + head_id_real) * Q_SEQ + (query_row % Q_SEQ)) : (query_row * N_HEADS + head_id_real)) * QK_DIM);"
+        ));
+    }
     w.line("float dot = 0.0f;");
     w.line("for (uint d = 0u; d < QK_DIM; ++d) {");
     w.push_indent();
-    w.line("dot += float(q_row[d]) * float(k_row[d]);");
+    if split_q {
+        w.line("dot += q_local[d] * float(k_row[d]);");
+    } else {
+        w.line("dot += float(q_row[d]) * float(k_row[d]);");
+    }
     w.pop_indent();
     w.line("}");
     w.line("s_block[tid] = dot * SCALE;");
@@ -402,11 +834,11 @@ fn emit_flash_decoding(w: &mut MslWriter, t: &str) {
     w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
     w.line("float m_block = reduce_buf[0];");
     w.line("float m_new = max(m, m_block);");
-    w.line("float alpha = metal::precise::exp(m - m_new);");
+    w.line("float alpha = metal::fast::exp(m - m_new);");
     w.blank();
 
     // Stage 2b: exp(s - m_new), sum.
-    w.line("if (tid < block_size) s_block[tid] = metal::precise::exp(s_block[tid] - m_new);");
+    w.line("if (tid < block_size) s_block[tid] = metal::fast::exp(s_block[tid] - m_new);");
     w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
     w.line("float t_sum = (tid < block_size) ? s_block[tid] : 0.0f;");
     w.line("t_sum = simd_sum(t_sum);");
@@ -424,20 +856,23 @@ fn emit_flash_decoding(w: &mut MslWriter, t: &str) {
     w.line("l = l * alpha + l_block;");
     w.blank();
 
-    // Stage 3: o_d update, Σ_i beta_i * V[block+i, d].
-    w.line("if (owns_d) {");
+    // Stage 3: output update, Σ_i beta_i * V[block+i, d].
+    w.line("if (owns_d0 || owns_d1) {");
     w.push_indent();
-    w.line("float contrib = 0.0f;");
+    w.line("float contrib0 = 0.0f;");
+    w.line("float contrib1 = 0.0f;");
     w.line("for (uint i = 0u; i < block_size; ++i) {");
     w.push_indent();
     w.line("uint kv = block + i;");
     w.line(format!(
         "device const {t}* v_row = V + (kv_head * capacity + kv) * V_DIM;"
     ));
-    w.line("contrib += s_block[i] * float(v_row[tid]);");
+    w.line("if (owns_d0) contrib0 += s_block[i] * float(v_row[d0]);");
+    w.line("if (owns_d1) contrib1 += s_block[i] * float(v_row[d1]);");
     w.pop_indent();
     w.line("}");
-    w.line("o_d = o_d * alpha + contrib;");
+    w.line("if (owns_d0) o_d0 = o_d0 * alpha + contrib0;");
+    w.line("if (owns_d1) o_d1 = o_d1 * alpha + contrib1;");
     w.pop_indent();
     w.line("}");
     w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
@@ -457,14 +892,25 @@ fn emit_flash_decoding(w: &mut MslWriter, t: &str) {
     w.line("partials[partial_base + 1u] = l;");
     w.pop_indent();
     w.line("}");
-    w.line("if (owns_d) {");
+    w.line("if (owns_d0) {");
     w.push_indent();
-    w.line("partials[partial_base + 2u + tid] = o_d;");
+    w.line("partials[partial_base + 2u + d0] = o_d0;");
+    w.pop_indent();
+    w.line("}");
+    w.line("if (owns_d1) {");
+    w.push_indent();
+    w.line("partials[partial_base + 2u + d1] = o_d1;");
     w.pop_indent();
     w.line("}");
     w.line("// Make partials visible to other TGs that observe our counter.");
     w.line("threadgroup_barrier(mem_flags::mem_device);");
     w.blank();
+
+    if !atomic_combine {
+        w.line("// Two-dispatch flash path: combine runs as a separate ordered dispatch.");
+        w.line("return;");
+        return;
+    }
 
     // Atomic increment, broadcast to TG.
     w.line("threadgroup uint prev_count_smem[1];");
@@ -501,11 +947,12 @@ fn emit_flash_decoding(w: &mut MslWriter, t: &str) {
     w.blank();
 
     w.line("// Combine: online-softmax-merge across `active_chunks` partials.");
-    w.line("if (owns_d) {");
+    w.line("if (owns_d0 || owns_d1) {");
     w.push_indent();
     w.line("float final_m = -INFINITY;");
     w.line("float final_l = 0.0f;");
-    w.line("float final_o = 0.0f;");
+    w.line("float final_o0 = 0.0f;");
+    w.line("float final_o1 = 0.0f;");
     w.line("for (uint c = 0u; c < active_chunks; ++c) {");
     w.push_indent();
     w.line("uint c_base = LAYER_IDX * PARTIALS_STRIDE_PER_LAYER");
@@ -513,18 +960,87 @@ fn emit_flash_decoding(w: &mut MslWriter, t: &str) {
     w.line("            + c * (V_DIM + 2u);");
     w.line("float m_c = partials[c_base + 0u];");
     w.line("float l_c = partials[c_base + 1u];");
-    w.line("float o_c = partials[c_base + 2u + tid];");
+    w.line("float o_c0 = owns_d0 ? partials[c_base + 2u + d0] : 0.0f;");
+    w.line("float o_c1 = owns_d1 ? partials[c_base + 2u + d1] : 0.0f;");
     w.line("float m_new = max(final_m, m_c);");
-    w.line("float alpha_c = metal::precise::exp(final_m - m_new);");
-    w.line("float beta_c  = metal::precise::exp(m_c       - m_new);");
+    w.line("float alpha_c = metal::fast::exp(final_m - m_new);");
+    w.line("float beta_c  = metal::fast::exp(m_c       - m_new);");
     w.line("final_l = final_l * alpha_c + l_c * beta_c;");
-    w.line("final_o = final_o * alpha_c + o_c * beta_c;");
+    w.line("final_o0 = final_o0 * alpha_c + o_c0 * beta_c;");
+    w.line("final_o1 = final_o1 * alpha_c + o_c1 * beta_c;");
     w.line("final_m = m_new;");
     w.pop_indent();
     w.line("}");
+    w.line("if (owns_d0) {");
+    w.push_indent();
     w.line(format!(
-        "out[(query_row * N_HEADS + head_id_real) * V_DIM + tid] = {t}(final_o / final_l);"
+        "out[((OUT_HEAD_MAJOR ? (((query_row / OUT_TRACE_SEQ) * N_HEADS + head_id_real) * OUT_TRACE_SEQ + (query_row % OUT_TRACE_SEQ)) : (query_row * N_HEADS + head_id_real)) * V_DIM) + d0] = {t}(final_o0 / final_l);"
     ));
+    w.pop_indent();
+    w.line("}");
+    w.line("if (owns_d1) {");
+    w.push_indent();
+    w.line(format!(
+        "out[((OUT_HEAD_MAJOR ? (((query_row / OUT_TRACE_SEQ) * N_HEADS + head_id_real) * OUT_TRACE_SEQ + (query_row % OUT_TRACE_SEQ)) : (query_row * N_HEADS + head_id_real)) * V_DIM) + d1] = {t}(final_o1 / final_l);"
+    ));
+    w.pop_indent();
+    w.line("}");
+    w.pop_indent();
+    w.line("}");
+}
+
+fn emit_flash_combine(w: &mut MslWriter, t: &str) {
+    w.line("// Flash-Decoding combine: ordered dispatch reads per-chunk partials.");
+    w.line("uint query_head = head_id;");
+    w.line("uint query_row = query_head / N_HEADS;");
+    w.line("uint head_id_real = query_head - query_row * N_HEADS;");
+    w.line("if (query_row >= OUT_SEQ) return;");
+    w.line("uint kv_len_eff = kv_len + query_row;");
+    w.line("uint active_chunks = (kv_len_eff + KV_CHUNK - 1u) / KV_CHUNK;");
+    w.line("uint query_head_flat = query_row * N_HEADS + head_id_real;");
+    w.line("bool owns_d0 = tid < V_DIM;");
+    w.line("uint d0 = tid;");
+    w.line("bool owns_d1 = (tid + tg_size) < V_DIM;");
+    w.line("uint d1 = tid + tg_size;");
+    w.blank();
+    w.line("if (owns_d0 || owns_d1) {");
+    w.push_indent();
+    w.line("float final_m = -INFINITY;");
+    w.line("float final_l = 0.0f;");
+    w.line("float final_o0 = 0.0f;");
+    w.line("float final_o1 = 0.0f;");
+    w.line("for (uint c = 0u; c < active_chunks; ++c) {");
+    w.push_indent();
+    w.line("uint c_base = LAYER_IDX * PARTIALS_STRIDE_PER_LAYER");
+    w.line("            + query_head_flat * PARTIALS_STRIDE_PER_HEAD");
+    w.line("            + c * (V_DIM + 2u);");
+    w.line("float m_c = partials[c_base + 0u];");
+    w.line("float l_c = partials[c_base + 1u];");
+    w.line("float o_c0 = owns_d0 ? partials[c_base + 2u + d0] : 0.0f;");
+    w.line("float o_c1 = owns_d1 ? partials[c_base + 2u + d1] : 0.0f;");
+    w.line("float m_new = max(final_m, m_c);");
+    w.line("float alpha_c = metal::fast::exp(final_m - m_new);");
+    w.line("float beta_c  = metal::fast::exp(m_c       - m_new);");
+    w.line("final_l = final_l * alpha_c + l_c * beta_c;");
+    w.line("final_o0 = final_o0 * alpha_c + o_c0 * beta_c;");
+    w.line("final_o1 = final_o1 * alpha_c + o_c1 * beta_c;");
+    w.line("final_m = m_new;");
+    w.pop_indent();
+    w.line("}");
+    w.line("if (owns_d0) {");
+    w.push_indent();
+    w.line(format!(
+        "out[((OUT_HEAD_MAJOR ? (((query_row / OUT_TRACE_SEQ) * N_HEADS + head_id_real) * OUT_TRACE_SEQ + (query_row % OUT_TRACE_SEQ)) : (query_row * N_HEADS + head_id_real)) * V_DIM) + d0] = {t}(final_o0 / final_l);"
+    ));
+    w.pop_indent();
+    w.line("}");
+    w.line("if (owns_d1) {");
+    w.push_indent();
+    w.line(format!(
+        "out[((OUT_HEAD_MAJOR ? (((query_row / OUT_TRACE_SEQ) * N_HEADS + head_id_real) * OUT_TRACE_SEQ + (query_row % OUT_TRACE_SEQ)) : (query_row * N_HEADS + head_id_real)) * V_DIM) + d1] = {t}(final_o1 / final_l);"
+    ));
+    w.pop_indent();
+    w.line("}");
     w.pop_indent();
     w.line("}");
 }
@@ -545,11 +1061,21 @@ fn emit_flash_decoding(w: &mut MslWriter, t: &str) {
 ///   l_new = l * alpha + sum_i exp(s_block[i] - m_new)
 ///   o_new[d] = o[d] * alpha + sum_i exp(s_block[i] - m_new) * V[i, d]
 /// After the final block, `out = o / l`.
-fn emit_flash_online(w: &mut MslWriter, t: &str) {
+fn emit_flash_online(
+    w: &mut MslWriter,
+    t: &str,
+    split_q: bool,
+    q_transpose_split: bool,
+    q1_rope: Option<&RopeInfo>,
+    q1_dim: u32,
+) {
     w.line("// Flash-attention 2-pass: block-streamed online softmax.");
     w.line("threadgroup float s_block[BLOCK];");
     w.line("threadgroup float reduce_buf[32];");
     w.blank();
+    if split_q {
+        emit_split_q_stage(w, t, q_transpose_split, q1_rope, q1_dim);
+    }
 
     w.line("// Per-thread running state. Threads tid < V_DIM own one");
     w.line("// output dim each; the rest help with Stage 1/2 only.");
@@ -574,15 +1100,21 @@ fn emit_flash_online(w: &mut MslWriter, t: &str) {
     w.push_indent();
     w.line("uint kv = block + tid;");
     w.line(format!(
-        "device const {t}* q_row = Q + ((Q_HEAD_MAJOR ? (head_id_real * Q_SEQ + query_row) : (query_row * N_HEADS + head_id_real)) * QK_DIM);"
-    ));
-    w.line(format!(
         "device const {t}* k_row = K + (kv_head * capacity + kv) * QK_DIM;"
     ));
+    if !split_q {
+        w.line(format!(
+            "device const {t}* q_row = Q + ((Q_HEAD_MAJOR ? (((query_row / Q_SEQ) * N_HEADS + head_id_real) * Q_SEQ + (query_row % Q_SEQ)) : (query_row * N_HEADS + head_id_real)) * QK_DIM);"
+        ));
+    }
     w.line("float dot = 0.0f;");
     w.line("for (uint d = 0u; d < QK_DIM; ++d) {");
     w.push_indent();
-    w.line("dot += float(q_row[d]) * float(k_row[d]);");
+    if split_q {
+        w.line("dot += q_local[d] * float(k_row[d]);");
+    } else {
+        w.line("dot += float(q_row[d]) * float(k_row[d]);");
+    }
     w.pop_indent();
     w.line("}");
     w.line("s_block[tid] = dot * SCALE;");
@@ -609,14 +1141,14 @@ fn emit_flash_online(w: &mut MslWriter, t: &str) {
     w.blank();
 
     w.line("float m_new = max(m, m_block);");
-    w.line("float alpha = metal::precise::exp(m - m_new);");
+    w.line("float alpha = metal::fast::exp(m - m_new);");
     w.blank();
 
     // ── Stage 2b: compute beta[i] = exp(s_block[i] - m_new), reuse SMEM
     w.line("// Stage 2b: s_block[i] ← beta_i = exp(s_block[i] - m_new). l_block = Σ beta_i.");
     w.line("if (tid < block_size) {");
     w.push_indent();
-    w.line("s_block[tid] = metal::precise::exp(s_block[tid] - m_new);");
+    w.line("s_block[tid] = metal::fast::exp(s_block[tid] - m_new);");
     w.pop_indent();
     w.line("}");
     w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
@@ -672,7 +1204,7 @@ fn emit_flash_online(w: &mut MslWriter, t: &str) {
     w.push_indent();
     w.line("float inv_l = 1.0f / l;");
     w.line(format!(
-        "out[(query_row * N_HEADS + head_id_real) * V_DIM + tid] = {t}(o_d * inv_l);"
+        "out[((OUT_HEAD_MAJOR ? (((query_row / OUT_TRACE_SEQ) * N_HEADS + head_id_real) * OUT_TRACE_SEQ + (query_row % OUT_TRACE_SEQ)) : (query_row * N_HEADS + head_id_real)) * V_DIM) + tid] = {t}(o_d * inv_l);"
     ));
     w.pop_indent();
     w.line("}");
@@ -685,10 +1217,20 @@ fn emit_flash_online(w: &mut MslWriter, t: &str) {
 /// Retained behind `FUSEKIT_SDPA_LEGACY=1` for A/B perf comparison
 /// against the flash emit. At long context the SMEM cap (16 KB) holds
 /// occupancy to 2 TGs/SM on M5 — the flash path's main edge.
-fn emit_legacy_two_pass(w: &mut MslWriter, t: &str) {
+fn emit_legacy_two_pass(
+    w: &mut MslWriter,
+    t: &str,
+    split_q: bool,
+    q_transpose_split: bool,
+    q1_rope: Option<&RopeInfo>,
+    q1_dim: u32,
+) {
     w.line("threadgroup float scores[MAX_KV_LEN];");
     w.line("threadgroup float reduce_buf[32];");
     w.blank();
+    if split_q {
+        emit_split_q_stage(w, t, q_transpose_split, q1_rope, q1_dim);
+    }
 
     // Stage 1: thread-per-kv (one thread owns one kv position).
     // Each thread independently iterates QK_DIM serially. Tested
@@ -704,24 +1246,39 @@ fn emit_legacy_two_pass(w: &mut MslWriter, t: &str) {
     // vs scalar loads — Apple GPU coalesces these into a single
     // ~16-byte transaction per lane. QK_DIM must be a multiple of 4
     // (true for all Llama/Qwen variants: 64/128/256).
-    w.line("// Stage 1: dot product Q · K[kv] per kv position (thread-per-kv, vec4).");
+    w.line("// Stage 1: dot product Q · K[kv] per kv position (thread-per-kv).");
     w.line("for (uint kv = tid; kv < kv_len_eff; kv += tg_size) {");
     w.push_indent();
-    w.line(format!(
-        "device const {t}4* q_row4 = (device const {t}4*)(Q + ((Q_HEAD_MAJOR ? (head_id_real * Q_SEQ + query_row) : (query_row * N_HEADS + head_id_real)) * QK_DIM));"
-    ));
-    w.line(format!(
-        "device const {t}4* k_row4 = (device const {t}4*)(K + (kv_head * capacity + kv) * QK_DIM);"
-    ));
-    w.line("float dot = 0.0f;");
-    w.line("for (uint d4 = 0u; d4 < QK_DIM / 4u; ++d4) {");
-    w.push_indent();
-    w.line(format!("{t}4 q4 = q_row4[d4];"));
-    w.line(format!("{t}4 k4 = k_row4[d4];"));
-    w.line("dot += float(q4.x) * float(k4.x) + float(q4.y) * float(k4.y)");
-    w.line("     + float(q4.z) * float(k4.z) + float(q4.w) * float(k4.w);");
-    w.pop_indent();
-    w.line("}");
+    if split_q {
+        w.line(format!(
+            "device const {t}4* k_row4 = (device const {t}4*)(K + (kv_head * capacity + kv) * QK_DIM);"
+        ));
+        w.line("float dot = 0.0f;");
+        w.line("for (uint d4 = 0u; d4 < QK_DIM / 4u; ++d4) {");
+        w.push_indent();
+        w.line("uint d = d4 * 4u;");
+        w.line(format!("{t}4 k4 = k_row4[d4];"));
+        w.line("dot += q_local[d + 0u] * float(k4.x) + q_local[d + 1u] * float(k4.y)");
+        w.line("     + q_local[d + 2u] * float(k4.z) + q_local[d + 3u] * float(k4.w);");
+        w.pop_indent();
+        w.line("}");
+    } else {
+        w.line(format!(
+            "device const {t}4* q_row4 = (device const {t}4*)(Q + ((Q_HEAD_MAJOR ? (((query_row / Q_SEQ) * N_HEADS + head_id_real) * Q_SEQ + (query_row % Q_SEQ)) : (query_row * N_HEADS + head_id_real)) * QK_DIM));"
+        ));
+        w.line(format!(
+            "device const {t}4* k_row4 = (device const {t}4*)(K + (kv_head * capacity + kv) * QK_DIM);"
+        ));
+        w.line("float dot = 0.0f;");
+        w.line("for (uint d4 = 0u; d4 < QK_DIM / 4u; ++d4) {");
+        w.push_indent();
+        w.line(format!("{t}4 q4 = q_row4[d4];"));
+        w.line(format!("{t}4 k4 = k_row4[d4];"));
+        w.line("dot += float(q4.x) * float(k4.x) + float(q4.y) * float(k4.y)");
+        w.line("     + float(q4.z) * float(k4.z) + float(q4.w) * float(k4.w);");
+        w.pop_indent();
+        w.line("}");
+    }
     w.line("scores[kv] = dot * SCALE;");
     w.pop_indent();
     w.line("}");
@@ -753,7 +1310,7 @@ fn emit_legacy_two_pass(w: &mut MslWriter, t: &str) {
     w.line("float t_sum = 0.0f;");
     w.line("for (uint kv = tid; kv < kv_len_eff; kv += tg_size) {");
     w.push_indent();
-    w.line("scores[kv] = metal::precise::exp(scores[kv] - global_max);");
+    w.line("scores[kv] = metal::fast::exp(scores[kv] - global_max);");
     w.line("t_sum += scores[kv];");
     w.pop_indent();
     w.line("}");
@@ -815,7 +1372,7 @@ fn emit_legacy_two_pass(w: &mut MslWriter, t: &str) {
     w.line("if (simd_lane == 0u) {");
     w.push_indent();
     w.line(format!(
-        "device {t}4* out4 = (device {t}4*)(out + (query_row * N_HEADS + head_id_real) * V_DIM);"
+        "device {t}4* out4 = (device {t}4*)(out + ((OUT_HEAD_MAJOR ? (((query_row / OUT_TRACE_SEQ) * N_HEADS + head_id_real) * OUT_TRACE_SEQ + (query_row % OUT_TRACE_SEQ)) : (query_row * N_HEADS + head_id_real)) * V_DIM));"
     ));
     w.line(format!(
         "out4[d_base / 4u] = {t}4({t}(acc.x), {t}(acc.y), {t}(acc.z), {t}(acc.w));"

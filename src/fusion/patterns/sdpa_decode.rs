@@ -14,10 +14,11 @@
 //! ```
 //!
 //! Anchored on `Softmax` since there's exactly one per attention block.
-//! Scale multiplication on Q happens upstream as a separate Multiply
-//! op which we deliberately leave outside the fusion — the kernel
-//! re-applies `scale = 1/√head_dim` internally so the wrapper can
-//! pass *unscaled* Q.
+//! Any scale multiplication on Q is already part of the primitive graph
+//! feeding the QK matmul. This recogniser therefore preserves the trace Q
+//! input and emits a neutral SDPA scale; later graph-semantic passes may
+//! absorb a provably scalar Q multiply into the SDPA scale, but the
+//! structural match itself must not invent the high-level default scale.
 
 use crate::fusion::ir::{
     AttentionMask, AxisRef, BoundaryKind, FusionAttrs, FusionBoundary, FusionKind, ParallelAxis,
@@ -91,12 +92,6 @@ impl Pattern for SdpaDecode {
         }
         let q_tid = qk.inputs[0];
         let kt_tid = qk.inputs[1];
-        let q_already_scaled = g
-            .tensor(q_tid)
-            .producer
-            .map(|p| g.op(p).name == "Multiply")
-            .unwrap_or(false);
-
         // ── Walk forward: Matmul (attn · V) ───────────────────────
         let av_consumers = &ud.consumers[sm_out as usize];
         if av_consumers.len() != 1 {
@@ -119,6 +114,7 @@ impl Pattern for SdpaDecode {
                 role,
                 shape: t.shape.clone(),
                 dtype: t.dtype,
+                scalar_value: t.scalar_value.clone(),
             }
         };
 
@@ -141,11 +137,17 @@ impl Pattern for SdpaDecode {
             inputs: vec![bnd(q_tid, "Q"), bnd(kt_tid, "Kt"), bnd(v_tid, "V")],
             outputs: vec![bnd(out_tid, "out")],
             attrs: FusionAttrs::SdpaDecode {
-                // Some MLX traces lower `scale=` as a pre-multiply on Q
-                // before the QK matmul. In that case the fused SDPA must
-                // not apply another 1/sqrt(dim). A zero sentinel keeps the
-                // historical emitter fallback for unscaled Q traces.
-                scale: if q_already_scaled { 1.0 } else { 0.0 },
+                // This is a primitive graph match, not a high-level
+                // `ScaledDotProductAttention` op. The Q input to the QK
+                // matmul already represents the exact trace semantics,
+                // including any dynamic scalar/broadcast multiply. Keep
+                // that Q as a real input and do not add an implicit
+                // 1/sqrt(head_dim) scale here.
+                scale: 1.0,
+                trace_q: true,
+                q_split: None,
+                q_transpose_split: false,
+                q1_rope: None,
                 mask: AttentionMask::Causal,
             },
             parallel_axes,

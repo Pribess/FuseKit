@@ -44,8 +44,21 @@ pub fn emit(
         .map(|b| crate::target::current_chip().active_tokens_for_shape(&b.shape))
         .unwrap_or_else(|| crate::target::current_chip().active_m_for_unshaped(8))
         .max(1);
-    let n_kv = meta.num_key_value_heads;
-    let head_dim = meta.head_dim;
+    let k_shape = fusion
+        .inputs
+        .first()
+        .map(|b| b.shape.as_slice())
+        .unwrap_or(&[]);
+    let n_kv = k_shape
+        .get(k_shape.len().saturating_sub(2))
+        .copied()
+        .unwrap_or(meta.num_key_value_heads as i32)
+        .max(1) as u32;
+    let head_dim = k_shape
+        .last()
+        .copied()
+        .unwrap_or(meta.head_dim as i32)
+        .max(1) as u32;
     let half = head_dim / 2;
     let el_per_int = 32 / bits;
     let n_words = head_dim / el_per_int;
@@ -81,7 +94,8 @@ pub fn emit(
         "device {t}       *cache_values_biases [[buffer(7)]],"
     ));
     w.line("constant uint      &offset             [[buffer(8)]],");
-    w.line("constant uint      &capacity           [[buffer(9)]],");
+    w.line("constant uint      &write_offset       [[buffer(9)]],");
+    w.line("constant uint      &capacity           [[buffer(10)]],");
     w.line("uint tid     [[thread_position_in_threadgroup]],");
     w.line("uint tg_size [[threads_per_threadgroup]],");
     w.line("uint gid     [[threadgroup_position_in_grid]]");
@@ -114,7 +128,8 @@ pub fn emit(
     w.line("bool is_v = (local_gid >= N_KV);");
     w.line("uint kh = is_v ? (local_gid - N_KV) : local_gid;");
     w.line("uint kbase = (row * N_KV + kh) * HEAD_DIM;");
-    w.line("uint cache_offset = offset + row;");
+    w.line("uint pos = offset + row;");
+    w.line("uint cache_offset = (write_offset + row) % capacity;");
     w.blank();
 
     // ── Stage 1: load row into SMEM (qrow). K does RoPE, V copy.
@@ -138,7 +153,7 @@ pub fn emit(
     w.line("uint pair = (d < HALF) ? d : (d - HALF);");
     w.line("float d_norm = float(pair) / float(HALF);");
     w.line("float inv_freq = metal::exp2(-d_norm * BASE_LOG2);");
-    w.line("float angle = float(cache_offset) * inv_freq;");
+    w.line("float angle = float(pos) * inv_freq;");
     w.line("float c = metal::fast::cos(angle); float s = metal::fast::sin(angle);");
     w.line("float lo = float(K_in[kbase + pair]);");
     w.line("float hi = float(K_in[kbase + pair + HALF]);");

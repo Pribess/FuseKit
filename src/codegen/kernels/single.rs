@@ -32,14 +32,15 @@ use anyhow::{bail, Result};
 
 use crate::codegen::msl::MslWriter;
 use crate::fusion::ir::{
-    ChainOperand, ChainStep, Fusion, FusionAttrs, FusionBoundary, FusionKind, ModelMeta,
+    AttentionMask, ChainOperand, ChainStep, Fusion, FusionAttrs, FusionBoundary, FusionKind,
+    ModelMeta,
 };
 use crate::graph::Dtype;
 use crate::task::ir::PartitionPlan;
 
 pub fn emit(
     fusion: &Fusion,
-    _partition: &PartitionPlan,
+    partition: &PartitionPlan,
     meta: &ModelMeta,
     w: &mut MslWriter,
 ) -> Result<()> {
@@ -63,12 +64,20 @@ pub fn emit(
         "Subtract" => emit_pointwise_binary(fusion, meta, w, "-"),
         "Multiply" => emit_pointwise_binary(fusion, meta, w, "*"),
         "Divide" => emit_pointwise_binary(fusion, meta, w, "/"),
-        "Power" => emit_pointwise_binary_fn(fusion, meta, w, "pow"),
+        "Power" => emit_power(fusion, meta, w),
         "Maximum" => emit_pointwise_binary_fn(fusion, meta, w, "max"),
         "Minimum" => emit_pointwise_binary_fn(fusion, meta, w, "min"),
 
         // ── Pointwise (unary) ─────────────────────────────────────
-        "Sigmoid" => emit_pointwise_unary(fusion, meta, w, "(1.0f / (1.0f + exp(-_x)))"),
+        "Sigmoid" => {
+            emit_pointwise_unary(fusion, meta, w, "(1.0f / (1.0f + metal::fast::exp(-_x)))")
+        }
+        "Tanh" => emit_pointwise_unary(
+            fusion,
+            meta,
+            w,
+            "metal::fast::tanh(clamp(_x, -20.0f, 20.0f))",
+        ),
         "Exp" => emit_pointwise_unary(fusion, meta, w, "exp(_x)"),
         "Negative" => emit_pointwise_unary(fusion, meta, w, "(-_x)"),
 
@@ -91,20 +100,28 @@ pub fn emit(
         // Stride-aware view ops:
         "Broadcast" => emit_broadcast(fusion, &op_attrs, meta, w),
         "Transpose" => emit_transpose(fusion, &op_attrs, meta, w),
+        "TransposeSplit" => emit_transpose_split(fusion, &op_attrs, meta, w),
 
         // ── Heavy ─────────────────────────────────────────────────
         "Matmul" => emit_matmul(fusion, meta, w),
-        "ScaledDotProductAttention" => emit_scaled_dot_product_attention_prefill(fusion, meta, w),
+        "ScaledDotProductAttention" => {
+            emit_scaled_dot_product_attention_prefill(fusion, partition, meta, w)
+        }
         "Softmax" => emit_softmax(fusion, &op_attrs, meta, w),
+        "SoftmaxTopKRoute" => emit_softmax_topk_route(fusion, meta, w),
         "Arange" => emit_arange(fusion, &op_attrs, meta, w),
         "Full" => emit_full(fusion, meta, w),
-        "Slice" => emit_slice(fusion, meta, w),
+        "Slice" => emit_slice(fusion, &op_attrs, meta, w),
         "ArgPartition" | "Argpartition" => emit_argpartition(fusion, meta, w),
+        "ArgTopKAsc" => emit_argtopk(fusion, meta, w, false),
+        "ArgTopKDesc" => emit_argtopk(fusion, meta, w, true),
         "GatherAxis" => emit_gather_axis(fusion, meta, w),
+        "GatherAxisScaleExpand" => emit_gather_axis_scale_expand(fusion, meta, w),
         "GatherQMM" => emit_gather_qmm(fusion, meta, w),
+        "GatherQMMReduce" => emit_gather_qmm_reduce(fusion, meta, w),
         "Gather" => emit_gather(fusion, &op_attrs, meta, w),
         "Concatenate" => emit_concatenate(fusion, &op_attrs, meta, w),
-        "WeightedRouteReduce" => emit_weighted_route_reduce(fusion, meta, w),
+        "ScaledSumReduce" | "WeightedRouteReduce" => emit_scaled_sum_reduce(fusion, meta, w),
         "Reduce" => emit_reduce_sum(fusion, meta, w),
         "Convolution" => emit_convolution(fusion, meta, w, false),
         "ConvolutionSilu" => emit_convolution(fusion, meta, w, true),
@@ -192,6 +209,71 @@ fn sdpa_prefill_dims(fusion: &Fusion, meta: &ModelMeta) -> Option<(u32, u32, u32
     let head_dim = meta.head_dim.max(1);
     let heads_per_kv = (n_heads / n_kv_heads).max(1);
     Some((active_m, n_heads, n_kv_heads, head_dim, heads_per_kv))
+}
+
+fn sdpa_single_decode_dims(fusion: &Fusion, meta: &ModelMeta) -> Option<(u32, u32, u32, u32)> {
+    let out_shape = fusion.outputs.first().map(|b| b.shape.as_slice())?;
+    if out_shape.len() < 3 {
+        return None;
+    }
+    let n_heads = meta.num_attention_heads.max(1);
+    let q_shape = fusion
+        .inputs
+        .first()
+        .map(|b| b.shape.as_slice())
+        .unwrap_or(&[]);
+    let qk_dim = q_shape
+        .last()
+        .copied()
+        .unwrap_or(meta.head_dim as i32)
+        .max(1) as u32;
+    let v_dim = fusion
+        .inputs
+        .get(2)
+        .and_then(|b| b.shape.last().copied())
+        .or_else(|| out_shape.last().copied())
+        .unwrap_or(meta.head_dim as i32)
+        .max(1) as u32;
+    let active_m =
+        crate::codegen::kernels::sdpa_decode::active_rows_for_shape(out_shape, n_heads, v_dim)
+            .max(1);
+    Some((active_m, n_heads, qk_dim, v_dim))
+}
+
+/// Single SDPA ops in a decode pipeline are already rebound to semantic
+/// Q/K/V cache buffers by task metadata. When the shape is a single
+/// active decode row, lower them through the decode SDPA emitter instead
+/// of the prefill materialized-score path. This is an op/shape rule, not
+/// a model-name or layer pattern.
+pub fn sdpa_single_decode_flash_enabled(fusion: &Fusion, meta: &ModelMeta) -> bool {
+    if !sdpa_single_decode_enabled(fusion, meta) {
+        return false;
+    }
+    let Some((active_m, n_heads, qk_dim, v_dim)) = sdpa_single_decode_dims(fusion, meta) else {
+        return false;
+    };
+    crate::codegen::kernels::sdpa_decode::flash_decoding_enabled_for(
+        n_heads,
+        meta.num_key_value_heads.max(1),
+        qk_dim,
+        v_dim,
+        active_m,
+    )
+}
+
+pub fn sdpa_single_decode_enabled(fusion: &Fusion, meta: &ModelMeta) -> bool {
+    if !matches!(&fusion.kind, FusionKind::Single(name) if name == "ScaledDotProductAttention") {
+        return false;
+    }
+    let Some((active_m, _n_heads, _qk_dim, v_dim)) = sdpa_single_decode_dims(fusion, meta) else {
+        return false;
+    };
+    // Decode lowering is valid for a single active query row. The
+    // decode emitter itself decides whether it can use flash chunking
+    // or the one-TG-per-head online path. Keep the V_DIM capability
+    // aligned with the decode kernel's one-output-dimension-per-thread
+    // implementation.
+    active_m == 1 && v_dim <= 256
 }
 
 pub fn sdpa_prefill_plan(fusion: &Fusion, meta: &ModelMeta) -> SdpaPrefillPlan {
@@ -304,6 +386,12 @@ fn total_elements(boundary_shape: &[i32]) -> u32 {
         .product::<i32>() as u32
 }
 
+fn active_elements(boundary_shape: &[i32]) -> u32 {
+    crate::target::current_chip()
+        .active_elems(boundary_shape)
+        .min(u32::MAX as u64) as u32
+}
+
 fn emit_header(
     fusion: &Fusion,
     meta: &ModelMeta,
@@ -388,7 +476,7 @@ fn emit_pointwise_binary(
     if fusion.inputs.len() < 2 || fusion.outputs.is_empty() {
         bail!("pointwise binary: expected 2+ inputs, 1+ outputs");
     }
-    let n = total_elements(&fusion.outputs[0].shape);
+    let n = active_elements(&fusion.outputs[0].shape);
     let (t, _) = emit_header(fusion, meta, w, 2, 1, "pointwise binary");
     w.line(format!("constexpr uint N = {n};"));
     w.line("uint i = gid * tg_size + tid;");
@@ -407,7 +495,7 @@ fn emit_pointwise_binary_fn(
     if fusion.inputs.len() < 2 || fusion.outputs.is_empty() {
         bail!("pointwise binary fn: expected 2+ inputs, 1+ outputs");
     }
-    let n = total_elements(&fusion.outputs[0].shape);
+    let n = active_elements(&fusion.outputs[0].shape);
     let (t, _) = emit_header(fusion, meta, w, 2, 1, "pointwise binary fn");
     w.line(format!("constexpr uint N = {n};"));
     w.line("uint i = gid * tg_size + tid;");
@@ -415,6 +503,36 @@ fn emit_pointwise_binary_fn(
     w.line(format!(
         "out0[i] = {t}({func}(float(in0[i]), float(in1[i])));"
     ));
+    emit_close(w);
+    Ok(())
+}
+
+fn emit_power(fusion: &Fusion, meta: &ModelMeta, w: &mut MslWriter) -> Result<()> {
+    if fusion.inputs.len() < 2 || fusion.outputs.is_empty() {
+        bail!("Power: expected 2+ inputs, 1+ outputs");
+    }
+    let n = active_elements(&fusion.outputs[0].shape);
+    let (t, _) = emit_header(fusion, meta, w, 2, 1, "Power");
+    w.line(format!("constexpr uint N = {n};"));
+    w.line("uint i = gid * tg_size + tid;");
+    w.line("if (i >= N) return;");
+    w.line("float a = float(in0[i]);");
+    w.line("float b = float(in1[i]);");
+    w.line("float y;");
+    w.line("if (fabs(b - 2.0f) < 1.0e-6f) {");
+    w.push_indent();
+    w.line("y = a * a;");
+    w.pop_indent();
+    w.line("} else if (fabs(b - 3.0f) < 1.0e-6f) {");
+    w.push_indent();
+    w.line("y = a * a * a;");
+    w.pop_indent();
+    w.line("} else {");
+    w.push_indent();
+    w.line("y = pow(a, b);");
+    w.pop_indent();
+    w.line("}");
+    w.line(format!("out0[i] = {t}(y);"));
     emit_close(w);
     Ok(())
 }
@@ -428,7 +546,7 @@ fn emit_pointwise_unary(
     if fusion.inputs.is_empty() || fusion.outputs.is_empty() {
         bail!("pointwise unary: expected 1+ input, 1+ output");
     }
-    let n = total_elements(&fusion.outputs[0].shape);
+    let n = active_elements(&fusion.outputs[0].shape);
     let (t, _) = emit_header(fusion, meta, w, 1, 1, "pointwise unary");
     w.line(format!("constexpr uint N = {n};"));
     w.line("uint i = gid * tg_size + tid;");
@@ -440,7 +558,7 @@ fn emit_pointwise_unary(
 }
 
 fn emit_log_add_exp(fusion: &Fusion, meta: &ModelMeta, w: &mut MslWriter) -> Result<()> {
-    let n = total_elements(&fusion.outputs[0].shape);
+    let n = active_elements(&fusion.outputs[0].shape);
     let (t, _) = emit_header(fusion, meta, w, 2, 1, "LogAddExp");
     w.line(format!("constexpr uint N = {n};"));
     w.line("uint i = gid * tg_size + tid;");
@@ -459,7 +577,7 @@ fn emit_select(fusion: &Fusion, meta: &ModelMeta, w: &mut MslWriter) -> Result<(
     if fusion.inputs.len() < 3 {
         bail!("Select: expected 3 inputs (cond, a, b)");
     }
-    let n = total_elements(&fusion.outputs[0].shape);
+    let n = active_elements(&fusion.outputs[0].shape);
     let (t, _) = emit_header(fusion, meta, w, 3, 1, "Select");
     w.line(format!("constexpr uint N = {n};"));
     w.line("uint i = gid * tg_size + tid;");
@@ -475,7 +593,7 @@ fn emit_select(fusion: &Fusion, meta: &ModelMeta, w: &mut MslWriter) -> Result<(
 }
 
 fn emit_greater_equal(fusion: &Fusion, meta: &ModelMeta, w: &mut MslWriter) -> Result<()> {
-    let n = total_elements(&fusion.outputs[0].shape);
+    let n = active_elements(&fusion.outputs[0].shape);
     let (t, _) = emit_header(fusion, meta, w, 2, 1, "GreaterEqual");
     w.line(format!("constexpr uint N = {n};"));
     w.line("uint i = gid * tg_size + tid;");
@@ -492,7 +610,7 @@ fn emit_greater_equal(fusion: &Fusion, meta: &ModelMeta, w: &mut MslWriter) -> R
 }
 
 fn emit_astype(fusion: &Fusion, meta: &ModelMeta, w: &mut MslWriter) -> Result<()> {
-    let n = total_elements(&fusion.outputs[0].shape);
+    let n = active_elements(&fusion.outputs[0].shape);
     let (t, _) = emit_header(fusion, meta, w, 1, 1, "AsType");
     w.line(format!("constexpr uint N = {n};"));
     w.line("uint i = gid * tg_size + tid;");
@@ -516,7 +634,8 @@ fn emit_view_passthrough(fusion: &Fusion, meta: &ModelMeta, w: &mut MslWriter) -
         );
     }
     let (_t, _) = emit_header(fusion, meta, w, 1, 1, "view passthrough (memcpy)");
-    w.line(format!("constexpr uint N = {n_in};"));
+    let n = n_out;
+    w.line(format!("constexpr uint N = {n};"));
     w.line("uint i = gid * tg_size + tid;");
     w.line("if (i >= N) return;");
     w.line("out0[i] = in0[i];");
@@ -601,6 +720,31 @@ fn emit_transpose(
     if axes.len() != rank || out_shape.len() != rank {
         return emit_view_passthrough(fusion, meta, w);
     }
+    if rank == 4 && axes.as_slice() == [0, 2, 1, 3] {
+        let d0 = out_shape[0].max(1) as u32;
+        let d1 = out_shape[1].max(1) as u32;
+        let d2 = out_shape[2].max(1) as u32;
+        let d3 = out_shape[3].max(1) as u32;
+        let n_out = total_elements(out_shape);
+        let (_t, _) = emit_header(fusion, meta, w, 1, 1, "Transpose (4D swap 1/2)");
+        w.line(format!("constexpr uint D0 = {d0};"));
+        w.line(format!("constexpr uint D1 = {d1};"));
+        w.line(format!("constexpr uint D2 = {d2};"));
+        w.line(format!("constexpr uint D3 = {d3};"));
+        w.line(format!("constexpr uint N_OUT = {n_out};"));
+        w.line("uint i = gid * tg_size + tid;");
+        w.line("if (i >= N_OUT) return;");
+        w.line("uint c3 = i % D3;");
+        w.line("uint q = i / D3;");
+        w.line("uint c2 = q % D2;");
+        w.line("q /= D2;");
+        w.line("uint c1 = q % D1;");
+        w.line("uint c0 = q / D1;");
+        w.line("uint in_off = ((c0 * D2 + c2) * D1 + c1) * D3 + c3;");
+        w.line("out0[i] = in0[in_off];");
+        emit_close(w);
+        return Ok(());
+    }
     // out_shape[d] == in_shape[axes[d]]
     // out coords (c0..cR) → in coord[axes[d]] = c[d]
     // Compute input contiguous strides.
@@ -629,6 +773,129 @@ fn emit_transpose(
         div_acc *= dim;
     }
     w.line("out0[i] = in0[(uint)_in_off];");
+    emit_close(w);
+    Ok(())
+}
+
+fn emit_transpose_split(
+    fusion: &Fusion,
+    op_attrs: &crate::graph::Attrs,
+    meta: &ModelMeta,
+    w: &mut MslWriter,
+) -> Result<()> {
+    // General layout+split sink:
+    //   y = transpose(x, axes); outs = split(y, axis)
+    // materialized as one pass over the split outputs. This avoids the
+    // full transposed temporary when the transpose has exactly one
+    // consumer. It is shape/dataflow based; the axes come from the
+    // captured Transpose op and the split axis is inferred from output
+    // shapes.
+    if fusion.inputs.len() != 1 || fusion.outputs.is_empty() {
+        return emit_todo_stub(fusion, meta, w, "TransposeSplit (arity)");
+    }
+    let in_shape = &fusion.inputs[0].shape;
+    let rank = in_shape.len();
+    let axes: Vec<i32> = match op_attrs {
+        crate::graph::Attrs::Transpose { axes } => axes.clone(),
+        _ => (0..rank as i32).rev().collect(),
+    };
+    if rank == 0 || axes.len() != rank {
+        return emit_todo_stub(fusion, meta, w, "TransposeSplit (rank)");
+    }
+    let mut seen = vec![false; rank];
+    for &axis in &axes {
+        if axis < 0 || axis as usize >= rank || seen[axis as usize] {
+            return emit_todo_stub(fusion, meta, w, "TransposeSplit (axes)");
+        }
+        seen[axis as usize] = true;
+    }
+    let trans_shape = axes
+        .iter()
+        .map(|&axis| in_shape[axis as usize])
+        .collect::<Vec<_>>();
+    let Some(axis_idx) = infer_split_axis(&trans_shape, &fusion.outputs) else {
+        return emit_todo_stub(fusion, meta, w, "TransposeSplit (split axis)");
+    };
+
+    let mut in_strides = vec![0i64; rank];
+    let mut stride: i64 = 1;
+    for d in (0..rank).rev() {
+        in_strides[d] = stride;
+        stride *= in_shape[d].max(1) as i64;
+    }
+    let outer: u32 = trans_shape[..axis_idx]
+        .iter()
+        .copied()
+        .map(|x| x.max(1) as u32)
+        .product();
+    let inner: u32 = trans_shape[axis_idx + 1..]
+        .iter()
+        .copied()
+        .map(|x| x.max(1) as u32)
+        .product();
+    let trans_axis = trans_shape[axis_idx].max(1) as u32;
+    let out_elems: Vec<u32> = fusion
+        .outputs
+        .iter()
+        .map(|b| total_elements(&b.shape))
+        .collect();
+    let total: u32 = out_elems.iter().sum();
+    let (t, _) = emit_header(
+        fusion,
+        meta,
+        w,
+        1,
+        fusion.outputs.len(),
+        &format!("TransposeSplit(axis={axis_idx})"),
+    );
+    w.line(format!("constexpr uint OUTER = {outer}u;"));
+    w.line(format!("constexpr uint INNER = {inner}u;"));
+    w.line(format!("constexpr uint TRANS_AXIS = {trans_axis}u;"));
+    w.line(format!("constexpr uint TOTAL = {total}u;"));
+    w.line("uint i = gid * tg_size + tid;");
+    w.line("if (i >= TOTAL) return;");
+    let mut elem_base = 0u32;
+    let mut axis_base = 0u32;
+    for (idx, out) in fusion.outputs.iter().enumerate() {
+        let axis_len = out.shape.get(axis_idx).copied().unwrap_or(1).max(1) as u32;
+        let n = out_elems[idx];
+        let cond = if idx == 0 {
+            format!("if (i < {n}u) {{")
+        } else if idx == fusion.outputs.len() - 1 {
+            "else {".to_string()
+        } else {
+            format!("else if (i < {}u) {{", elem_base + n)
+        };
+        w.line(cond);
+        w.push_indent();
+        w.line(format!("uint local = i - {elem_base}u;"));
+        w.line(format!("uint along_len = {axis_len}u;"));
+        w.line("uint outer = local / (along_len * INNER);");
+        w.line("uint rest = local - outer * (along_len * INNER);");
+        w.line("uint along = rest / INNER;");
+        w.line("uint inner = rest % INNER;");
+        w.line(format!(
+            "uint trans_i = (outer * TRANS_AXIS + ({axis_base}u + along)) * INNER + inner;"
+        ));
+        w.line("uint _rem = trans_i;");
+        w.line("ulong _in_off = 0;");
+        let mut div_acc: u64 = 1;
+        for d in (0..rank).rev() {
+            let dim = trans_shape[d].max(1) as u64;
+            let in_dim = axes[d] as usize;
+            let stride = in_strides[in_dim];
+            w.line(format!(
+                "{{ uint _c = (_rem / {}u) % {}u; _in_off += (ulong)_c * {}ul; }}",
+                div_acc, dim, stride
+            ));
+            div_acc *= dim;
+        }
+        w.line(format!("out{idx}[local] = {t}(in0[(uint)_in_off]);"));
+        w.pop_indent();
+        w.line("}");
+        elem_base += n;
+        axis_base += axis_len;
+    }
     emit_close(w);
     Ok(())
 }
@@ -1011,7 +1278,14 @@ fn emit_quantized_matmul_mlx_qmv(
     let qmv_sgs = crate::codegen::kernels::qmv_fast_simdgroups(active_rows, bits, k_dim, out_dim);
     let qmv_cols_per_sg =
         crate::codegen::kernels::qmv_fast_cols_per_simdgroup(active_rows, bits, k_dim, out_dim);
-    if token_rows > 1 {
+    if let Some((vecs_per_tg, k_lanes, _rows_per_tg)) =
+        crate::codegen::kernels::qmv_wide_params(active_rows, bits, group_size, k_dim, out_dim)
+    {
+        w.writeln(format_args!("constexpr int ACTIVE_ROWS = {active_rows};"));
+        w.writeln(format_args!(
+            "fusekit_qmv_wide_impl<{t}, {group_size}, {bits}, {vecs_per_tg}, {k_lanes}>(in1, in2, in3, in0, out0, K, N, ACTIVE_ROWS, tgid, simd_gid, simd_lid);"
+        ));
+    } else if token_rows > 1 {
         w.writeln(format_args!("constexpr int ACTIVE_ROWS = {active_rows};"));
         w.writeln(format_args!(
             "fusekit_qmv_fast_m_impl<{t}, {group_size}, {bits}, {qmv_sgs}, {qmv_cols_per_sg}, {token_rows}>(in1, in2, in3, in0, out0, K, N, ACTIVE_ROWS, tgid, simd_gid, simd_lid);"
@@ -1123,6 +1397,7 @@ fn emit_quantized_matmul_nax(
 
 fn emit_scaled_dot_product_attention_prefill(
     fusion: &Fusion,
+    partition: &PartitionPlan,
     meta: &ModelMeta,
     w: &mut MslWriter,
 ) -> Result<()> {
@@ -1158,6 +1433,32 @@ fn emit_scaled_dot_product_attention_prefill(
         .first()
         .map(|b| msl_ty(b.dtype, fallback))
         .unwrap_or(fallback);
+    if sdpa_single_decode_enabled(fusion, meta) {
+        let decode = Fusion {
+            id: fusion.id,
+            kind: FusionKind::SdpaDecode,
+            op_ids: fusion.op_ids.clone(),
+            inputs: vec![],
+            outputs: fusion.outputs.clone(),
+            attrs: FusionAttrs::SdpaDecode {
+                scale,
+                trace_q: false,
+                q_split: None,
+                q_transpose_split: false,
+                q1_rope: None,
+                mask: AttentionMask::Causal,
+            },
+            parallel_axes: fusion.parallel_axes.clone(),
+            layer_hint: fusion.layer_hint,
+        };
+        return crate::codegen::kernels::sdpa_decode::emit_with_function_name(
+            &decode,
+            partition,
+            meta,
+            w,
+            function_name(fusion),
+        );
+    }
     let fn_name = function_name(fusion);
     let plan = sdpa_prefill_plan(fusion, meta);
     if matches!(plan, SdpaPrefillPlan::BlockNax) {
@@ -1220,6 +1521,7 @@ fn emit_scaled_dot_product_attention_prefill(
         w.line(") {");
         w.push_indent();
         w.writeln(format_args!("constexpr uint OUT_SEQ        = {active_m}u;"));
+        w.writeln(format_args!("constexpr uint OUT_SEQ_STRIDE = {out_seq}u;"));
         w.writeln(format_args!("constexpr uint N_HEADS        = {n_heads}u;"));
         w.writeln(format_args!(
             "constexpr uint N_KV_HEADS     = {n_kv_heads}u;"
@@ -1356,7 +1658,7 @@ fn emit_scaled_dot_product_attention_prefill(
         w.line("if (i < D_PER_LANE && dims[i] < HEAD_DIM) {");
         w.push_indent();
         w.line(format!(
-            "out[(head_id * OUT_SEQ + row) * HEAD_DIM + dims[i]] = {t}(acc[i] * inv_l);"
+            "out[(head_id * OUT_SEQ_STRIDE + row) * HEAD_DIM + dims[i]] = {t}(acc[i] * inv_l);"
         ));
         w.pop_indent();
         w.line("}");
@@ -1388,6 +1690,7 @@ fn emit_scaled_dot_product_attention_prefill(
         w.line(") {");
         w.push_indent();
         w.writeln(format_args!("constexpr uint OUT_SEQ      = {active_m}u;"));
+        w.writeln(format_args!("constexpr uint OUT_SEQ_STRIDE = {out_seq}u;"));
         w.writeln(format_args!("constexpr uint N_HEADS      = {n_heads}u;"));
         w.writeln(format_args!("constexpr uint N_KV_HEADS   = {n_kv_heads}u;"));
         w.writeln(format_args!("constexpr uint HEAD_DIM     = {head_dim}u;"));
@@ -1492,7 +1795,7 @@ fn emit_scaled_dot_product_attention_prefill(
         w.line("if (out_d < HEAD_DIM) {");
         w.push_indent();
         w.line(format!(
-            "out[(head_id * OUT_SEQ + query_row) * HEAD_DIM + out_d] = {t}(normed);"
+            "out[(head_id * OUT_SEQ_STRIDE + query_row) * HEAD_DIM + out_d] = {t}(normed);"
         ));
         w.pop_indent();
         w.line("}");
@@ -1527,6 +1830,7 @@ fn emit_scaled_dot_product_attention_prefill(
         w.line(") {");
         w.push_indent();
         w.writeln(format_args!("constexpr uint OUT_SEQ      = {active_m}u;"));
+        w.writeln(format_args!("constexpr uint OUT_SEQ_STRIDE = {out_seq}u;"));
         w.writeln(format_args!("constexpr uint N_HEADS      = {n_heads}u;"));
         w.writeln(format_args!("constexpr uint N_KV_HEADS   = {n_kv_heads}u;"));
         w.writeln(format_args!("constexpr uint HEAD_DIM     = {head_dim}u;"));
@@ -1612,7 +1916,7 @@ fn emit_scaled_dot_product_attention_prefill(
         w.line("if (i < D_PER_LANE && dims[i] < HEAD_DIM) {");
         w.push_indent();
         w.line(format!(
-            "out[(head_id * OUT_SEQ + query_row) * HEAD_DIM + dims[i]] = {t}(acc[i] * inv_l);"
+            "out[(head_id * OUT_SEQ_STRIDE + query_row) * HEAD_DIM + dims[i]] = {t}(acc[i] * inv_l);"
         ));
         w.pop_indent();
         w.line("}");
@@ -1640,6 +1944,7 @@ fn emit_scaled_dot_product_attention_prefill(
     w.line(") {");
     w.push_indent();
     w.writeln(format_args!("constexpr uint OUT_SEQ      = {active_m}u;"));
+    w.writeln(format_args!("constexpr uint OUT_SEQ_STRIDE = {out_seq}u;"));
     w.writeln(format_args!("constexpr uint N_HEADS      = {n_heads}u;"));
     w.writeln(format_args!("constexpr uint N_KV_HEADS   = {n_kv_heads}u;"));
     w.writeln(format_args!("constexpr uint HEAD_DIM     = {head_dim}u;"));
@@ -1731,7 +2036,7 @@ fn emit_scaled_dot_product_attention_prefill(
     w.pop_indent();
     w.line("}");
     w.line(format!(
-        "out[(head_id * OUT_SEQ + query_row) * HEAD_DIM + d] = {t}(acc);"
+        "out[(head_id * OUT_SEQ_STRIDE + query_row) * HEAD_DIM + d] = {t}(acc);"
     ));
     w.pop_indent();
     w.line("}");
@@ -1754,8 +2059,10 @@ fn emit_softmax(
     };
     let shape = &fusion.outputs[0].shape;
     let last = shape.last().copied().unwrap_or(1) as u32;
-    let rows: i32 = shape[..shape.len().saturating_sub(1)].iter().product();
-    let rows = rows.max(1) as u32;
+    let rows = crate::target::current_chip()
+        .active_rows_before_last(shape)
+        .min(u32::MAX as u64) as u32;
+    let rows = rows.max(1);
     // Only last-axis softmax is supported for now.
     if !(axis == -1 || axis as usize == shape.len() - 1) {
         return emit_todo_stub(fusion, meta, w, "Softmax (non-last axis)");
@@ -1862,10 +2169,17 @@ fn emit_full(fusion: &Fusion, meta: &ModelMeta, w: &mut MslWriter) -> Result<()>
     Ok(())
 }
 
-fn emit_slice(fusion: &Fusion, meta: &ModelMeta, w: &mut MslWriter) -> Result<()> {
-    // Common decode slice: keep a prefix along the last axis while all
-    // outer dimensions are unchanged, e.g. MoE top-k indices
-    // [B,T,experts] -> [B,T,top_k].
+fn emit_slice(
+    fusion: &Fusion,
+    op_attrs: &crate::graph::Attrs,
+    meta: &ModelMeta,
+    w: &mut MslWriter,
+) -> Result<()> {
+    // General contiguous slice. mlx records start/stop/stride as op
+    // arguments; map each output linear index back to a row-major input
+    // offset. This covers last-axis top-k slices and middle-axis decode
+    // slices such as Gemma4 shared-KV selection without model-specific
+    // shape checks.
     if fusion.inputs.is_empty() || fusion.outputs.is_empty() {
         return emit_todo_stub(fusion, meta, w, "Slice (missing input/output)");
     }
@@ -1873,6 +2187,11 @@ fn emit_slice(fusion: &Fusion, meta: &ModelMeta, w: &mut MslWriter) -> Result<()
     let out_shape = &fusion.outputs[0].shape;
     if in_shape.len() != out_shape.len() || in_shape.is_empty() {
         return emit_todo_stub(fusion, meta, w, "Slice (rank change)");
+    }
+    if let crate::graph::Attrs::Slice { start, stride, .. } = op_attrs {
+        if start.len() == in_shape.len() && stride.len() == in_shape.len() {
+            return emit_slice_strided(fusion, meta, w, start, stride);
+        }
     }
     if in_shape[..in_shape.len() - 1] != out_shape[..out_shape.len() - 1] {
         return emit_todo_stub(fusion, meta, w, "Slice (non-last-axis)");
@@ -1892,6 +2211,112 @@ fn emit_slice(fusion: &Fusion, meta: &ModelMeta, w: &mut MslWriter) -> Result<()
     w.line("uint outer = i / OUT_LAST;");
     w.line("uint col = i % OUT_LAST;");
     w.line("out0[i] = in0[outer * IN_LAST + col];");
+    emit_close(w);
+    Ok(())
+}
+
+fn emit_slice_strided(
+    fusion: &Fusion,
+    meta: &ModelMeta,
+    w: &mut MslWriter,
+    start: &[i32],
+    stride: &[i32],
+) -> Result<()> {
+    let in_shape = &fusion.inputs[0].shape;
+    let out_shape = &fusion.outputs[0].shape;
+    let rank = out_shape.len();
+    let mut in_strides = vec![1i64; rank];
+    for d in (0..rank).rev() {
+        if d + 1 < rank {
+            in_strides[d] = in_strides[d + 1] * i64::from(in_shape[d + 1].max(1));
+        }
+    }
+
+    let mut starts = Vec::with_capacity(rank);
+    let mut strides = Vec::with_capacity(rank);
+    for d in 0..rank {
+        let dim = in_shape[d].max(1);
+        let mut s = start[d];
+        if s < 0 {
+            s += dim;
+        }
+        starts.push(s.max(0) as u32);
+        strides.push(stride[d].max(1) as u32);
+    }
+
+    // A stride-1 full-shape slice is a straight copy; keep the generic
+    // path for clarity but reject obvious out-of-range expansions.
+    for d in 0..rank {
+        let last =
+            starts[d] as u64 + (out_shape[d].max(1) as u64).saturating_sub(1) * strides[d] as u64;
+        if last >= in_shape[d].max(1) as u64 {
+            return emit_todo_stub(fusion, meta, w, "Slice (out of range)");
+        }
+    }
+    if strides.iter().all(|&s| s == 1) {
+        let changed_axes = (0..rank)
+            .filter(|&d| starts[d] != 0 || out_shape[d].max(1) != in_shape[d].max(1))
+            .collect::<Vec<_>>();
+        if changed_axes.len() == 1 {
+            let axis = changed_axes[0];
+            let inner: u64 = out_shape[axis + 1..]
+                .iter()
+                .map(|&d| d.max(1) as u64)
+                .product();
+            let outer: u64 = out_shape[..axis].iter().map(|&d| d.max(1) as u64).product();
+            let out_axis = out_shape[axis].max(1) as u64;
+            let in_axis = in_shape[axis].max(1) as u64;
+            let start_axis = starts[axis] as u64;
+            let block = out_axis.saturating_mul(inner).max(1);
+            let n = total_elements(out_shape);
+            let (_t, _) = emit_header(fusion, meta, w, 1, 1, "Slice (single-axis block)");
+            w.line(format!("constexpr uint N_OUT = {n};"));
+            w.line(format!("constexpr uint OUTER = {outer};"));
+            w.line(format!("constexpr uint BLOCK = {block};"));
+            w.line(format!("constexpr uint INNER = {inner};"));
+            w.line(format!("constexpr uint IN_AXIS = {in_axis};"));
+            w.line(format!("constexpr uint START_AXIS = {start_axis};"));
+            w.line("uint i = gid * tg_size + tid;");
+            w.line("if (i >= N_OUT) return;");
+            w.line("uint outer = i / BLOCK;");
+            w.line("uint inner = i - outer * BLOCK;");
+            w.line("uint in_off = outer * IN_AXIS * INNER + START_AXIS * INNER + inner;");
+            w.line("out0[i] = in0[in_off];");
+            w.line("(void)OUTER;");
+            emit_close(w);
+            return Ok(());
+        }
+    }
+
+    let n = total_elements(out_shape);
+    let (_t, _) = emit_header(fusion, meta, w, 1, 1, "Slice (rank-N strided)");
+    w.line(format!("constexpr uint N_OUT = {n};"));
+    for d in 0..rank {
+        w.line(format!(
+            "constexpr uint OUT_D{d} = {};",
+            out_shape[d].max(1)
+        ));
+        w.line(format!("constexpr uint START_D{d} = {};", starts[d]));
+        w.line(format!("constexpr uint STEP_D{d} = {};", strides[d]));
+        w.line(format!(
+            "constexpr uint IN_STRIDE_D{d} = {};",
+            in_strides[d].max(1)
+        ));
+    }
+    w.line("uint i = gid * tg_size + tid;");
+    w.line("if (i >= N_OUT) return;");
+    w.line("uint rem = i;");
+    w.line("uint in_off = 0u;");
+    for d in (0..rank).rev() {
+        w.line(format!("uint c{d} = rem % OUT_D{d};"));
+        if d > 0 {
+            w.line(format!("rem /= OUT_D{d};"));
+        }
+        w.line(format!(
+            "in_off += (START_D{d} + c{d} * STEP_D{d}) * IN_STRIDE_D{d};"
+        ));
+    }
+    w.line("out0[i] = in0[in_off];");
     emit_close(w);
     Ok(())
 }
@@ -2005,6 +2430,105 @@ fn emit_argpartition(fusion: &Fusion, meta: &ModelMeta, w: &mut MslWriter) -> Re
     Ok(())
 }
 
+fn emit_argtopk(
+    fusion: &Fusion,
+    meta: &ModelMeta,
+    w: &mut MslWriter,
+    descending: bool,
+) -> Result<()> {
+    if fusion.inputs.is_empty() || fusion.outputs.is_empty() {
+        return emit_todo_stub(fusion, meta, w, "ArgTopK (missing input/output)");
+    }
+    let in_shape = &fusion.inputs[0].shape;
+    let out_shape = &fusion.outputs[0].shape;
+    if in_shape.is_empty()
+        || out_shape.is_empty()
+        || in_shape.len() != out_shape.len()
+        || in_shape[..in_shape.len() - 1] != out_shape[..out_shape.len() - 1]
+    {
+        return emit_todo_stub(fusion, meta, w, "ArgTopK (shape)");
+    }
+    let row_n = in_shape.last().copied().unwrap_or(1).max(1) as u32;
+    let top_k = out_shape.last().copied().unwrap_or(1).max(1) as u32;
+    if top_k >= row_n || row_n > 256 || top_k > 32 {
+        return emit_todo_stub(fusion, meta, w, "ArgTopK (bounds)");
+    }
+    let rows = crate::target::current_chip()
+        .active_rows_before_last(in_shape)
+        .min(u32::MAX as u64) as u32;
+    let (_t, _) = emit_header(
+        fusion,
+        meta,
+        w,
+        1,
+        1,
+        if descending {
+            "ArgTopK (last-axis descending)"
+        } else {
+            "ArgTopK (last-axis ascending)"
+        },
+    );
+    w.line(format!("constexpr uint ROW_N = {row_n};"));
+    w.line(format!("constexpr uint TOP_K = {top_k};"));
+    w.line(format!("constexpr uint ROWS  = {};", rows.max(1)));
+    w.line("uint row = gid;");
+    w.line("if (row >= ROWS) return;");
+    w.line("threadgroup float vals[256];");
+
+    w.line("threadgroup uint idxs[256];");
+    w.line("if (tid < ROW_N) {");
+    w.push_indent();
+    w.line("uint col = tid;");
+    if descending {
+        // Sort `-score` ascending, which is equivalent to sorting the
+        // original score descending. This preserves the same tie rule
+        // as Negative -> ArgPartition: lower index wins equal scores.
+        w.line("vals[col] = -float(in0[row * ROW_N + col]);");
+    } else {
+        w.line("vals[col] = float(in0[row * ROW_N + col]);");
+    }
+    w.line("idxs[col] = col;");
+    w.pop_indent();
+    w.line("}");
+    w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
+    w.line("for (uint k = 2u; k <= ROW_N; k <<= 1u) {");
+    w.push_indent();
+    w.line("for (uint j = k >> 1u; j > 0u; j >>= 1u) {");
+    w.push_indent();
+    w.line("uint other = tid ^ j;");
+    w.line("if (tid < ROW_N && other > tid && other < ROW_N) {");
+    w.push_indent();
+    w.line("float a = vals[tid];");
+    w.line("float b = vals[other];");
+    w.line("uint ai = idxs[tid];");
+    w.line("uint bi = idxs[other];");
+    w.line("bool ascending = ((tid & k) == 0u);");
+    w.line("bool a_after_b = (a > b) || (a == b && ai > bi);");
+    w.line("bool do_swap = ascending ? a_after_b : !a_after_b;");
+    w.line("if (do_swap) {");
+    w.push_indent();
+    w.line("vals[tid] = b;");
+    w.line("vals[other] = a;");
+    w.line("idxs[tid] = bi;");
+    w.line("idxs[other] = ai;");
+    w.pop_indent();
+    w.line("}");
+    w.pop_indent();
+    w.line("}");
+    w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
+    w.pop_indent();
+    w.line("}");
+    w.pop_indent();
+    w.line("}");
+    w.line("if (tid < TOP_K) {");
+    w.push_indent();
+    w.line("out0[row * TOP_K + tid] = idxs[tid];");
+    w.pop_indent();
+    w.line("}");
+    emit_close(w);
+    Ok(())
+}
+
 fn emit_gather_axis(fusion: &Fusion, meta: &ModelMeta, w: &mut MslWriter) -> Result<()> {
     // Gather along the last axis: data [outer,N], idx [outer,K] -> [outer,K].
     if fusion.inputs.len() < 2 || fusion.outputs.is_empty() {
@@ -2035,18 +2559,320 @@ fn emit_gather_axis(fusion: &Fusion, meta: &ModelMeta, w: &mut MslWriter) -> Res
     Ok(())
 }
 
-fn emit_gather_qmm(fusion: &Fusion, meta: &ModelMeta, w: &mut MslWriter) -> Result<()> {
-    // Quantized expert matvec for MoE routing.
-    // Inputs: x, packed_w[E,O,K/lanes], scales[E,O,K/group],
-    // biases[E,O,K/group], row_idx[B,T,top_k], expert_idx[B,T,top_k].
+fn emit_gather_axis_scale_expand(
+    fusion: &Fusion,
+    meta: &ModelMeta,
+    w: &mut MslWriter,
+) -> Result<()> {
+    if fusion.inputs.len() < 3 || fusion.outputs.is_empty() {
+        return emit_todo_stub(fusion, meta, w, "GatherAxisScaleExpand (arity)");
+    }
+    let data_shape = &fusion.inputs[0].shape;
+    let idx_shape = &fusion.inputs[1].shape;
+    let scale_shape = &fusion.inputs[2].shape;
+    let out_shape = &fusion.outputs[0].shape;
+    if data_shape.is_empty()
+        || idx_shape.is_empty()
+        || out_shape.len() != idx_shape.len() + 1
+        || out_shape.last().copied().unwrap_or(0) != 1
+        || out_shape[..out_shape.len() - 1] != idx_shape[..]
+        || data_shape[..data_shape.len() - 1] != idx_shape[..idx_shape.len() - 1]
+    {
+        return emit_todo_stub(fusion, meta, w, "GatherAxisScaleExpand (shape)");
+    }
+    if !(scale_shape.is_empty() || scale_shape == idx_shape) {
+        return emit_todo_stub(fusion, meta, w, "GatherAxisScaleExpand (scale)");
+    }
+    let in_last = data_shape.last().copied().unwrap_or(1).max(1) as u32;
+    let top_k = idx_shape.last().copied().unwrap_or(1).max(1) as u32;
+    let n = total_elements(out_shape);
+    let (t, _) = emit_header(fusion, meta, w, 3, 1, "GatherAxisScaleExpand");
+    w.line(format!("constexpr uint IN_LAST = {in_last};"));
+    w.line(format!("constexpr uint TOP_K = {top_k};"));
+    w.line(format!("constexpr uint N_OUT = {n};"));
+    w.line(format!(
+        "constexpr bool SCALE_SCALAR = {};",
+        if scale_shape.is_empty() {
+            "true"
+        } else {
+            "false"
+        }
+    ));
+    w.line("uint i = gid * tg_size + tid;");
+    w.line("if (i >= N_OUT) return;");
+    w.line("uint gather_i = i; // last output dim is 1");
+    w.line("uint outer = gather_i / TOP_K;");
+    w.line("uint idx = uint(in1[gather_i]);");
+    w.line("idx = min(idx, IN_LAST - 1u);");
+    w.line("float scale = SCALE_SCALAR ? float(in2[0]) : float(in2[gather_i]);");
+    w.line(format!(
+        "out0[i] = {t}(float(in0[outer * IN_LAST + idx]) * scale);"
+    ));
+    emit_close(w);
+    Ok(())
+}
+
+fn emit_softmax_topk_route(fusion: &Fusion, meta: &ModelMeta, w: &mut MslWriter) -> Result<()> {
+    if fusion.inputs.len() < 2 || fusion.outputs.len() != 2 {
+        return emit_todo_stub(fusion, meta, w, "SoftmaxTopKRoute (arity)");
+    }
+    let logits_shape = &fusion.inputs[0].shape;
+    let scale_shape = &fusion.inputs[1].shape;
+    let idx_shape = &fusion.outputs[0].shape;
+    let weight_shape = &fusion.outputs[1].shape;
+    if logits_shape.is_empty()
+        || idx_shape.is_empty()
+        || logits_shape.len() != idx_shape.len()
+        || weight_shape.len() != idx_shape.len() + 1
+        || weight_shape.last().copied().unwrap_or(0) != 1
+        || logits_shape[..logits_shape.len() - 1] != idx_shape[..idx_shape.len() - 1]
+        || weight_shape[..weight_shape.len() - 1] != idx_shape[..]
+        || fusion.outputs[0].dtype != Dtype::U32
+    {
+        return emit_todo_stub(fusion, meta, w, "SoftmaxTopKRoute (shape)");
+    }
+    if !(scale_shape.is_empty() || scale_shape == idx_shape) {
+        return emit_todo_stub(fusion, meta, w, "SoftmaxTopKRoute (scale)");
+    }
+    let row_n = logits_shape.last().copied().unwrap_or(1).max(1) as u32;
+    let top_k = idx_shape.last().copied().unwrap_or(1).max(1) as u32;
+    if top_k >= row_n || row_n > 256 || top_k > 32 || !row_n.is_power_of_two() {
+        return emit_todo_stub(fusion, meta, w, "SoftmaxTopKRoute (bounds)");
+    }
+    let rows = crate::target::current_chip()
+        .active_rows_before_last(logits_shape)
+        .min(u32::MAX as u64) as u32;
+    let fallback = crate::codegen::kernels::act_ty(meta);
+    let weight_t = fusion
+        .outputs
+        .get(1)
+        .map(|bd| msl_ty(bd.dtype, fallback))
+        .unwrap_or(fallback);
+    let (_out_t, _) = emit_header(fusion, meta, w, 2, 2, "SoftmaxTopKRoute");
+    w.line(format!("constexpr uint ROW_N = {row_n};"));
+    w.line(format!("constexpr uint TOP_K = {top_k};"));
+    w.line(format!("constexpr uint ROWS = {};", rows.max(1)));
+    w.line(format!(
+        "constexpr bool SCALE_SCALAR = {};",
+        if scale_shape.is_empty() {
+            "true"
+        } else {
+            "false"
+        }
+    ));
+    w.line("uint row = gid;");
+    w.line("if (row >= ROWS) return;");
+    w.line("uint simd_lane = tid % 32u;");
+    w.line("uint simd_id = tid / 32u;");
+    w.line("threadgroup float vals[256];");
+    w.line("threadgroup uint idxs[256];");
+    w.line("threadgroup float reduce_buf[32];");
+
+    w.line("float local_max = -INFINITY;");
+    w.line("float local_sum = 0.0f;");
+    w.line("if (tid < ROW_N) {");
+    w.push_indent();
+    w.line("float score = float(in0[row * ROW_N + tid]);");
+    w.line("local_max = score;");
+    w.pop_indent();
+    w.line("}");
+    w.line("local_max = simd_max(local_max);");
+    w.line("if (simd_lane == 0u) reduce_buf[simd_id] = local_max;");
+    w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
+    w.line("if (simd_id == 0u) {");
+    w.push_indent();
+    w.line("float v = (tid < tg_size / 32u) ? reduce_buf[tid] : -INFINITY;");
+    w.line("v = simd_max(v);");
+    w.line("if (simd_lane == 0u) reduce_buf[0] = v;");
+    w.pop_indent();
+    w.line("}");
+    w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
+    w.line("float row_max = reduce_buf[0];");
+    w.line("for (uint i = tid; i < ROW_N; i += tg_size) {");
+    w.push_indent();
+    w.line("local_sum += exp(float(in0[row * ROW_N + i]) - row_max);");
+    w.pop_indent();
+    w.line("}");
+    w.line("local_sum = simd_sum(local_sum);");
+    w.line("if (simd_lane == 0u) reduce_buf[simd_id] = local_sum;");
+    w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
+    w.line("if (simd_id == 0u) {");
+    w.push_indent();
+    w.line("float v = (tid < tg_size / 32u) ? reduce_buf[tid] : 0.0f;");
+    w.line("v = simd_sum(v);");
+    w.line("if (simd_lane == 0u) reduce_buf[0] = v;");
+    w.pop_indent();
+    w.line("}");
+    w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
+    w.line("float inv_sum = 1.0f / reduce_buf[0];");
+    w.line("if (tid < ROW_N) {");
+    w.push_indent();
+    w.line("float score = float(in0[row * ROW_N + tid]);");
+    w.line(format!(
+        "float prob = float({weight_t}(exp(score - row_max) * inv_sum));"
+    ));
+    w.line("vals[tid] = -prob;");
+    w.line("idxs[tid] = tid;");
+    w.pop_indent();
+    w.line("}");
+    w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
+
+    w.line("for (uint k = 2u; k <= ROW_N; k <<= 1u) {");
+    w.push_indent();
+    w.line("for (uint j = k >> 1u; j > 0u; j >>= 1u) {");
+    w.push_indent();
+    w.line("uint other = tid ^ j;");
+    w.line("if (tid < ROW_N && other > tid && other < ROW_N) {");
+    w.push_indent();
+    w.line("float a = vals[tid];");
+    w.line("float b = vals[other];");
+    w.line("uint ai = idxs[tid];");
+    w.line("uint bi = idxs[other];");
+    w.line("bool ascending = ((tid & k) == 0u);");
+    w.line("bool a_after_b = (a > b) || (a == b && ai > bi);");
+    w.line("bool do_swap = ascending ? a_after_b : !a_after_b;");
+    w.line("if (do_swap) {");
+    w.push_indent();
+    w.line("vals[tid] = b;");
+    w.line("vals[other] = a;");
+    w.line("idxs[tid] = bi;");
+    w.line("idxs[other] = ai;");
+    w.pop_indent();
+    w.line("}");
+    w.pop_indent();
+    w.line("}");
+    w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
+    w.pop_indent();
+    w.line("}");
+    w.pop_indent();
+    w.line("}");
+
+    w.line("if (tid < TOP_K) {");
+    w.push_indent();
+    w.line("uint out_i = row * TOP_K + tid;");
+    w.line("uint idx = idxs[tid];");
+    w.line("out0[out_i] = idx;");
+    w.line("float prob = -vals[tid];");
+    w.line("float scale = SCALE_SCALAR ? float(in1[0]) : float(in1[out_i]);");
+    w.line(format!("out1[out_i] = {weight_t}(prob * scale);"));
+    w.pop_indent();
+    w.line("}");
+    emit_close(w);
+    Ok(())
+}
+
+fn emit_gather_qmm_mlx_qmv(fusion: &Fusion, meta: &ModelMeta, w: &mut MslWriter) -> Result<bool> {
+    let Some((k_dim, out_dim, active_routes, bits, group_size)) =
+        crate::codegen::kernels::gather_qmm_mlx_qmv_shape(fusion)
+    else {
+        return Ok(false);
+    };
     if fusion.inputs.len() < 6 || fusion.outputs.is_empty() {
-        return emit_todo_stub(fusion, meta, w, "GatherQMM (missing inputs)");
+        return Ok(false);
     }
     let x_shape = &fusion.inputs[0].shape;
     let w_shape = &fusion.inputs[1].shape;
     let s_shape = &fusion.inputs[2].shape;
     let out_shape = &fusion.outputs[0].shape;
     if x_shape.is_empty() || w_shape.len() != 3 || s_shape.len() != 3 || out_shape.len() < 5 {
+        return Ok(false);
+    }
+    let n_experts = w_shape[0].max(1) as u32;
+    let packed = w_shape[2].max(1) as u32;
+    let n_groups = s_shape[2].max(1) as u32;
+    let tokens = out_shape.get(1).copied().unwrap_or(1).max(1) as u32;
+    let active_tokens = crate::target::current_chip().active_tokens_for_shape(out_shape);
+    let top_k = out_shape.get(2).copied().unwrap_or(1).max(1) as u32;
+    let fallback = crate::codegen::kernels::act_ty(meta);
+    let t = fusion
+        .outputs
+        .first()
+        .map(|b| msl_ty(b.dtype, fallback))
+        .unwrap_or(fallback);
+    if !matches!(t, "bfloat" | "half" | "float") {
+        return Ok(false);
+    }
+    let qmv_sgs = crate::codegen::kernels::qmv_fast_simdgroups(1, bits, k_dim, out_dim);
+    let qmv_cols_per_sg =
+        crate::codegen::kernels::qmv_fast_cols_per_simdgroup(1, bits, k_dim, out_dim);
+    let fn_name = function_name(fusion);
+    w.line(format!(
+        "// Fusion #{}: Single(GatherQMM MLX qmv_fast) — GatherQMM",
+        fusion.id
+    ));
+    w.line(format!("kernel void {fn_name}("));
+    w.push_indent();
+    w.line(format!("device const {t} *in0 [[buffer(0)]],"));
+    w.line("device const uint *in1 [[buffer(1)]],");
+    w.line(format!("device const {t} *in2 [[buffer(2)]],"));
+    w.line(format!("device const {t} *in3 [[buffer(3)]],"));
+    w.line("device const uint *in4 [[buffer(4)]],");
+    w.line("device const uint *in5 [[buffer(5)]],");
+    w.line(format!("device {t}       *out0 [[buffer(6)]],"));
+    w.line("uint3 tgid [[threadgroup_position_in_grid]],");
+    w.line("uint simd_gid [[simdgroup_index_in_threadgroup]],");
+    w.line("uint simd_lid [[thread_index_in_simdgroup]]");
+    w.pop_indent();
+    w.line(") {");
+    w.push_indent();
+    w.line("#if FUSEKIT_HAVE_MLX_NAX");
+    w.push_indent();
+    w.line(format!("constexpr int K = {k_dim};"));
+    w.line(format!("constexpr int O = {out_dim};"));
+    w.line(format!("constexpr uint N_EXPERTS = {n_experts}u;"));
+    w.line(format!("constexpr uint PACKED = {packed}u;"));
+    w.line(format!("constexpr uint N_GROUPS = {n_groups}u;"));
+    w.line(format!("constexpr uint TOKENS = {tokens}u;"));
+    w.line(format!("constexpr uint ACTIVE_TOKENS = {active_tokens}u;"));
+    w.line(format!("constexpr uint TOP_K = {top_k}u;"));
+    w.line(format!("constexpr uint ACTIVE_ROUTES = {active_routes}u;"));
+    w.line("uint route = tgid.y;");
+    w.line("if (route >= ACTIVE_ROUTES) return;");
+    w.line("uint slot = route % TOP_K;");
+    w.line("uint tok = (route / TOP_K) % TOKENS;");
+    w.line("if (tok >= ACTIVE_TOKENS) return;");
+    w.line("uint route_idx = tok * TOP_K + slot;");
+    w.line("uint x_row = uint(in4[route_idx]);");
+    w.line("uint expert = min(uint(in5[route_idx]), N_EXPERTS - 1u);");
+    w.line("uint3 local_tid = uint3(0u, tgid.x, 0u);");
+    w.writeln(format_args!(
+        "fusekit_qmv_fast_impl<{t}, {group_size}, {bits}, {qmv_sgs}, {qmv_cols_per_sg}>(in1 + expert * O * PACKED, in2 + expert * O * N_GROUPS, in3 + expert * O * N_GROUPS, in0 + x_row * K, out0 + route * O, K, O, local_tid, simd_gid, simd_lid);"
+    ));
+    w.pop_indent();
+    w.line("#else");
+    w.push_indent();
+    w.line(
+        "if (simd_lid == 0u && simd_gid == 0u && tgid.x == 0u && tgid.y == 0u) { out0[0] = 0; }",
+    );
+    w.line("static_assert(FUSEKIT_HAVE_MLX_NAX, \"FuseKit GatherQMM qmv requires MLX Metal headers\");");
+    w.pop_indent();
+    w.line("#endif");
+    emit_close(w);
+    Ok(true)
+}
+
+fn emit_gather_qmm(fusion: &Fusion, meta: &ModelMeta, w: &mut MslWriter) -> Result<()> {
+    // Quantized expert matvec for MoE routing.
+    // Inputs: x, packed_w[E,O,K/lanes], scales[E,O,K/group],
+    // biases[E,O,K/group], row_idx[B,T,top_k], expert_idx[B,T,top_k].
+    if emit_gather_qmm_mlx_qmv(fusion, meta, w)? {
+        return Ok(());
+    }
+    if emit_gather_qmm_nax(fusion, meta, w)? {
+        return Ok(());
+    }
+    if fusion.inputs.len() < 6 || fusion.outputs.is_empty() {
+        return emit_todo_stub(fusion, meta, w, "GatherQMM (missing inputs)");
+    }
+    let has_output_scale = fusion
+        .inputs
+        .get(6)
+        .is_some_and(|b| b.role == "output_scale");
+    let x_shape = &fusion.inputs[0].shape;
+    let w_shape = &fusion.inputs[1].shape;
+    let s_shape = &fusion.inputs[2].shape;
+    let out_shape = &fusion.outputs[0].shape;
+    if x_shape.is_empty() || w_shape.len() != 3 || s_shape.len() != 3 || out_shape.len() < 4 {
         return emit_todo_stub(fusion, meta, w, "GatherQMM (unsupported shape)");
     }
     let k_dim = x_shape.last().copied().unwrap_or(1).max(1) as u32;
@@ -2069,7 +2895,18 @@ fn emit_gather_qmm(fusion: &Fusion, meta: &ModelMeta, w: &mut MslWriter) -> Resu
         .product::<i32>()
         .max(1) as u32;
     let active_routes = active_tokens.saturating_mul(routes_per_token).max(1);
-    let (t, _) = emit_header(fusion, meta, w, 6, 1, "GatherQMM");
+    let (t, _) = emit_header(
+        fusion,
+        meta,
+        w,
+        if has_output_scale { 7 } else { 6 },
+        1,
+        if has_output_scale {
+            "GatherQMM output-scale"
+        } else {
+            "GatherQMM"
+        },
+    );
     w.line(format!("constexpr uint K = {k_dim};"));
     w.line(format!("constexpr uint N_EXPERTS = {n_experts};"));
     w.line(format!("constexpr uint O = {out_dim};"));
@@ -2091,6 +2928,69 @@ fn emit_gather_qmm(fusion: &Fusion, meta: &ModelMeta, w: &mut MslWriter) -> Resu
     w.line("constexpr uint ROW_BLOCKS = (O + ROWS_PER_SG - 1u) / ROWS_PER_SG;");
     w.line("uint simd_lane  = tid % 32u;");
     w.line("uint simd_id    = tid / 32u;");
+    let planned_sgs = chip.gatherqmm_simdgroups_per_tg().max(1);
+    let row_blocks = out_dim.saturating_add(rows_per_sg).saturating_sub(1) / rows_per_sg.max(1);
+    let x_smem_always = use_x_smem && row_blocks.is_multiple_of(planned_sgs);
+    if x_smem_always {
+        w.line("threadgroup float x_smem[K];");
+        w.line(format!(
+            "constexpr uint STAGED_SGS_PER_TG = {planned_sgs}u;"
+        ));
+        w.line("constexpr uint STAGED_TG_SIZE = STAGED_SGS_PER_TG * 32u;");
+        w.line("uint sg = gid * STAGED_SGS_PER_TG + simd_id;");
+        w.line("if (sg >= ACTIVE_ROUTES * ROW_BLOCKS) return;");
+        w.line("uint route = sg / ROW_BLOCKS;");
+        w.line("uint o_base = (sg % ROW_BLOCKS) * ROWS_PER_SG;");
+        w.line("uint slot = route % TOP_K;");
+        w.line("uint tok = (route / TOP_K) % TOKENS;");
+        w.line("uint route_idx = tok * TOP_K + slot;");
+        w.line("uint x_row_src = (simd_lane == 0u) ? uint(in4[route_idx]) : 0u;");
+        w.line(
+            "uint expert_src = (simd_lane == 0u) ? min(uint(in5[route_idx]), N_EXPERTS - 1u) : 0u;",
+        );
+        w.line("uint x_row = simd_broadcast(x_row_src, 0u);");
+        w.line("uint expert = simd_broadcast(expert_src, 0u);");
+        if has_output_scale {
+            w.line("float output_scale_src = (simd_lane == 0u) ? float(in6[route_idx]) : 0.0f;");
+            w.line("float output_scale = simd_broadcast(output_scale_src, 0u);");
+        }
+        w.line("for (uint k = tid; k < K; k += STAGED_TG_SIZE) {");
+        w.push_indent();
+        w.line("x_smem[k] = float(in0[x_row * K + k]);");
+        w.pop_indent();
+        w.line("}");
+        w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
+        for r in 0..rows_per_sg {
+            w.line(format!("float acc{r} = 0.0f;"));
+        }
+        crate::codegen::kernels::emit_int4_gemv_inner_multirow(
+            w,
+            |r| format!("acc{r}"),
+            |r| format!("in1 + (expert * O + (o_base + {r}u)) * PACKED"),
+            |r| format!("in2 + (expert * O + (o_base + {r}u)) * N_GROUPS"),
+            |r| format!("in3 + (expert * O + (o_base + {r}u)) * N_GROUPS"),
+            "K",
+            bits,
+            group_size,
+            rows_per_sg,
+            |off| format!("x_smem[{off}]"),
+        );
+        for r in 0..rows_per_sg {
+            w.line(format!("acc{r} = simd_sum(acc{r});"));
+        }
+        w.line("if (simd_lane != 0u) return;");
+        for r in 0..rows_per_sg {
+            if has_output_scale {
+                w.line(format!(
+                    "out0[route * O + o_base + {r}u] = {t}(float({t}(acc{r})) * output_scale);"
+                ));
+            } else {
+                w.line(format!("out0[route * O + o_base + {r}u] = {t}(acc{r});"));
+            }
+        }
+        emit_close(w);
+        return Ok(());
+    }
     w.line("uint sgs_per_tg = tg_size / 32u;");
     if use_x_smem {
         w.line("threadgroup float x_smem[K];");
@@ -2107,6 +3007,9 @@ fn emit_gather_qmm(fusion: &Fusion, meta: &ModelMeta, w: &mut MslWriter) -> Resu
         w.line("uint route_idx = tok * TOP_K + slot;");
         w.line("uint x_row = uint(in4[route_idx]);");
         w.line("uint expert = min(uint(in5[route_idx]), N_EXPERTS - 1u);");
+        if has_output_scale {
+            w.line("float output_scale = float(in6[route_idx]);");
+        }
         w.line("for (uint k = tid; k < K; k += tg_size) {");
         w.push_indent();
         w.line("x_smem[k] = float(in0[x_row * K + k]);");
@@ -2134,7 +3037,13 @@ fn emit_gather_qmm(fusion: &Fusion, meta: &ModelMeta, w: &mut MslWriter) -> Resu
         }
         w.line("if (simd_lane != 0u) return;");
         for r in 0..rows_per_sg {
-            w.line(format!("out0[route * O + o_base + {r}u] = {t}(acc{r});"));
+            if has_output_scale {
+                w.line(format!(
+                    "out0[route * O + o_base + {r}u] = {t}(float({t}(acc{r})) * output_scale);"
+                ));
+            } else {
+                w.line(format!("out0[route * O + o_base + {r}u] = {t}(acc{r});"));
+            }
         }
         w.pop_indent();
         w.line("} else {");
@@ -2150,6 +3059,9 @@ fn emit_gather_qmm(fusion: &Fusion, meta: &ModelMeta, w: &mut MslWriter) -> Resu
     w.line("uint route_idx = tok * TOP_K + slot;");
     w.line("uint x_row = uint(in4[route_idx]);");
     w.line("uint expert = min(uint(in5[route_idx]), N_EXPERTS - 1u);");
+    if has_output_scale {
+        w.line("float output_scale = float(in6[route_idx]);");
+    }
     for r in 0..rows_per_sg {
         w.line(format!("float acc{r} = 0.0f;"));
     }
@@ -2170,7 +3082,13 @@ fn emit_gather_qmm(fusion: &Fusion, meta: &ModelMeta, w: &mut MslWriter) -> Resu
     }
     w.line("if (simd_lane != 0u) return;");
     for r in 0..rows_per_sg {
-        w.line(format!("out0[route * O + o_base + {r}u] = {t}(acc{r});"));
+        if has_output_scale {
+            w.line(format!(
+                "out0[route * O + o_base + {r}u] = {t}(float({t}(acc{r})) * output_scale);"
+            ));
+        } else {
+            w.line(format!("out0[route * O + o_base + {r}u] = {t}(acc{r});"));
+        }
     }
     if use_x_smem {
         w.pop_indent();
@@ -2178,6 +3096,565 @@ fn emit_gather_qmm(fusion: &Fusion, meta: &ModelMeta, w: &mut MslWriter) -> Resu
     }
     emit_close(w);
     Ok(())
+}
+
+fn emit_gather_qmm_reduce(fusion: &Fusion, meta: &ModelMeta, w: &mut MslWriter) -> Result<()> {
+    // Fuses the generic op chain:
+    //   GatherQMM(route rows, expert rows) -> optional output scale -> Reduce(sum over routes)
+    // into one route-parallel threadgroup. This keeps one simdgroup per
+    // route so TOP_K parallelism is preserved, and only the route partials
+    // round-trip through threadgroup memory.
+    let has_route_weight = fusion
+        .inputs
+        .get(6)
+        .is_some_and(|b| b.role == "route_weight");
+    let base_inputs = if has_route_weight { 7 } else { 6 };
+    let has_residual_linear = fusion
+        .inputs
+        .get(base_inputs)
+        .is_some_and(|b| b.role == "shared_x");
+    let has_extra_residual = has_residual_linear
+        && fusion
+            .inputs
+            .get(base_inputs + 4)
+            .is_some_and(|b| b.role == "residual_extra");
+    let expected_inputs = base_inputs
+        + if has_residual_linear {
+            4 + usize::from(has_extra_residual)
+        } else {
+            0
+        };
+    if fusion.inputs.len() != expected_inputs || fusion.outputs.len() != 1 {
+        return emit_todo_stub(fusion, meta, w, "GatherQMMReduce (inputs)");
+    }
+    let x_shape = &fusion.inputs[0].shape;
+    let w_shape = &fusion.inputs[1].shape;
+    let s_shape = &fusion.inputs[2].shape;
+    let out_shape = &fusion.outputs[0].shape;
+    if x_shape.len() < 3 || w_shape.len() != 3 || s_shape.len() != 3 || out_shape.len() < 3 {
+        return emit_todo_stub(fusion, meta, w, "GatherQMMReduce (shape)");
+    }
+    let k_dim = x_shape.last().copied().unwrap_or(1).max(1) as u32;
+    let n_experts = w_shape[0].max(1) as u32;
+    let out_dim = w_shape[1].max(1) as u32;
+    let packed = w_shape[2].max(1) as u32;
+    let n_groups = s_shape[2].max(1) as u32;
+    let bits = ((packed * 32) / k_dim).max(1);
+    let group_size = (k_dim / n_groups).max(1);
+    if !matches!(bits, 4 | 8) || group_size == 0 || out_dim == 0 {
+        return emit_todo_stub(fusion, meta, w, "GatherQMMReduce (quant)");
+    }
+    let top_k = x_shape[2..x_shape.len().saturating_sub(1)]
+        .iter()
+        .copied()
+        .filter(|&d| d > 0)
+        .product::<i32>()
+        .max(1) as u32;
+    if top_k == 0 || top_k > 8 {
+        return emit_todo_stub(fusion, meta, w, "GatherQMMReduce (top_k)");
+    }
+    let tokens = out_shape.get(1).copied().unwrap_or(1).max(1) as u32;
+    let active_tokens = crate::target::current_chip().active_tokens_for_shape(out_shape);
+    let out_cols =
+        crate::target::current_chip().routed_reduce_cols_per_simdgroup(bits, k_dim, out_dim, top_k);
+    let (out_t, _) = emit_header(
+        fusion,
+        meta,
+        w,
+        expected_inputs,
+        1,
+        if has_route_weight {
+            "GatherQMMReduce output-scale"
+        } else {
+            "GatherQMMReduce"
+        },
+    );
+    let t = out_t.as_str();
+    if has_residual_linear {
+        let shared_base = base_inputs;
+        let shared_x_shape = fusion.inputs[shared_base].shape.as_slice();
+        let shared_w_shape = fusion.inputs[shared_base + 1].shape.as_slice();
+        let shared_s_shape = fusion.inputs[shared_base + 2].shape.as_slice();
+        let shared_b_shape = fusion.inputs[shared_base + 3].shape.as_slice();
+        if shared_x_shape.is_empty()
+            || shared_w_shape.len() != 2
+            || shared_s_shape.len() != 2
+            || shared_b_shape.len() != 2
+        {
+            return emit_todo_stub(fusion, meta, w, "GatherQMMReduce+LinearResidual (shape)");
+        }
+        let shared_k = shared_x_shape.last().copied().unwrap_or(1).max(1) as u32;
+        let shared_out = shared_w_shape[0].max(1) as u32;
+        let shared_packed = shared_w_shape[1].max(1) as u32;
+        let shared_groups = shared_s_shape[1].max(1) as u32;
+        let shared_bits = ((shared_packed * 32) / shared_k).max(1);
+        let shared_group_size = (shared_k / shared_groups.max(1)).max(1);
+        if shared_out != out_dim
+            || !matches!(shared_bits, 4 | 8)
+            || shared_group_size != 64
+            || shared_packed.saturating_mul(32) != shared_k.saturating_mul(shared_bits)
+            || shared_s_shape[0].max(1) as u32 != out_dim
+            || shared_b_shape[0].max(1) as u32 != out_dim
+            || shared_b_shape[1].max(1) as u32 != shared_groups
+            || top_k + 1 > 8
+        {
+            return emit_todo_stub(fusion, meta, w, "GatherQMMReduce+LinearResidual (target)");
+        }
+        let mut combined_cols = std::env::var("FUSEKIT_GATHER_QMM_REDUCE_LINEAR_COLS")
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .filter(|&n| (1..=4).contains(&n))
+            .unwrap_or(1)
+            .min(out_dim.max(1));
+        while combined_cols > 1 && !out_dim.is_multiple_of(combined_cols) {
+            combined_cols -= 1;
+        }
+        w.line(format!("constexpr uint ROUTE_K = {k_dim};"));
+        w.line(format!("constexpr uint SHARED_K = {shared_k};"));
+        w.line(format!("constexpr uint N_EXPERTS = {n_experts};"));
+        w.line(format!("constexpr uint O = {out_dim};"));
+        w.line(format!("constexpr uint ROUTE_PACKED = {packed};"));
+        w.line(format!("constexpr uint ROUTE_GROUPS = {n_groups};"));
+        w.line(format!("constexpr uint SHARED_PACKED = {shared_packed};"));
+        w.line(format!("constexpr uint SHARED_GROUPS = {shared_groups};"));
+        w.line(format!("constexpr uint TOKENS = {tokens};"));
+        w.line(format!("constexpr uint ACTIVE_TOKENS = {active_tokens};"));
+        w.line(format!("constexpr uint TOP_K = {top_k};"));
+        w.line(format!("constexpr uint COLS = {combined_cols};"));
+        w.line("constexpr uint O_BLOCKS = (O + COLS - 1u) / COLS;");
+        w.line("constexpr uint PARTIALS = TOP_K + 1u;");
+        w.line("threadgroup float partial[8 * COLS];");
+        w.line("uint simd_lane = tid % 32u;");
+        w.line("uint simd_id = tid / 32u;");
+        w.line("uint n_work = ACTIVE_TOKENS * O_BLOCKS;");
+        w.line("if (gid >= n_work) return;");
+        w.line("uint tok = gid / O_BLOCKS;");
+        w.line("uint o_base = (gid - tok * O_BLOCKS) * COLS;");
+        w.line("if (simd_id < TOP_K) {");
+        w.push_indent();
+        w.line("uint slot = simd_id;");
+        w.line("uint route_idx = tok * TOP_K + slot;");
+        w.line("uint x_row_src = (simd_lane == 0u) ? uint(in4[route_idx]) : 0u;");
+        w.line(
+            "uint expert_src = (simd_lane == 0u) ? min(uint(in5[route_idx]), N_EXPERTS - 1u) : 0u;",
+        );
+        w.line("uint x_row = simd_broadcast(x_row_src, 0u);");
+        w.line("uint expert = simd_broadcast(expert_src, 0u);");
+        if has_route_weight {
+            w.line("float rw_src = (simd_lane == 0u) ? float(in6[route_idx]) : 0.0f;");
+            w.line("float rw = simd_broadcast(rw_src, 0u);");
+        }
+        for r in 0..combined_cols {
+            w.line(format!("float dot{r} = 0.0f;"));
+        }
+        if combined_cols == 1 && bits == 4 && group_size == 64 && k_dim >= 1024 {
+            crate::codegen::kernels::emit_int4_gemv_inner_with_options_and_qdot(
+                w,
+                "dot0",
+                "in1 + (expert * O + o_base) * ROUTE_PACKED",
+                "in2 + (expert * O + o_base) * ROUTE_GROUPS",
+                "in3 + (expert * O + o_base) * ROUTE_GROUPS",
+                "ROUTE_K",
+                bits,
+                group_size,
+                false,
+                false,
+                crate::codegen::kernels::QdotPolicy::Force,
+                |off| format!("float(in0[x_row * ROUTE_K + {off}])"),
+            );
+        } else if combined_cols == 1 {
+            crate::codegen::kernels::emit_int4_gemv_inner(
+                w,
+                "dot0",
+                "in1 + (expert * O + o_base) * ROUTE_PACKED",
+                "in2 + (expert * O + o_base) * ROUTE_GROUPS",
+                "in3 + (expert * O + o_base) * ROUTE_GROUPS",
+                "ROUTE_K",
+                bits,
+                group_size,
+                |off| format!("float(in0[x_row * ROUTE_K + {off}])"),
+            );
+        } else {
+            crate::codegen::kernels::emit_int4_gemv_inner_multirow(
+                w,
+                |r| format!("dot{r}"),
+                |r| format!("in1 + (expert * O + (o_base + {r}u)) * ROUTE_PACKED"),
+                |r| format!("in2 + (expert * O + (o_base + {r}u)) * ROUTE_GROUPS"),
+                |r| format!("in3 + (expert * O + (o_base + {r}u)) * ROUTE_GROUPS"),
+                "ROUTE_K",
+                bits,
+                group_size,
+                combined_cols,
+                |off| format!("float(in0[x_row * ROUTE_K + {off}])"),
+            );
+        }
+        for r in 0..combined_cols {
+            w.line(format!("dot{r} = simd_sum(dot{r});"));
+        }
+        w.line("if (simd_lane == 0u) {");
+        w.push_indent();
+        for r in 0..combined_cols {
+            if has_route_weight {
+                w.line(format!(
+                    "partial[slot * COLS + {r}u] = float({t}(float({t}(dot{r})) * rw));"
+                ));
+            } else {
+                w.line(format!("partial[slot * COLS + {r}u] = float({t}(dot{r}));"));
+            }
+        }
+        w.pop_indent();
+        w.line("}");
+        w.pop_indent();
+        w.line("} else if (simd_id == TOP_K) {");
+        w.push_indent();
+        for r in 0..combined_cols {
+            w.line(format!("float dot{r} = 0.0f;"));
+        }
+        if combined_cols == 1 && shared_bits == 4 && shared_group_size == 64 && shared_k >= 1024 {
+            crate::codegen::kernels::emit_int4_gemv_inner_with_options_and_qdot(
+                w,
+                "dot0",
+                &format!("in{} + o_base * SHARED_PACKED", shared_base + 1),
+                &format!("in{} + o_base * SHARED_GROUPS", shared_base + 2),
+                &format!("in{} + o_base * SHARED_GROUPS", shared_base + 3),
+                "SHARED_K",
+                shared_bits,
+                shared_group_size,
+                false,
+                false,
+                crate::codegen::kernels::QdotPolicy::Force,
+                |off| format!("float(in{shared_base}[tok * SHARED_K + {off}])"),
+            );
+        } else if combined_cols == 1 {
+            crate::codegen::kernels::emit_int4_gemv_inner(
+                w,
+                "dot0",
+                &format!("in{} + o_base * SHARED_PACKED", shared_base + 1),
+                &format!("in{} + o_base * SHARED_GROUPS", shared_base + 2),
+                &format!("in{} + o_base * SHARED_GROUPS", shared_base + 3),
+                "SHARED_K",
+                shared_bits,
+                shared_group_size,
+                |off| format!("float(in{shared_base}[tok * SHARED_K + {off}])"),
+            );
+        } else {
+            crate::codegen::kernels::emit_int4_gemv_inner_multirow(
+                w,
+                |r| format!("dot{r}"),
+                |r| format!("in{} + (o_base + {r}u) * SHARED_PACKED", shared_base + 1),
+                |r| format!("in{} + (o_base + {r}u) * SHARED_GROUPS", shared_base + 2),
+                |r| format!("in{} + (o_base + {r}u) * SHARED_GROUPS", shared_base + 3),
+                "SHARED_K",
+                shared_bits,
+                shared_group_size,
+                combined_cols,
+                |off| format!("float(in{shared_base}[tok * SHARED_K + {off}])"),
+            );
+        }
+        for r in 0..combined_cols {
+            w.line(format!("dot{r} = simd_sum(dot{r});"));
+        }
+        w.line("if (simd_lane == 0u) {");
+        w.push_indent();
+        for r in 0..combined_cols {
+            w.line(format!("partial[TOP_K * COLS + {r}u] = dot{r};"));
+        }
+        w.pop_indent();
+        w.line("}");
+        w.pop_indent();
+        w.line("}");
+        w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
+        w.line("if (tid == 0u) {");
+        w.push_indent();
+        for r in 0..combined_cols {
+            w.line(format!("if (o_base + {r}u < O) {{"));
+            w.push_indent();
+            w.line("float route_acc = 0.0f;");
+            w.line(format!(
+                "for (uint p = 0u; p < TOP_K; ++p) route_acc += partial[p * COLS + {r}u];"
+            ));
+            w.line(format!("float route_y = float({out_t}(route_acc));"));
+            w.line(format!(
+                "{out_t} y0 = {out_t}(partial[TOP_K * COLS + {r}u] + route_y);"
+            ));
+            if has_extra_residual {
+                w.line(format!(
+                    "out0[tok * O + o_base + {r}u] = {out_t}(float(y0) + float(in{}[tok * O + o_base + {r}u]));",
+                    shared_base + 4
+                ));
+            } else {
+                w.line(format!("out0[tok * O + o_base + {r}u] = y0;"));
+            }
+            w.pop_indent();
+            w.line("}");
+        }
+        w.pop_indent();
+        w.line("}");
+        emit_close(w);
+        return Ok(());
+    }
+    w.line(format!("constexpr uint K = {k_dim};"));
+    w.line(format!("constexpr uint N_EXPERTS = {n_experts};"));
+    w.line(format!("constexpr uint O = {out_dim};"));
+    w.line(format!("constexpr uint PACKED = {packed};"));
+    w.line(format!("constexpr uint N_GROUPS = {n_groups};"));
+    w.line(format!("constexpr uint TOKENS = {tokens};"));
+    w.line(format!("constexpr uint ACTIVE_TOKENS = {active_tokens};"));
+    w.line(format!("constexpr uint TOP_K = {top_k};"));
+    w.line(format!("constexpr uint OUT_COLS = {out_cols};"));
+    w.line("constexpr uint O_BLOCKS = (O + OUT_COLS - 1u) / OUT_COLS;");
+    w.line("(void)tg_size;");
+    w.line("threadgroup float route_partial[8 * OUT_COLS];");
+    w.line("uint simd_lane = tid % 32u;");
+    w.line("uint simd_id = tid / 32u;");
+    w.line("uint n_work = ACTIVE_TOKENS * O_BLOCKS;");
+    w.line("if (gid >= n_work) return;");
+    w.line("uint tok = gid / O_BLOCKS;");
+    w.line("uint o_base = (gid % O_BLOCKS) * OUT_COLS;");
+    w.line("uint slot = simd_id;");
+    w.line("if (slot < TOP_K) {");
+    w.push_indent();
+    w.line("uint route_idx = tok * TOP_K + slot;");
+    w.line("uint x_row_src = (simd_lane == 0u) ? uint(in4[route_idx]) : 0u;");
+    w.line("uint expert_src = (simd_lane == 0u) ? min(uint(in5[route_idx]), N_EXPERTS - 1u) : 0u;");
+    w.line("uint x_row = simd_broadcast(x_row_src, 0u);");
+    w.line("uint expert = simd_broadcast(expert_src, 0u);");
+    if has_route_weight {
+        w.line("float rw_src = (simd_lane == 0u) ? float(in6[route_idx]) : 0.0f;");
+        w.line("float rw = simd_broadcast(rw_src, 0u);");
+    }
+    for r in 0..out_cols {
+        w.line(format!("float dot{r} = 0.0f;"));
+    }
+    if out_cols == 1 && bits == 4 && group_size == 64 && k_dim >= 1024 {
+        crate::codegen::kernels::emit_int4_gemv_inner_with_options_and_qdot(
+            w,
+            "dot0",
+            "in1 + (expert * O + o_base) * PACKED",
+            "in2 + (expert * O + o_base) * N_GROUPS",
+            "in3 + (expert * O + o_base) * N_GROUPS",
+            "K",
+            bits,
+            group_size,
+            false,
+            false,
+            crate::codegen::kernels::QdotPolicy::Force,
+            |off| format!("float(in0[x_row * K + {off}])"),
+        );
+    } else if out_cols == 1 {
+        crate::codegen::kernels::emit_int4_gemv_inner(
+            w,
+            "dot0",
+            "in1 + (expert * O + o_base) * PACKED",
+            "in2 + (expert * O + o_base) * N_GROUPS",
+            "in3 + (expert * O + o_base) * N_GROUPS",
+            "K",
+            bits,
+            group_size,
+            |off| format!("float(in0[x_row * K + {off}])"),
+        );
+    } else if out_cols == 2 && matches!(bits, 4 | 8) && group_size == 64 {
+        crate::codegen::kernels::emit_int4_gemv_inner_pair(
+            w,
+            "dot0",
+            "dot1",
+            "in1 + (expert * O + o_base) * PACKED",
+            "in2 + (expert * O + o_base) * N_GROUPS",
+            "in3 + (expert * O + o_base) * N_GROUPS",
+            "in1 + (expert * O + (o_base + 1u)) * PACKED",
+            "in2 + (expert * O + (o_base + 1u)) * N_GROUPS",
+            "in3 + (expert * O + (o_base + 1u)) * N_GROUPS",
+            "K",
+            bits,
+            group_size,
+            |off| format!("float(in0[x_row * K + {off}])"),
+        );
+    } else {
+        crate::codegen::kernels::emit_int4_gemv_inner_multirow(
+            w,
+            |r| format!("dot{r}"),
+            |r| format!("in1 + (expert * O + (o_base + {r}u)) * PACKED"),
+            |r| format!("in2 + (expert * O + (o_base + {r}u)) * N_GROUPS"),
+            |r| format!("in3 + (expert * O + (o_base + {r}u)) * N_GROUPS"),
+            "K",
+            bits,
+            group_size,
+            out_cols,
+            |off| format!("float(in0[x_row * K + {off}])"),
+        );
+    }
+    for r in 0..out_cols {
+        w.line(format!("dot{r} = simd_sum(dot{r});"));
+    }
+    w.line("if (simd_lane == 0u) {");
+    w.push_indent();
+    for r in 0..out_cols {
+        if has_route_weight {
+            w.line(format!(
+                "route_partial[slot * OUT_COLS + {r}u] = float({t}(float({t}(dot{r})) * rw));"
+            ));
+        } else {
+            w.line(format!(
+                "route_partial[slot * OUT_COLS + {r}u] = float({t}(dot{r}));"
+            ));
+        }
+    }
+    w.pop_indent();
+    w.line("}");
+    w.pop_indent();
+    w.line("}");
+    w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");
+    w.line("if (tid < OUT_COLS) {");
+    w.push_indent();
+    w.line("uint o = o_base + tid;");
+    w.line("if (o < O) {");
+    w.push_indent();
+    w.line("float acc = 0.0f;");
+    w.line("for (uint slot_i = 0u; slot_i < TOP_K; ++slot_i) {");
+    w.push_indent();
+    w.line("acc += route_partial[slot_i * OUT_COLS + tid];");
+    w.pop_indent();
+    w.line("}");
+    w.line(format!("out0[tok * O + o] = {t}(acc);"));
+    w.pop_indent();
+    w.line("}");
+    w.pop_indent();
+    w.line("}");
+    emit_close(w);
+    Ok(())
+}
+
+fn emit_gather_qmm_nax(fusion: &Fusion, meta: &ModelMeta, w: &mut MslWriter) -> Result<bool> {
+    let Some((k_dim, out_dim, active_routes, bits, group_size)) =
+        crate::codegen::kernels::gather_qmm_nax_shape(fusion)
+    else {
+        return Ok(false);
+    };
+    if fusion.inputs.len() < 6 || fusion.outputs.is_empty() {
+        return Ok(false);
+    }
+    let x_shape = &fusion.inputs[0].shape;
+    let w_shape = &fusion.inputs[1].shape;
+    let s_shape = &fusion.inputs[2].shape;
+    let out_shape = &fusion.outputs[0].shape;
+    if x_shape.is_empty() || w_shape.len() != 3 || s_shape.len() != 3 || out_shape.len() < 5 {
+        return Ok(false);
+    }
+    let fallback = crate::codegen::kernels::act_ty(meta);
+    let t = fusion
+        .outputs
+        .first()
+        .map(|b| msl_ty(b.dtype, fallback))
+        .unwrap_or(fallback);
+    if !matches!(t, "bfloat" | "half" | "float") {
+        return Ok(false);
+    }
+    let idx_t = fusion
+        .inputs
+        .get(4)
+        .map(|b| msl_ty(b.dtype, fallback))
+        .unwrap_or("uint");
+    let expert_t = fusion
+        .inputs
+        .get(5)
+        .map(|b| msl_ty(b.dtype, fallback))
+        .unwrap_or("uint");
+    let n_experts = w_shape[0].max(1) as u32;
+    let packed = w_shape[2].max(1) as u32;
+    let n_groups = s_shape[2].max(1) as u32;
+    let tokens = out_shape.get(1).copied().unwrap_or(1).max(1) as u32;
+    let active_tokens = crate::target::current_chip().active_tokens_for_shape(out_shape);
+    let top_k = out_shape.get(2).copied().unwrap_or(1).max(1) as u32;
+    let (_bm_auto, _bk_auto, _bn_auto) =
+        crate::codegen::kernels::qmm_mlx_qmmt_tile(k_dim, out_dim, active_routes, bits);
+    // Match MLX's gather_qmm_t_nax default tiling. This helper is distinct
+    // from the generic qmm_t BlockMMA path: it keeps only the quantized
+    // weight tile in threadgroup memory and loads the one routed activation
+    // row directly through NAXTile, which is the small-M gather case.
+    let bm = 64u32;
+    let bk = 64u32;
+    let bn = 64u32;
+    let aligned_n = if out_dim.is_multiple_of(32) {
+        "true"
+    } else {
+        "false"
+    };
+    let fn_name = function_name(fusion);
+    w.line(format!(
+        "// Fusion #{}: Single(GatherQMM NAX) — M=1 routed qMM K={} N={} bits={} gs={} tile={}x{}x{} routes={}",
+        fusion.id, k_dim, out_dim, bits, group_size, bm, bk, bn, active_routes
+    ));
+    w.line(format!("kernel void {fn_name}("));
+    w.push_indent();
+    w.line(format!("device const {t} *in0 [[buffer(0)]],"));
+    w.line("device const uint *in1 [[buffer(1)]],");
+    w.line(format!("device const {t} *in2 [[buffer(2)]],"));
+    w.line(format!("device const {t} *in3 [[buffer(3)]],"));
+    w.line(format!("device const {idx_t} *in4 [[buffer(4)]],"));
+    w.line(format!("device const {expert_t} *in5 [[buffer(5)]],"));
+    w.line(format!("device {t}       *out0 [[buffer(6)]],"));
+    w.line("uint3 tgid [[threadgroup_position_in_grid]],");
+    w.line("uint tid [[thread_index_in_threadgroup]],");
+    w.line("uint simd_gid [[simdgroup_index_in_threadgroup]],");
+    w.line("uint simd_lid [[thread_index_in_simdgroup]]");
+    w.pop_indent();
+    w.line(") {");
+    w.push_indent();
+    w.line("#if FUSEKIT_HAVE_MLX_NAX");
+    w.push_indent();
+    w.line(format!("constexpr int K = {k_dim};"));
+    w.line(format!("constexpr int O = {out_dim};"));
+    w.line("constexpr int M = 1;");
+    w.line(format!("constexpr uint N_EXPERTS = {n_experts};"));
+    w.line(format!("constexpr uint PACKED = {packed};"));
+    w.line(format!("constexpr uint N_GROUPS = {n_groups};"));
+    w.line(format!("constexpr uint TOKENS = {tokens};"));
+    w.line(format!("constexpr uint ACTIVE_TOKENS = {active_tokens};"));
+    w.line(format!("constexpr uint TOP_K = {top_k};"));
+    w.line(format!("constexpr uint ACTIVE_ROUTES = {active_routes};"));
+    w.line("uint route = tgid.y;");
+    w.line("if (route >= ACTIVE_ROUTES) return;");
+    w.line("uint slot = route % TOP_K;");
+    w.line("uint tok = (route / TOP_K) % TOKENS;");
+    w.line("if (tok >= ACTIVE_TOKENS) return;");
+    w.line("uint route_idx = tok * TOP_K + slot;");
+    w.line("uint x_row = uint(in4[route_idx]);");
+    w.line("uint expert = min(uint(in5[route_idx]), N_EXPERTS - 1u);");
+    w.line(format!(
+        "threadgroup {t} Ws[{bk} * ({bn} + 16 / sizeof({t}))];"
+    ));
+    w.line("device const uint *w_expert = in1 + expert * O * PACKED;");
+    w.line(format!(
+        "device const {t} *s_expert = in2 + expert * O * N_GROUPS;"
+    ));
+    w.line(format!(
+        "device const {t} *b_expert = in3 + expert * O * N_GROUPS;"
+    ));
+    w.line(format!(
+        "device const {t} *x_row_ptr = in0 + uint64_t(x_row) * uint64_t(K);"
+    ));
+    w.line(format!(
+        "device {t} *y_route = out0 + uint64_t(route) * uint64_t(O);"
+    ));
+    w.line("uint3 local_tgid = uint3(tgid.x, 0u, 0u);");
+    w.line(format!(
+        "fusekit_qmm_t_nax_tgp_impl<{t}, {group_size}, {bits}, {aligned_n}, {bm}, {bk}, {bn}, 2, 2>("
+    ));
+    w.push_indent();
+    w.line("w_expert, s_expert, b_expert, x_row_ptr, y_route, Ws, K, O, M,");
+    w.line("local_tgid, tid, simd_gid, simd_lid);");
+    w.pop_indent();
+    w.pop_indent();
+    w.line("#else");
+    w.push_indent();
+    w.line("if (tid == 0u && tgid.x == 0u && tgid.y == 0u) { out0[0] = 0; }");
+    w.line(
+        "static_assert(FUSEKIT_HAVE_MLX_NAX, \"FuseKit GatherQMM NAX requires MLX Metal headers\");",
+    );
+    w.pop_indent();
+    w.line("#endif");
+    emit_close(w);
+    Ok(true)
 }
 
 fn emit_reduce_sum(fusion: &Fusion, meta: &ModelMeta, w: &mut MslWriter) -> Result<()> {
@@ -2223,17 +3700,21 @@ fn emit_reduce_sum(fusion: &Fusion, meta: &ModelMeta, w: &mut MslWriter) -> Resu
     Ok(())
 }
 
-fn emit_weighted_route_reduce(fusion: &Fusion, meta: &ModelMeta, w: &mut MslWriter) -> Result<()> {
-    // Fuses MoE route weighting:
-    //   Broadcast(route_weight) -> Multiply(expert_output, weight) -> Reduce(sum, route_axis)
+fn emit_scaled_sum_reduce(fusion: &Fusion, meta: &ModelMeta, w: &mut MslWriter) -> Result<()> {
+    // Fuses the generic algebra:
+    //   Broadcast(scale) -> Multiply(data, scale) -> Reduce(sum, axis)
     // into one pass over the final output. This is semantic shape
-    // lowering, not model-name matching.
+    // lowering, not model-name or model-architecture matching.
+    let display_name = match &fusion.kind {
+        FusionKind::Single(name) => name.as_str(),
+        _ => "ScaledSumReduce",
+    };
     if fusion.inputs.len() < 2 || fusion.outputs.is_empty() {
         return emit_todo_stub(
             fusion,
             meta,
             w,
-            "WeightedRouteReduce (missing input/output)",
+            &format!("{display_name} (missing input/output)"),
         );
     }
     let data_shape = &fusion.inputs[0].shape;
@@ -2243,7 +3724,7 @@ fn emit_weighted_route_reduce(fusion: &Fusion, meta: &ModelMeta, w: &mut MslWrit
         || weight_shape.len() != data_shape.len()
         || data_shape.is_empty()
     {
-        return emit_todo_stub(fusion, meta, w, "WeightedRouteReduce (rank)");
+        return emit_todo_stub(fusion, meta, w, &format!("{display_name} (rank)"));
     }
     let axis = data_shape
         .iter()
@@ -2253,21 +3734,26 @@ fn emit_weighted_route_reduce(fusion: &Fusion, meta: &ModelMeta, w: &mut MslWrit
         .map(|(idx, _)| idx)
         .collect::<Vec<_>>();
     if axis.len() != 1 {
-        return emit_todo_stub(fusion, meta, w, "WeightedRouteReduce (axis)");
+        return emit_todo_stub(fusion, meta, w, &format!("{display_name} (axis)"));
     }
     let axis = axis[0];
     for i in 0..data_shape.len() {
         if i == axis {
             if weight_shape[i] != data_shape[i] {
-                return emit_todo_stub(fusion, meta, w, "WeightedRouteReduce (weight axis)");
+                return emit_todo_stub(fusion, meta, w, &format!("{display_name} (weight axis)"));
             }
             continue;
         }
         if out_shape[i] != data_shape[i] {
-            return emit_todo_stub(fusion, meta, w, "WeightedRouteReduce (output shape)");
+            return emit_todo_stub(fusion, meta, w, &format!("{display_name} (output shape)"));
         }
         if weight_shape[i] != data_shape[i] && weight_shape[i] != 1 {
-            return emit_todo_stub(fusion, meta, w, "WeightedRouteReduce (weight broadcast)");
+            return emit_todo_stub(
+                fusion,
+                meta,
+                w,
+                &format!("{display_name} (weight broadcast)"),
+            );
         }
     }
     let pre = data_shape[..axis].iter().product::<i32>().max(1) as u32;
@@ -2275,13 +3761,13 @@ fn emit_weighted_route_reduce(fusion: &Fusion, meta: &ModelMeta, w: &mut MslWrit
     let post = data_shape[axis + 1..].iter().product::<i32>().max(1) as u32;
     let weight_post = weight_shape[axis + 1..].iter().product::<i32>().max(1) as u32;
     if weight_post != 1 && weight_post != post {
-        return emit_todo_stub(fusion, meta, w, "WeightedRouteReduce (weight post)");
+        return emit_todo_stub(fusion, meta, w, &format!("{display_name} (weight post)"));
     }
     let active_rows = crate::target::current_chip()
         .active_rows_before_last(out_shape)
         .min(u32::MAX as u64) as u32;
     let n = active_rows.saturating_mul(post).max(1);
-    let (t, _) = emit_header(fusion, meta, w, 2, 1, "WeightedRouteReduce");
+    let (t, _) = emit_header(fusion, meta, w, 2, 1, display_name);
     w.line(format!("constexpr uint PRE = {pre};"));
     w.line(format!("constexpr uint RED = {red};"));
     w.line(format!("constexpr uint POST = {post};"));
@@ -2297,7 +3783,9 @@ fn emit_weighted_route_reduce(fusion: &Fusion, meta: &ModelMeta, w: &mut MslWrit
     w.push_indent();
     w.line("uint data_idx = (pre * RED + r) * POST + post;");
     w.line("uint weight_idx = (pre * RED + r) * WEIGHT_POST + (WEIGHT_POST == 1u ? 0u : post);");
-    w.line("acc += float(in0[data_idx]) * float(in1[weight_idx]);");
+    w.line(format!(
+        "acc += float({t}(float(in0[data_idx]) * float(in1[weight_idx])));"
+    ));
     w.pop_indent();
     w.line("}");
     w.line(format!("out0[i] = {t}(acc);"));
@@ -2475,11 +3963,30 @@ fn emit_split(
         .copied()
         .map(|x| x.max(1) as u32)
         .product();
+    let active_outer: u32 = if rank >= 3 && axis_idx >= 2 {
+        let active_seq = crate::target::current_chip().active_tokens_for_shape(in_shape);
+        let post_seq_prefix: u32 = in_shape[2..axis_idx]
+            .iter()
+            .copied()
+            .map(|x| x.max(1) as u32)
+            .product::<u32>()
+            .max(1);
+        active_seq.saturating_mul(post_seq_prefix).max(1).min(outer)
+    } else {
+        outer
+    };
     let in_axis = in_shape[axis_idx].max(1) as u32;
     let out_elems: Vec<u32> = fusion
         .outputs
         .iter()
-        .map(|b| total_elements(&b.shape))
+        .map(|b| {
+            if rank >= 3 && axis_idx >= 2 {
+                let axis_len = b.shape.get(axis_idx).copied().unwrap_or(1).max(1) as u32;
+                active_outer.saturating_mul(axis_len).saturating_mul(inner)
+            } else {
+                total_elements(&b.shape)
+            }
+        })
         .collect();
     let total: u32 = out_elems.iter().sum();
     let (_t, _) = emit_header(
@@ -2491,6 +3998,7 @@ fn emit_split(
         &format!("Split(axis={axis_idx})"),
     );
     w.line(format!("constexpr uint OUTER = {outer}u;"));
+    w.line(format!("constexpr uint ACTIVE_OUTER = {active_outer}u;"));
     w.line(format!("constexpr uint INNER = {inner}u;"));
     w.line(format!("constexpr uint IN_AXIS = {in_axis}u;"));
     w.line(format!("constexpr uint TOTAL = {total}u;"));
@@ -2702,7 +4210,7 @@ fn emit_convolution(
         // for recurrent decode paths where one-ulp conv drift compounds.
         w.line(format!("{t} conv = {t}(acc);"));
         w.line("float conv_f = float(conv);");
-        w.line("float sig = 1.0f / (1.0f + exp(-conv_f));");
+        w.line("float sig = 1.0f / (1.0f + metal::fast::exp(-conv_f));");
         w.line(format!("out0[i] = {t}(conv_f * sig);"));
     } else {
         w.line(format!("out0[i] = {t}(acc);"));
@@ -2725,8 +4233,31 @@ fn emit_rmsnorm(
     };
     let shape = &fusion.outputs[0].shape;
     let last = shape.last().copied().unwrap_or(1) as u32;
-    let rows: i32 = shape[..shape.len().saturating_sub(1)].iter().product();
-    let rows = rows.max(1) as u32;
+    let head_major = shape.len() == 4
+        && last == meta.head_dim
+        && (shape[1].max(1) as u32 == meta.num_attention_heads
+            || shape[1].max(1) as u32 == meta.num_key_value_heads);
+    let (rows, heads, trace_seq, active_seq) = if head_major {
+        let heads = shape[1].max(1) as u32;
+        let trace_seq = shape[2].max(1) as u32;
+        let active_seq = crate::target::current_chip().active_m(trace_seq).max(1);
+        (
+            heads.saturating_mul(active_seq).max(1),
+            heads,
+            trace_seq,
+            active_seq,
+        )
+    } else {
+        (
+            crate::target::current_chip()
+                .active_rows_before_last(shape)
+                .min(u32::MAX as u64) as u32,
+            1,
+            1,
+            1,
+        )
+    };
+    let rows = rows.max(1);
     let weight_elems = fusion
         .inputs
         .get(1)
@@ -2736,13 +4267,28 @@ fn emit_rmsnorm(
     let (t, _) = emit_header(fusion, meta, w, 2, 1, "RMSNorm");
     w.line(format!("constexpr uint HIDDEN = {last};"));
     w.line(format!("constexpr uint ROWS   = {rows};"));
+    w.line(format!("constexpr uint HEADS  = {heads};"));
+    w.line(format!("constexpr uint TRACE_SEQ = {trace_seq};"));
+    w.line(format!("constexpr uint ACTIVE_SEQ = {active_seq};"));
     w.line(format!("constexpr float EPS   = {eps};"));
+    w.line(format!(
+        "constexpr bool HEAD_MAJOR = {};",
+        if head_major { "true" } else { "false" }
+    ));
     w.line(format!(
         "constexpr bool WEIGHT_IS_VECTOR = {};",
         if weight_is_vector { "true" } else { "false" }
     ));
-    w.line("uint row = gid;");
-    w.line("if (row >= ROWS) return;");
+    w.line("uint logical_row = gid;");
+    w.line("if (logical_row >= ROWS) return;");
+    w.line("uint row = logical_row;");
+    w.line("if (HEAD_MAJOR) {");
+    w.push_indent();
+    w.line("uint seq = logical_row / HEADS;");
+    w.line("uint head = logical_row - seq * HEADS;");
+    w.line("row = head * TRACE_SEQ + seq;");
+    w.pop_indent();
+    w.line("}");
     w.line(format!("device const {t} *x_row = in0 + row * HIDDEN;"));
     w.line(format!(
         "device const {t} *w_row = WEIGHT_IS_VECTOR ? in1 : in1;"
@@ -2798,8 +4344,13 @@ fn emit_rope(
             traditional,
             base,
             scale,
+            ..
         } => (*dims as u32, *traditional, *base, *scale),
         _ => bail!("rope emitter: expected Attrs::Rope"),
+    };
+    let inline_freqs = match op_attrs {
+        crate::graph::Attrs::Rope { inline_freqs, .. } => inline_freqs.as_ref(),
+        _ => None,
     };
     let shape = &fusion.outputs[0].shape;
     let head_dim = shape.last().copied().unwrap_or(0) as u32;
@@ -2807,6 +4358,7 @@ fn emit_rope(
     let rows: i32 = shape[..shape.len().saturating_sub(1)].iter().product();
     let rows = rows.max(1) as u32;
     let has_freqs = fusion.inputs.len() > 2;
+    let has_inline_freqs = inline_freqs.is_some();
     let seq_len = shape
         .get(shape.len().saturating_sub(2))
         .copied()
@@ -2824,8 +4376,8 @@ fn emit_rope(
     let t = crate::codegen::kernels::act_ty(meta);
     let fn_name = function_name(fusion);
     w.line(format!(
-        "// Fusion #{}: Single(RoPE) — dims={} head_dim={} seq_len={} base={} scale={} traditional={} freqs={}",
-        fusion.id, dims, head_dim, seq_len, base, scale, traditional, has_freqs
+        "// Fusion #{}: Single(RoPE) — dims={} head_dim={} seq_len={} base={} scale={} traditional={} freqs={} inline_freqs={}",
+        fusion.id, dims, head_dim, seq_len, base, scale, traditional, has_freqs, has_inline_freqs
     ));
     w.line(format!("kernel void {fn_name}("));
     w.push_indent();
@@ -2863,6 +4415,17 @@ fn emit_rope(
         "constexpr bool HAS_FREQS = {};",
         if has_freqs { "true" } else { "false" }
     ));
+    if let Some(freqs) = inline_freqs {
+        let vals = freqs
+            .iter()
+            .map(|v| format!("{v:.9e}f"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        w.writeln(format_args!(
+            "const float inline_freqs[{}] = {{ {vals} }};",
+            freqs.len()
+        ));
+    }
     w.blank();
 
     w.line("uint g = gid * tg_size + tid;");
@@ -2891,7 +4454,14 @@ fn emit_rope(
 
     w.line("uint pair_idx = TRADITIONAL ? (d / 2u) : ((d < HALF) ? d : (d - HALF));");
     w.line("float d_norm = float(pair_idx) / float(HALF);");
-    if has_freqs {
+    if let Some(freqs) = inline_freqs {
+        w.writeln(format_args!(
+            "uint freq_idx = (pair_idx < {}u) ? pair_idx : {}u;",
+            freqs.len(),
+            freqs.len().saturating_sub(1)
+        ));
+        w.line("float inv_freq = SCALE / inline_freqs[freq_idx];");
+    } else if has_freqs {
         w.line("float inv_freq = SCALE / float(freqs[pair_idx]);");
     } else {
         w.line("float inv_freq = metal::exp2(-d_norm * BASE_LOG2) * SCALE;");

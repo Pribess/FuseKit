@@ -5,12 +5,14 @@ Import side effects:
   `load()` whenever it's first imported, wrapping the loaded model with
   a `FusekitWrapper` if a `fusekit/` subdir exists next to the weights.
 
-This module is meant to be imported automatically at interpreter
-startup via a `.pth` file in user site-packages. Importing it manually
-is harmless — the finder install is idempotent.
+This module is imported automatically at interpreter startup through a
+`.pth` file in user site-packages. Importing it manually is harmless —
+the finder install is idempotent.
 
-Phase 1 is pure Python and acts as a passthrough wrapper. Phase 2 will
-swap `FusekitWrapper.__call__` for a Rust-side Metal dispatcher.
+When a compiled artifact is present, `FusekitWrapper` routes supported
+prefill/decode work through the embedded Rust/Metal dispatcher and falls
+back to mlx-lm only when the runtime cannot prove the fast path safe.
+Set `FUSEKIT_DISABLE_HOOK=1` before Python starts to force raw mlx-lm.
 """
 
 from __future__ import annotations
@@ -38,6 +40,83 @@ def _dispatch_enabled() -> bool:
     if _env_flag("FUSEKIT_DISABLE_DISPATCH") or _env_flag("FUSEKIT_DISABLE_FAST"):
         return False
     return True
+
+
+def _gemma4_layer_index_from_weight_key(key: str) -> int | None:
+    marker = ".layers."
+    pos = key.find(marker)
+    if pos < 0:
+        return None
+    tail = key[pos + len(marker) :]
+    dot = tail.find(".")
+    if dot <= 0:
+        return None
+    try:
+        return int(tail[:dot])
+    except ValueError:
+        return None
+
+
+def _install_gemma4_shared_kv_weight_filter() -> None:
+    """Allow Gemma4 shared-KV checkpoints with harmless extra K/V tensors.
+
+    Some Gemma4 E*B MLX exports carry K/V tensors for layers that the config
+    marks as KV-shared. The mlx-lm model correctly omits those modules, so
+    strict loading rejects the extra tensors before raw or FuseKit generation
+    can run. Preserve the config semantics and filter only those shared-layer
+    K/V tensors during the model's normal sanitize stage.
+    """
+
+    try:
+        from mlx_lm.models import gemma4_text
+    except Exception:
+        return
+
+    model_cls = getattr(gemma4_text, "Model", None)
+    original = getattr(model_cls, "sanitize", None)
+    if model_cls is None or original is None:
+        return
+    if getattr(original, "_fusekit_gemma4_shared_kv_filter", False):
+        return
+
+    def sanitize(self, weights):
+        sanitized = original(self, weights)
+        args = getattr(self, "args", None)
+        try:
+            num_layers = int(getattr(args, "num_hidden_layers", 0) or 0)
+            shared_layers = int(getattr(args, "num_kv_shared_layers", 0) or 0)
+        except (TypeError, ValueError):
+            return sanitized
+        first_shared = num_layers - shared_layers
+        if num_layers <= 0 or shared_layers <= 0 or first_shared < 0:
+            return sanitized
+
+        out = {}
+        dropped = 0
+        for key, value in sanitized.items():
+            layer_idx = _gemma4_layer_index_from_weight_key(key)
+            is_shared_kv_extra = (
+                layer_idx is not None
+                and layer_idx >= first_shared
+                and (
+                    ".self_attn.k_proj." in key
+                    or ".self_attn.v_proj." in key
+                    or ".self_attn.k_norm." in key
+                )
+            )
+            if is_shared_kv_extra:
+                dropped += 1
+                continue
+            out[key] = value
+        if dropped and _env_flag("FUSEKIT_GEMMA4_LOAD_DEBUG"):
+            print(
+                f"[fusekit] Gemma4 shared-KV load: ignored {dropped} extra tensors",
+                file=sys.stderr,
+            )
+        return out
+
+    sanitize._fusekit_gemma4_shared_kv_filter = True
+    model_cls.sanitize = sanitize
 
 
 def _prefill_pad_multiple() -> int:
@@ -1911,6 +1990,12 @@ def _cache_capacity(cache: Any) -> int | None:
         arr = _cache_keys_array(keys)
         cap = _cache_array_capacity(arr)
         if cap is not None:
+            max_size = getattr(c, "max_size", None)
+            if max_size is not None and "Rotating" in type(c).__name__:
+                try:
+                    cap = min(int(cap), int(max_size))
+                except Exception:
+                    pass
             caps.append(cap)
     return min(caps) if caps else None
 
@@ -1938,15 +2023,28 @@ def _engine_set_cache_offset(cache: Any, offset: int) -> None:
     if cache is None:
         return
     import mlx.core as mx
+
+    def make_offset_like(current: Any):
+        shape = getattr(current, "shape", None)
+        if shape is None:
+            return offset
+        try:
+            if len(shape) == 0:
+                return mx.array(offset)
+            n = int(shape[0]) if len(shape) > 0 else 1
+            return mx.array([offset] * max(1, n))
+        except Exception:
+            return mx.array([offset])
+
     batch_offset = None
     for c in cache:
         if type(c).__name__ == "BatchKVCache":
             c._idx = offset
             if batch_offset is None:
-                batch_offset = mx.array([offset])
+                batch_offset = make_offset_like(getattr(c, "offset", None))
             c.offset = batch_offset
         elif hasattr(c, "offset"):
-            c.offset = offset
+            c.offset = make_offset_like(getattr(c, "offset", None))
 
 
 def _grow_time_axis(arr: Any, target: int):
@@ -2024,10 +2122,18 @@ def _ensure_cache_capacity(cache: Any, required: int) -> tuple[bool, str | None]
 
         max_size = getattr(c, "max_size", None)
         if max_size is not None and required > int(max_size):
-            return (
-                False,
-                f"{type(c).__name__} requires {required} slots but max_size is {max_size}",
-            )
+            # Rotating/sliding-window caches deliberately cap physical
+            # storage at max_size and wrap the write index. `required`
+            # is the absolute decode length, so exceeding max_size is
+            # valid once the ring buffer is fully allocated.
+            if "Rotating" in type(c).__name__:
+                if cap >= int(max_size):
+                    continue
+            else:
+                return (
+                    False,
+                    f"{type(c).__name__} requires {required} slots but max_size is {max_size}",
+                )
 
         step = int(getattr(c, "step", 256) or 256)
         target = ((required + step - 1) // step) * step
@@ -3595,6 +3701,9 @@ def _wrap_generation_batch(module) -> None:
     original_next_generated = (
         getattr(batch_cls, "next_generated", None) if batch_cls is not None else None
     )
+    original_insert_segments = (
+        getattr(batch_cls, "insert_segments", None) if batch_cls is not None else None
+    )
     original_prompt = (
         getattr(prompt_cls, "prompt", None) if prompt_cls is not None else None
     )
@@ -3670,15 +3779,15 @@ def _wrap_generation_batch(module) -> None:
         return True
 
     def _engine_direct_head_argmax_enabled(self) -> bool:
+        if not _env_flag("FUSEKIT_ENABLE_DIRECT_HEAD_ARGMAX"):
+            return False
         if _env_flag("FUSEKIT_DISABLE_DIRECT_HEAD_ARGMAX"):
             return False
         if _env_flag("FUSEKIT_DISABLE_GPU_ARGMAX_TOKENS"):
             return False
-        # This flag is entered only by greedy-argmax call sites. The
-        # dispatcher still filters the concrete task to head kernels
-        # with emitted direct-argmax variants, so this must not be
-        # quantization-specific: bf16 FinalRmsNormLmHead can also
-        # avoid the logits write/read round trip.
+        # Entered only by greedy-argmax call sites. Keep it opt-in:
+        # L512 profiles on q4/q8/bf16 show the direct scan/finalize path
+        # is not faster than the normal logits + MLX argmax path.
         return _is_engine_fast_eligible(self)
 
     def _engine_needs_direct_head_rebuild(self) -> bool:
@@ -3690,13 +3799,13 @@ def _wrap_generation_batch(module) -> None:
         return fk is not None and not bool(fk.get("direct_head_argmax", False))
 
     def _engine_drain_limit(self=None) -> int:
-        if _is_omlx_step_style():
-            return 1
         if _env_flag("FUSEKIT_DISABLE_ENGINE_DRAIN"):
             return 1
         raw = os.environ.get("FUSEKIT_ENGINE_DRAIN")
         if raw is None:
-            return 1
+            gb = getattr(self, "_generation_batch", None)
+            queued = getattr(gb, "_fk_engine_queue", None) or []
+            return max(1, 1 + len(queued))
         try:
             return max(1, int(raw))
         except ValueError:
@@ -3721,7 +3830,7 @@ def _wrap_generation_batch(module) -> None:
         queue = getattr(self, "_fk_engine_queue", None) or []
         if not queue:
             return False
-        self._next_tokens = mx.array([int(queue.pop(0))], dtype=inputs.dtype)
+        self._next_tokens = mx.array([int(queue.pop(0))], dtype=mx.uint32)
         self._next_logprobs = [None]
         self._fk_engine_queue = queue
         return True
@@ -3753,7 +3862,7 @@ def _wrap_generation_batch(module) -> None:
             _native.wait_pending_icb(int(pending["handle"]))
 
         next_token = int(pending["next_token_view"][0])
-        self._next_tokens = mx.array([next_token], dtype=pending["dtype"])
+        self._next_tokens = mx.array([next_token], dtype=mx.uint32)
         self._next_logprobs = [None]
         self._fk_engine_async_pending = None
         return True
@@ -3765,6 +3874,55 @@ def _wrap_generation_batch(module) -> None:
             _finish_engine_async(gb, mx)
         finally:
             gb._fk_engine_queue = []
+            gb._fk_engine_async_pending = None
+            gb.__dict__.pop("_fk_seeded_first_tokens", None)
+            gb.__dict__.pop("_fk_seeded_first_logprobs", None)
+            if len(getattr(gb, "uids", []) or []) == 0:
+                # The final visible token may have already submitted the next
+                # pipelined decode.  Draining that work writes _next_tokens even
+                # though GenerationBatch.filter([]) has made the batch idle, so
+                # restore the same empty state mlx-lm expects before reuse.
+                gb._next_tokens = None
+                gb._next_logprobs = []
+                gb._current_tokens = None
+                gb._current_logprobs = []
+
+    def _reset_idle_engine_fast_state(batch_generator: Any) -> None:
+        """Clear stale fast-token state before a new request enters an idle engine."""
+        if batch_generator is None:
+            return
+        try:
+            generation_batch = getattr(batch_generator, "_generation_batch", None)
+            prompt_batch = getattr(batch_generator, "_prompt_batch", None)
+            if generation_batch is None:
+                return
+            if len(getattr(generation_batch, "uids", []) or []) != 0:
+                return
+            if prompt_batch is not None and len(getattr(prompt_batch, "uids", []) or []) != 0:
+                return
+            generation_batch._fk_engine_queue = []
+            generation_batch._fk_engine_async_pending = None
+            generation_batch._next_tokens = None
+            generation_batch._next_logprobs = []
+            generation_batch._current_tokens = None
+            generation_batch._current_logprobs = []
+            generation_batch.__dict__.pop("_fk_seeded_first_tokens", None)
+            generation_batch.__dict__.pop("_fk_seeded_first_logprobs", None)
+            model = getattr(batch_generator, "model", None)
+            if model is not None:
+                model.__dict__.pop("_fk_last_argmax_tokens", None)
+                model.__dict__.pop("_fk_mtp_split_tokens_trusted", None)
+            inner = getattr(model, "_fk_original", None)
+            if inner is not None:
+                inner.__dict__.pop("_fk_last_argmax_tokens", None)
+                inner.__dict__.pop("_fk_mtp_split_tokens_trusted", None)
+                inner.__dict__.pop("_fk_lm", None)
+            dispatcher = getattr(model, "_fk_dispatcher", None)
+            if dispatcher is not None:
+                dispatcher._cache_sig = None
+                dispatcher._icb_id = None
+        except Exception:
+            return
 
     def _ensure_engine_full_capacity(self, remaining: int) -> tuple[bool, str | None, bool]:
         offset = _engine_cache_offset(self.prompt_cache)
@@ -3884,12 +4042,7 @@ def _wrap_generation_batch(module) -> None:
                 self._fk_engine_chunk_miss_debug = n + 1
             return False
 
-        # BatchKVCache exposes a batched state surface that does not yet match
-        # the direct generate_step chunk path. Keep chunk precompute disabled
-        # until its state binding is proven by text-level correctness.
-        if _is_omlx_step_style():
-            return miss("omlx_step_style")
-        if not _env_flag("FUSEKIT_ENABLE_ENGINE_CHUNK"):
+        if _env_flag("FUSEKIT_DISABLE_ENGINE_CHUNK"):
             return miss("disabled")
         if not _stopless(self):
             return miss("not_stopless")
@@ -3923,7 +4076,10 @@ def _wrap_generation_batch(module) -> None:
         capacity = _cache_capacity(self.prompt_cache)
         if capacity is None:
             return miss("capacity_none")
-        if capacity is None or offset + chunk > capacity:
+        if capacity is None:
+            return miss("capacity_none")
+        chunk = min(chunk, max(0, int(capacity) - int(offset)))
+        if chunk <= 1:
             return miss(f"capacity_guard offset={offset} chunk={chunk} capacity={capacity}")
         chunk_cap = int(fk.get("chunk_capacity", chunk_cap) or chunk_cap)
 
@@ -4006,10 +4162,26 @@ def _wrap_generation_batch(module) -> None:
                 flush=True,
             )
         _engine_set_cache_offset(self.prompt_cache, offset + chunk)
-        self._next_tokens = mx.array([history[0]], dtype=inputs.dtype)
+        self._next_tokens = mx.array([history[0]], dtype=mx.uint32)
         self._next_logprobs = [None]
         self._fk_engine_queue = history[1:]
         return True
+
+    def _engine_prefers_chunk_first(self) -> bool:
+        if (
+            _env_flag("FUSEKIT_FORCE_ENGINE_CHUNK")
+            or "FUSEKIT_ENGINE_CHUNK_MODE" in os.environ
+            or _env_flag("FUSEKIT_ENGINE_ALLOW_LONG_GPU_CHAIN")
+        ):
+            return True
+        model = self.model
+        inner = getattr(model, "_fk_original", None)
+        fk = getattr(inner, "_fk_lm", None) if inner is not None else None
+        if not isinstance(fk, dict) or not bool(fk.get("dense_bf16")):
+            return False
+        hidden = int(fk.get("hidden_size", 0) or 0)
+        vocab = int(fk.get("vocab_size", 0) or 0)
+        return hidden >= 4096 and vocab >= 200_000
 
     def _engine_profile_points() -> set[int]:
         raw = os.environ.get("FUSEKIT_PROFILE_KERNELS_AT", "")
@@ -4082,10 +4254,12 @@ def _wrap_generation_batch(module) -> None:
         finally:
             restore_direct()
 
-        dispatches = getattr(dispatcher, "_last_dispatches", None)
-        if fk is not None and "next_token_view" in fk and dispatches:
-            next_token = int(fk["next_token_view"][0])
-            self._next_tokens = mx.array([next_token], dtype=inputs.dtype)
+        argmax_tokens = getattr(model, "_fk_last_argmax_tokens", None)
+        if argmax_tokens is None:
+            argmax_tokens = getattr(inner, "_fk_last_argmax_tokens", None)
+        if argmax_tokens is not None:
+            next_token = int(mx.array(argmax_tokens).reshape(-1)[0].item())
+            self._next_tokens = mx.array([next_token], dtype=mx.uint32)
         else:
             if isinstance(logits, tuple):
                 logits = logits[0]
@@ -4161,60 +4335,95 @@ def _wrap_generation_batch(module) -> None:
         model = self.model
         inner = model._fk_original
 
+        cache_offset = _engine_cache_offset(self.prompt_cache)
+        cache_capacity = _cache_capacity(self.prompt_cache)
+        if (
+            cache_offset is not None
+            and cache_capacity is not None
+            and int(cache_offset) >= int(cache_capacity)
+        ):
+            return original_step(self)
+
         self._current_tokens = self._next_tokens
         self._current_logprobs = self._next_logprobs
         inputs = self._current_tokens
 
         if not _serve_engine_queue(self, inputs, mx):
-            if not _run_engine_profile_step(self, inputs, mx) and not _run_engine_chunk(self, inputs, mx):
-                if not _submit_engine_async(self, inputs):
-                    # Calls FusekitWrapper.__call__, which advances the live
-                    # cache by one token and writes the next greedy token into
-                    # `next_token_out`.
-                    remaining = int(self.max_tokens[0]) - int(self._num_tokens[0])
-                    ok, reason, _capacity_changed = _ensure_engine_full_capacity(
-                        self, remaining
+            profiled = _run_engine_profile_step(self, inputs, mx)
+            ran_fast_step = profiled
+            if not ran_fast_step:
+                chunk_first = _engine_prefers_chunk_first(self)
+                if chunk_first:
+                    ran_fast_step = _run_engine_chunk(self, inputs, mx) or _submit_engine_async(
+                        self, inputs
                     )
-                    if not ok and _env_flag("FUSEKIT_STRICT_DISPATCH"):
-                        raise RuntimeError(
-                            "fusekit: engine fallback cannot guarantee KV cache "
-                            f"capacity ({reason})"
-                        )
-                    direct_head = (
-                        getattr(inner, "_fk_lm", None) is not None
-                        and _engine_direct_head_argmax_enabled(self)
+                else:
+                    ran_fast_step = _submit_engine_async(self, inputs) or _run_engine_chunk(
+                        self, inputs, mx
                     )
-                    if os.environ.get("FUSEKIT_DBG_ENGINE_DIRECT"):
+            if not ran_fast_step:
+                # Calls FusekitWrapper.__call__, which advances the live
+                # cache by one token and writes the next greedy token into
+                # `next_token_out`.
+                remaining = int(self.max_tokens[0]) - int(self._num_tokens[0])
+                ok, reason, _capacity_changed = _ensure_engine_full_capacity(
+                    self, remaining
+                )
+                if not ok and _env_flag("FUSEKIT_STRICT_DISPATCH"):
+                    raise RuntimeError(
+                        "fusekit: engine fallback cannot guarantee KV cache "
+                        f"capacity ({reason})"
+                    )
+                direct_head = (
+                    getattr(inner, "_fk_lm", None) is not None
+                    and _engine_direct_head_argmax_enabled(self)
+                )
+                if os.environ.get("FUSEKIT_DBG_ENGINE_DIRECT"):
+                    print(
+                        "[fusekit-engine-direct] "
+                        f"enabled={direct_head} "
+                        f"skip_attr={getattr(self, '_fk_skip_logprobs', None)!r} "
+                        f"skip_current={_ENGINE_SKIP_LOGPROBS_CURRENT_STEP!r} "
+                        f"has_fk={getattr(inner, '_fk_lm', None) is not None} "
+                        f"native={getattr(model, '_fk_native_handle', None) is not None}",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                restore_direct = _direct_head_argmax_scope(model, direct_head)
+                try:
+                    logits = model(inputs[:, None], cache=self.prompt_cache)
+                finally:
+                    restore_direct()
+                fk = getattr(inner, "_fk_lm", None)
+                argmax_tokens = getattr(model, "_fk_last_argmax_tokens", None)
+                if argmax_tokens is None:
+                    argmax_tokens = getattr(inner, "_fk_last_argmax_tokens", None)
+                if argmax_tokens is not None:
+                    next_token = int(mx.array(argmax_tokens).reshape(-1)[0].item())
+                    if os.environ.get("FUSEKIT_DBG_RESPONSE_TOKENS"):
                         print(
-                            "[fusekit-engine-direct] "
-                            f"enabled={direct_head} "
-                            f"skip_attr={getattr(self, '_fk_skip_logprobs', None)!r} "
-                            f"skip_current={_ENGINE_SKIP_LOGPROBS_CURRENT_STEP!r} "
-                            f"has_fk={getattr(inner, '_fk_lm', None) is not None} "
-                            f"native={getattr(model, '_fk_native_handle', None) is not None}",
+                            "[fusekit-step-token] "
+                            f"input={int(inputs.item()) if getattr(inputs, 'size', 0) == 1 else inputs.tolist()} "
+                            f"next={next_token} source=fk_argmax",
                             file=sys.stderr,
                             flush=True,
                         )
-                    restore_direct = _direct_head_argmax_scope(
-                        model, direct_head
-                    )
-                    try:
-                        logits = model(inputs[:, None], cache=self.prompt_cache)
-                    finally:
-                        restore_direct()
-                    fk = getattr(inner, "_fk_lm", None)
-                    dispatcher = getattr(model, "_fk_dispatcher", None)
-                    dispatches = getattr(dispatcher, "_last_dispatches", None)
-                    if fk is not None and "next_token_view" in fk and dispatches:
-                        next_token = int(fk["next_token_view"][0])
-                        self._next_tokens = mx.array([next_token], dtype=inputs.dtype)
-                    else:
-                        if isinstance(logits, tuple):
-                            logits = logits[0]
-                        next_token = mx.argmax(logits[:, -1, :], axis=-1).astype(inputs.dtype)
-                        mx.eval(next_token)
-                        self._next_tokens = next_token
-                    self._next_logprobs = [None]
+                    self._next_tokens = mx.array([next_token], dtype=mx.uint32)
+                else:
+                    if isinstance(logits, tuple):
+                        logits = logits[0]
+                    next_token = mx.argmax(logits[:, -1, :], axis=-1).astype(inputs.dtype)
+                    mx.eval(next_token)
+                    if os.environ.get("FUSEKIT_DBG_RESPONSE_TOKENS"):
+                        print(
+                            "[fusekit-step-token] "
+                            f"input={int(inputs.item()) if getattr(inputs, 'size', 0) == 1 else inputs.tolist()} "
+                            f"next={int(next_token.item()) if getattr(next_token, 'size', 0) == 1 else next_token.tolist()} source=mlx",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    self._next_tokens = next_token
+                self._next_logprobs = [None]
 
         # Match the original contract: return the token generated by the
         # previous step and append it to the per-sequence token history.
@@ -4254,6 +4463,7 @@ def _wrap_generation_batch(module) -> None:
         return result
 
     def _patched_next(self):
+        mx = __import__("mlx.core", fromlist=["core"])
         seeded_tokens = getattr(self, "_fk_seeded_first_tokens", None)
         if (
             original_next is None
@@ -4305,6 +4515,15 @@ def _wrap_generation_batch(module) -> None:
 
         self.__dict__.pop("_fk_seeded_first_tokens", None)
         self.__dict__.pop("_fk_seeded_first_logprobs", None)
+        if keep:
+            # The seeded first token is returned without calling the normal
+            # GenerationBatch._step path. Seed the next decode step explicitly;
+            # otherwise a reused oMLX engine can carry a stale `next_token_out`
+            # from the previous request into the new request.
+            self._next_tokens = mx.array(
+                [int(seeded_tokens[i]) for i in keep], dtype=mx.uint32
+            )
+            self._next_logprobs = [None for _ in keep]
         if len(keep) < len(self.uids) and original_filter is not None:
             original_filter(self, keep)
         return responses
@@ -4326,7 +4545,7 @@ def _wrap_generation_batch(module) -> None:
         return generation
 
     def _patched_next_generated(self):
-        engine_limit = _engine_drain_limit()
+        engine_limit = _engine_drain_limit(self)
         mtp_limit = _mtp_queue_drain_limit()
         if original_next_generated is None:
             return original_next_generated(self)
@@ -4373,6 +4592,7 @@ def _wrap_generation_batch(module) -> None:
                     if any(getattr(r, "finish_reason", None) is not None for r in more):
                         break
 
+            engine_limit = max(engine_limit, _engine_drain_limit(self))
             # Only drain already queued FuseKit chunk tokens. Do not start
             # another GPU chunk inside the same scheduler tick; the next tick
             # can seed it through the normal GenerationBatch.next contract.
@@ -4400,7 +4620,21 @@ def _wrap_generation_batch(module) -> None:
                 )
             if any(getattr(r, "finish_reason", None) is not None for r in responses):
                 _drain_engine_fast_state(getattr(self, "_generation_batch", None), mx)
+            if os.environ.get("FUSEKIT_DBG_RESPONSE_TOKENS"):
+                gb = getattr(self, "_generation_batch", None)
+                print(
+                    "[fusekit-responses] "
+                    f"uids={list(getattr(gb, 'uids', []) or []) if gb is not None else None} "
+                    f"tokens={[int(getattr(r, 'token', -1)) for r in responses]} "
+                    f"finish={[getattr(r, 'finish_reason', None) for r in responses]}",
+                    file=sys.stderr,
+                    flush=True,
+                )
             return responses
+
+    def _patched_insert_segments(self, *args, **kwargs):
+        _reset_idle_engine_fast_state(self)
+        return original_insert_segments(self, *args, **kwargs)
 
     cls._step = _patched_step
     if original_next is not None:
@@ -4415,6 +4649,8 @@ def _wrap_generation_batch(module) -> None:
         prompt_cls._fk_full_prefill_seed_patched = True
     if batch_cls is not None and original_next_generated is not None:
         batch_cls.next_generated = _patched_next_generated
+    if batch_cls is not None and original_insert_segments is not None:
+        batch_cls.insert_segments = _patched_insert_segments
     cls._fk_engine_fast_patched = True
 
 
@@ -4440,6 +4676,7 @@ def _wrap_omlx_scheduler(module) -> None:
         def _patched_external_prefill(self, *args, **kwargs):
             global _ENGINE_EXTERNAL_PREFILL_NO_LOGITS_CURRENT
             model = getattr(self, "model", None)
+            _reset_idle_engine_fast_state(getattr(self, "batch_generator", None))
             active = (
                 getattr(model, "_fk_original", None) is not None
                 and not _env_flag("FUSEKIT_DISABLE_ENGINE_PREFILL_NO_LOGITS")
@@ -4571,12 +4808,24 @@ def _fast_generate_step(prompt, model, inner, kw, _orig):
         )
         yield from _orig(prompt, model, **kw)
         return
+    p = prompt.reshape(-1) if getattr(prompt, "ndim", 1) != 1 else prompt
+    total_prompt_tokens = len(p)
+    requested_max_kv_size = kw.get("max_kv_size")
+    try:
+        required_max_kv_size = int(total_prompt_tokens) + int(max_tokens)
+    except Exception:
+        required_max_kv_size = None
+    if required_max_kv_size is not None:
+        if requested_max_kv_size is None:
+            requested_max_kv_size = required_max_kv_size
+        else:
+            requested_max_kv_size = max(int(requested_max_kv_size), required_max_kv_size)
     prompt_cache = None
     try:
         from mlx_lm.models import cache as _cache_mod
         from mlx_lm.generate import maybe_quantize_kv_cache
         prompt_cache = _cache_mod.make_prompt_cache(
-            model, max_kv_size=kw.get("max_kv_size"))
+            model, max_kv_size=requested_max_kv_size)
     except Exception as e:
         warnings.warn(
             f"fusekit: prompt cache construction failed ({e}); "
@@ -4595,8 +4844,6 @@ def _fast_generate_step(prompt, model, inner, kw, _orig):
     # except the final one, then run the final prompt token through the
     # normal decode step. Full-prompt prefill produces a different KV
     # state for some RoPE/cache paths and can drift later in generation.
-    p = prompt.reshape(-1) if getattr(prompt, "ndim", 1) != 1 else prompt
-    total_prompt_tokens = len(p)
     prompt_progress_callback = kw.get("prompt_progress_callback") or (lambda *_: None)
     prefill_step_size = kw.get("prefill_step_size", 2048)
     try:
@@ -4734,16 +4981,26 @@ def _fast_generate_step(prompt, model, inner, kw, _orig):
     capacity = _cache_capacity(prompt_cache)
     step_offset = _cache_offset(prompt_cache)
     remaining = max_tokens - n
-    if capacity is None or step_offset is None or step_offset + remaining > capacity:
+    if capacity is None or step_offset is None:
         msg = (
-            "fusekit: fast path KV capacity changed after bootstrap "
+            "fusekit: fast path KV capacity unavailable after bootstrap "
             f"(offset={step_offset}, remaining={remaining}, capacity={capacity}); "
             "falling back to mlx-lm."
         )
         if _env_flag("FUSEKIT_STRICT_DISPATCH"):
             raise RuntimeError(msg)
         warnings.warn(msg)
-        yield from _orig(prompt[:0], model, **{**kw, "max_tokens": max_tokens - n})
+        # Bootstrap already consumed the first generated token into
+        # `prompt_cache` and left the next token in `token` with logits in
+        # `last_logits_arr`. Preserve the stream instead of asking mlx-lm to
+        # continue from an empty prompt, which raises on recent mlx-lm.
+        yield token, last_logits_arr
+        n += 1
+        if n >= max_tokens:
+            return
+        fallback_prompt = mx.array([token], dtype=mx.uint32)
+        fallback_kw = {**kw, "prompt_cache": prompt_cache, "max_tokens": max_tokens - n}
+        yield from _orig(fallback_prompt, model, **fallback_kw)
         return
 
     ctypes.c_uint32.from_address(capacity_ptr).value = capacity
@@ -4758,6 +5015,26 @@ def _fast_generate_step(prompt, model, inner, kw, _orig):
                 pass
 
     while n < max_tokens:
+        if step_offset >= capacity:
+            if n + 1 >= max_tokens:
+                yield token, last_logits_arr
+                return
+            msg = (
+                "fusekit: fast path reached physical KV capacity "
+                f"(offset={step_offset}, capacity={capacity}); "
+                "continuing tail with mlx-lm."
+            )
+            if _env_flag("FUSEKIT_STRICT_DISPATCH"):
+                raise RuntimeError(msg)
+            warnings.warn(msg)
+            yield token, last_logits_arr
+            n += 1
+            if n >= max_tokens:
+                return
+            fallback_prompt = mx.array([token], dtype=mx.uint32)
+            fallback_kw = {**kw, "prompt_cache": prompt_cache, "max_tokens": max_tokens - n}
+            yield from _orig(fallback_prompt, model, **fallback_kw)
+            return
         if n in profile_at:
             dispatcher = getattr(model, "_fk_dispatcher", None)
             if dispatcher is not None:
@@ -4796,6 +5073,7 @@ def _fast_generate_step(prompt, model, inner, kw, _orig):
                 )
 
         chunk = min(CHUNK, max_tokens - n)
+        chunk = min(chunk, max(1, capacity - step_offset))
         if profile_at:
             future_profile_points = [p for p in profile_at if n < p < n + chunk]
             if future_profile_points:
@@ -4951,4 +5229,5 @@ def install_hook() -> None:
 
 
 # Auto-install on import. Safe because all the work is idempotent.
+_install_gemma4_shared_kv_weight_filter()
 install_hook()

@@ -9,7 +9,13 @@ import re
 import subprocess
 from pathlib import Path
 
-from bench_omlx_engine_suite import DEFAULT_MODELS, PYTHON, PYTHONPATH, label
+from bench_omlx_engine_suite import (
+    DEFAULT_MODELS,
+    PYTHON,
+    PYTHONPATH,
+    WORKSPACE,
+    label,
+)
 
 
 TEXT_RE = re.compile(r"\[engine:run:0\] text=(.*)")
@@ -93,7 +99,7 @@ def main() -> int:
     parser.add_argument(
         "--workspace",
         type=Path,
-        default=Path("/Users/pribess/Documents/workspace/fusekit"),
+        default=WORKSPACE,
     )
     parser.add_argument("--tokens", type=int, default=16)
     parser.add_argument("--prompt", default="x")

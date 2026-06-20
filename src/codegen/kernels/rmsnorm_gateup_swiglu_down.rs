@@ -98,7 +98,7 @@ pub fn emit(
     w.line("acc_u += ny * float(W_up[i * HIDDEN + kx]);");
     w.pop_indent();
     w.line("}");
-    w.line("silu_up[i] = acc_g / (1.0f + exp(-acc_g)) * acc_u;");
+    w.line("silu_up[i] = acc_g / (1.0f + metal::fast::exp(-acc_g)) * acc_u;");
     w.pop_indent();
     w.line("}");
     w.line("threadgroup_barrier(mem_flags::mem_threadgroup);");

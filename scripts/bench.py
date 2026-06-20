@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import os
 import time
+from importlib.metadata import PackageNotFoundError, version
 
 import mlx.core as mx
 from mlx_lm import load
@@ -52,7 +53,22 @@ def main() -> int:
         help="Synchronize MLX before status timing; useful for profiling, not normal bench.",
     )
     args = parser.parse_args()
+    if args.tokens < 1 or args.repeat < 1 or args.prompt_repeat < 1:
+        parser.error("--tokens, --repeat, and --prompt-repeat must be >= 1")
+    if args.kv_group_size < 1:
+        parser.error("--kv-group-size must be >= 1")
 
+    def package_version(name: str) -> str:
+        try:
+            return version(name)
+        except PackageNotFoundError:
+            return "unknown"
+
+    print(
+        f"[bench] mlx={package_version('mlx')} "
+        f"mlx_lm={package_version('mlx-lm')}",
+        flush=True,
+    )
     print(
         "[bench] "
         f"hook_disable={os.environ.get('FUSEKIT_DISABLE_HOOK', '')!r} "

@@ -7,8 +7,10 @@ __pycache__/
 *.air
 .DS_Store
 
-# Local benchmark/profiling artifacts.
+# Local benchmark, release, and profiling artifacts.
 .artifacts/
+benchmark-results/
+dist/
 .pycache-check/
 trace_runs/
 crash

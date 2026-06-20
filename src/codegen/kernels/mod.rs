@@ -23,7 +23,7 @@
 use anyhow::Result;
 
 use crate::codegen::msl::MslWriter;
-use crate::fusion::ir::{ChainOperand, Fusion, FusionAttrs, FusionKind, ModelMeta};
+use crate::fusion::ir::{ChainOperand, ChainStep, Fusion, FusionAttrs, FusionKind, ModelMeta};
 use crate::graph::Dtype;
 use crate::task::ir::PartitionPlan;
 
@@ -92,15 +92,9 @@ pub fn qmv_m_qdot_default(bits: u32) -> bool {
 }
 
 pub fn qmv_fast_qdot_default(bits: u32) -> bool {
-    // This is the shared default for standalone/fused qMV helper kernels.
-    // It is selected from quant metadata, not model names. q4 stays explicit
-    // because fused-chain decode profiles show the qdot affine regrouping
-    // increases live ranges there; q8 keeps qdot for the helper kernels.
-    match bits {
-        4 => false,
-        5 | 6 | 8 => true,
-        _ => true,
-    }
+    // q4 qdot has repeatedly matched forced-prefix correctness but failed to
+    // hold an L512 wall win on Gemma4; keep the explicit q4 body by default.
+    matches!(bits, 8)
 }
 
 pub fn qmv_fast_residual_qdot_default(bits: u32) -> bool {
@@ -160,12 +154,48 @@ pub fn qmv_fast_packs_per_thread(bits: u32) -> Option<u32> {
     )
 }
 
+pub fn rmsnorm_rsqrt_fn() -> &'static str {
+    match std::env::var("FUSEKIT_RMSNORM_FAST_RSQRT").as_deref() {
+        Ok("1") | Ok("true") | Ok("on") | Ok("yes") => "metal::fast::rsqrt",
+        _ => "metal::precise::rsqrt",
+    }
+}
+
+pub fn qmv_wide_params(
+    active_rows: u64,
+    bits: u32,
+    group_size: u32,
+    k_dim: u32,
+    _out_dim: u32,
+) -> Option<(u32, u32, u32)> {
+    if env_bool_off("FUSEKIT_QMM_MLX_QMV_WIDE") {
+        return None;
+    }
+    if active_rows < 2 || active_rows > 10 || group_size != 64 || !matches!(bits, 4 | 8) {
+        return None;
+    }
+    if k_dim % group_size != 0 {
+        return None;
+    }
+    let m = active_rows.min(u32::MAX as u64) as u32;
+    let n_tiles = (m + 4) / 5;
+    let vecs_per_tg = ((m + n_tiles - 1) / n_tiles).clamp(2, 5);
+    let k_lanes = 8;
+    let rows_per_tg = (32 / k_lanes) * 2;
+    Some((vecs_per_tg, k_lanes, rows_per_tg))
+}
+
 pub fn mtp_token_m_qgemv_enabled() -> bool {
     !env_bool_off("FUSEKIT_MTP_TOKEN2_QGEMV")
 }
 
 pub fn mtp_token_m_reduction_fanout_enabled() -> bool {
     !env_bool_off("FUSEKIT_MTP_TOKEN2_REDUCTION_FANOUT")
+}
+
+pub fn token_m_reduction_fanout_enabled() -> bool {
+    !env_bool_off("FUSEKIT_TOKEN_M_REDUCTION_FANOUT")
+        && !env_bool_off("FUSEKIT_MTP_TOKEN2_REDUCTION_FANOUT")
 }
 
 pub fn qmv_fanout_pair2_compatible(
@@ -842,13 +872,28 @@ pub fn qmv_fast_simdgroups(active_rows: u64, bits: u32, k_dim: u32, out_dim: u32
         .ok()
         .and_then(|s| s.trim().parse::<u32>().ok())
         .filter(|&n| (1..=8).contains(&n));
-    let sgs = parsed.unwrap_or(2).max(1);
-    let cols = sgs.saturating_mul(4).max(1);
-    let _ = (active_rows, bits, k_dim);
-    if out_dim.is_multiple_of(cols) {
-        sgs
+    let default_sgs = if matches!(crate::target::current_chip(), crate::target::ChipModel::M5)
+        && bits == 4
+        && active_rows <= 1
+        && k_dim >= 2048
+        && out_dim >= 8192
+    {
+        // 4B-class q4 single-row qMV is weight-streaming dominated; M5
+        // late-token profiles favor four simdgroups per TG for standalone
+        // projection rows. Fanout chains keep their own policy.
+        4
     } else {
         2
+    };
+    let sgs = parsed.unwrap_or(default_sgs).max(1);
+    let cols_per_sg = qmv_fast_cols_per_simdgroup(active_rows, bits, k_dim, out_dim);
+    let cols = sgs.saturating_mul(cols_per_sg).max(1);
+    if out_dim.is_multiple_of(cols) {
+        sgs
+    } else if out_dim.is_multiple_of(2u32.saturating_mul(cols_per_sg).max(1)) {
+        2
+    } else {
+        1
     }
 }
 
@@ -1006,6 +1051,308 @@ pub fn qmv_fast_cols_per_threadgroup(active_rows: u64, bits: u32, k_dim: u32, ou
         * qmv_fast_cols_per_simdgroup(active_rows, bits, k_dim, out_dim)
 }
 
+pub fn routed_qmv_reduce_routes_per_token(fusion: &Fusion) -> Option<u32> {
+    if !matches!(fusion.kind, FusionKind::RoutedQmvReduce) {
+        return None;
+    }
+    let x_shape = fusion.inputs.first().map(|b| b.shape.as_slice())?;
+    if x_shape.len() < 3 {
+        return None;
+    }
+    Some(
+        x_shape[2..x_shape.len().saturating_sub(1)]
+            .iter()
+            .copied()
+            .filter(|&d| d > 0)
+            .product::<i32>()
+            .max(1) as u32,
+    )
+}
+
+pub fn routed_qmv_swiglu_fast_shape(fusion: &Fusion) -> Option<(u32, u32, u64, u32, u32)> {
+    if std::env::var("FUSEKIT_ROUTED_SWIGLU_FAST").as_deref() != Ok("1") {
+        return None;
+    }
+    let FusionAttrs::RoutedQmvSwiglu { gate, up, .. } = &fusion.attrs else {
+        return None;
+    };
+    if gate.k_dim != up.k_dim
+        || gate.out_dim != up.out_dim
+        || gate.bits != up.bits
+        || gate.group_size != up.group_size
+        || gate.group_size != 64
+        || !matches!(gate.bits, 4 | 8)
+    {
+        return None;
+    }
+    let shape = fusion.outputs.first().map(|b| b.shape.as_slice())?;
+    let routes_per_token = if shape.len() >= 3 {
+        shape[2..shape.len().saturating_sub(1)]
+            .iter()
+            .map(|&d| d.max(0) as u64)
+            .product::<u64>()
+            .max(1)
+    } else {
+        1
+    };
+    let active_tokens = crate::target::current_chip().active_tokens_for_shape(shape) as u64;
+    let active_routes = active_tokens.saturating_mul(routes_per_token).max(1);
+    if !qmv_fast_shape_is_tail_free(gate.k_dim, gate.out_dim, 1, gate.bits) {
+        return None;
+    }
+    Some((
+        gate.k_dim,
+        gate.out_dim,
+        active_routes,
+        gate.bits,
+        gate.group_size,
+    ))
+}
+
+pub fn routed_qmv_reduce_cols_per_simdgroup(fusion: &Fusion) -> Option<u32> {
+    if !matches!(fusion.kind, FusionKind::RoutedQmvReduce) {
+        return None;
+    }
+    let FusionAttrs::RoutedQmvReduce { target, .. } = &fusion.attrs else {
+        return None;
+    };
+    let x_shape = fusion.inputs.first().map(|b| b.shape.as_slice())?;
+    if x_shape.len() < 3 {
+        return None;
+    }
+    let top_k = x_shape[2..x_shape.len().saturating_sub(1)]
+        .iter()
+        .copied()
+        .filter(|&d| d > 0)
+        .product::<i32>()
+        .max(1) as u32;
+    Some(
+        crate::target::current_chip().routed_reduce_cols_per_simdgroup(
+            target.bits,
+            target.k_dim,
+            target.out_dim,
+            top_k,
+        ),
+    )
+}
+
+pub fn routed_qmv_reduce_fold_routes(fusion: &Fusion) -> bool {
+    if !matches!(fusion.kind, FusionKind::RoutedQmvReduce) {
+        return false;
+    }
+    if matches!(
+        &fusion.attrs,
+        FusionAttrs::RoutedQmvReduce {
+            residual_linear: Some(_),
+            ..
+        }
+    ) {
+        return false;
+    }
+    if let Ok(s) = std::env::var("FUSEKIT_ROUTED_REDUCE_FOLD") {
+        let s = s.trim().to_ascii_lowercase();
+        return matches!(s.as_str(), "1" | "true" | "yes" | "on");
+    }
+    false
+}
+
+pub fn gather_qmm_reduce_routes_per_token(fusion: &Fusion) -> Option<u32> {
+    if !matches!(&fusion.kind, FusionKind::Single(name) if name == "GatherQMMReduce") {
+        return None;
+    }
+    let x_shape = fusion.inputs.first().map(|b| b.shape.as_slice())?;
+    if x_shape.len() < 3 {
+        return None;
+    }
+    Some(
+        x_shape[2..x_shape.len().saturating_sub(1)]
+            .iter()
+            .copied()
+            .filter(|&d| d > 0)
+            .product::<i32>()
+            .max(1) as u32,
+    )
+}
+
+pub fn gather_qmm_reduce_has_residual_linear(fusion: &Fusion) -> bool {
+    if !matches!(&fusion.kind, FusionKind::Single(name) if name == "GatherQMMReduce") {
+        return false;
+    }
+    let has_route_weight = fusion
+        .inputs
+        .get(6)
+        .is_some_and(|b| b.role == "route_weight");
+    let shared_base = if has_route_weight { 7 } else { 6 };
+    fusion
+        .inputs
+        .get(shared_base)
+        .is_some_and(|b| b.role == "shared_x")
+}
+
+pub fn gather_qmm_reduce_simdgroups_per_tg(fusion: &Fusion) -> Option<u32> {
+    let routes = gather_qmm_reduce_routes_per_token(fusion)?;
+    Some(routes.saturating_add(u32::from(gather_qmm_reduce_has_residual_linear(fusion))))
+}
+
+pub fn gather_qmm_reduce_cols_per_simdgroup(fusion: &Fusion) -> Option<u32> {
+    if !matches!(&fusion.kind, FusionKind::Single(name) if name == "GatherQMMReduce") {
+        return None;
+    }
+    let x_shape = fusion.inputs.first().map(|b| b.shape.as_slice())?;
+    let w_shape = fusion.inputs.get(1).map(|b| b.shape.as_slice())?;
+    let s_shape = fusion.inputs.get(2).map(|b| b.shape.as_slice())?;
+    if x_shape.is_empty() || w_shape.len() != 3 || s_shape.len() != 3 {
+        return None;
+    }
+    let k_dim = x_shape.last().copied().unwrap_or(1).max(1) as u32;
+    let out_dim = w_shape[1].max(1) as u32;
+    let packed = w_shape[2].max(1) as u32;
+    let n_groups = s_shape[2].max(1) as u32;
+    let bits = ((packed * 32) / k_dim).max(1);
+    let group_size = (k_dim / n_groups).max(1);
+    let top_k = gather_qmm_reduce_routes_per_token(fusion)?;
+    if !matches!(bits, 4 | 8) || group_size == 0 {
+        return None;
+    }
+    Some(
+        crate::target::current_chip().routed_reduce_cols_per_simdgroup(bits, k_dim, out_dim, top_k),
+    )
+}
+
+pub fn fused_chain_gather_qmm_swiglu_shape(fusion: &Fusion) -> Option<(u32, u32, u64, u32, u32)> {
+    let FusionAttrs::FusedChain { steps, .. } = &fusion.attrs else {
+        return None;
+    };
+    if steps.len() != 5
+        || fusion.outputs.len() != 1
+        || steps[0].op_name != "GatherQMM"
+        || steps[1].op_name != "GatherQMM"
+        || steps[2].op_name != "Sigmoid"
+        || steps[3].op_name != "Multiply"
+        || steps[4].op_name != "Multiply"
+    {
+        return None;
+    }
+
+    let gather_target = |step: &ChainStep| -> Option<(u32, u32, u64, u32, u32)> {
+        if step.inputs.len() != 6 {
+            return None;
+        }
+        let ChainOperand::External {
+            buffer_index: x_buf,
+        } = step.inputs[0]
+        else {
+            return None;
+        };
+        let ChainOperand::External {
+            buffer_index: w_buf,
+        } = step.inputs[1]
+        else {
+            return None;
+        };
+        let ChainOperand::External {
+            buffer_index: s_buf,
+        } = step.inputs[2]
+        else {
+            return None;
+        };
+        let x_shape = fusion.inputs.get(x_buf as usize)?.shape.as_slice();
+        let w_shape = fusion.inputs.get(w_buf as usize)?.shape.as_slice();
+        let s_shape = fusion.inputs.get(s_buf as usize)?.shape.as_slice();
+        let out_shape = step.output_shape.as_slice();
+        if x_shape.is_empty() || w_shape.len() != 3 || s_shape.len() != 3 || out_shape.len() < 4 {
+            return None;
+        }
+        let k_dim = x_shape.last().copied().unwrap_or(0).max(1) as u32;
+        let out_dim = w_shape[1].max(1) as u32;
+        let packed = w_shape[2].max(1) as u32;
+        let n_groups = s_shape[2].max(1) as u32;
+        if out_shape.last().copied().unwrap_or(0).max(1) as u32 != out_dim
+            || packed == 0
+            || n_groups == 0
+            || !k_dim.is_multiple_of(n_groups)
+        {
+            return None;
+        }
+        let bits = ((packed * 32) / k_dim).max(1);
+        let group_size = (k_dim / n_groups).max(1);
+        if !matches!(bits, 4 | 8)
+            || group_size != 64
+            || packed.saturating_mul(32) != k_dim.saturating_mul(bits)
+        {
+            return None;
+        }
+        let active_tokens = crate::target::current_chip().active_tokens_for_shape(out_shape) as u64;
+        let routes_per_token = out_shape[2..out_shape.len().saturating_sub(1)]
+            .iter()
+            .map(|&d| d.max(1) as u64)
+            .product::<u64>()
+            .max(1);
+        Some((
+            k_dim,
+            out_dim,
+            active_tokens.saturating_mul(routes_per_token).max(1),
+            bits,
+            group_size,
+        ))
+    };
+
+    let gate = gather_target(&steps[0])?;
+    let up = gather_target(&steps[1])?;
+    if gate != up {
+        return None;
+    }
+    let same_external = |idx: usize| -> Option<bool> {
+        Some(steps[0].inputs.get(idx)? == steps[1].inputs.get(idx)?)
+    };
+    if same_external(0)? != true || same_external(4)? != true || same_external(5)? != true {
+        return None;
+    }
+
+    let sig_uses_gate = matches!(
+        steps[2].inputs.first(),
+        Some(ChainOperand::Register { step_index: 0 })
+    );
+    let mul_gate_uses_sig_gate = matches!(
+        (
+            steps[3].inputs.first().copied(),
+            steps[3].inputs.get(1).copied()
+        ),
+        (
+            Some(ChainOperand::Register { step_index: 2 }),
+            Some(ChainOperand::Register { step_index: 0 })
+        ) | (
+            Some(ChainOperand::Register { step_index: 0 }),
+            Some(ChainOperand::Register { step_index: 2 })
+        )
+    );
+    let mul_up_uses_prev_up = matches!(
+        (
+            steps[4].inputs.first().copied(),
+            steps[4].inputs.get(1).copied()
+        ),
+        (
+            Some(ChainOperand::Register { step_index: 3 }),
+            Some(ChainOperand::Register { step_index: 1 })
+        ) | (
+            Some(ChainOperand::Register { step_index: 1 }),
+            Some(ChainOperand::Register { step_index: 3 })
+        )
+    );
+    (sig_uses_gate && mul_gate_uses_sig_gate && mul_up_uses_prev_up).then_some(gate)
+}
+
+pub fn routed_qmv_swiglu_simdgroups_per_tg(target: &crate::target::Target) -> u32 {
+    if let Some(n) = std::env::var("FUSEKIT_ROUTED_SWIGLU_TG_SGS")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .filter(|&n| (1..=16).contains(&n))
+    {
+        return n;
+    }
+    target.chip.gatherqmm_simdgroups_per_tg()
+}
+
 pub fn qmv_fanout_fast_cols_per_threadgroup(
     active_rows: u64,
     bits: u32,
@@ -1125,6 +1472,87 @@ pub fn qmm_mlx_qmmt_shape(fusion: &Fusion) -> Option<(u32, u32, u64, u32, u32)> 
     Some((k_dim, out_dim, active_rows, *bits, *group_size))
 }
 
+pub fn gather_qmm_nax_shape(fusion: &Fusion) -> Option<(u32, u32, u64, u32, u32)> {
+    if std::env::var("FUSEKIT_GATHER_QMM_NAX").as_deref() != Ok("1") {
+        return None;
+    }
+    if fusion.inputs.len() < 6 || fusion.outputs.is_empty() {
+        return None;
+    }
+    let x_shape = fusion.inputs.first().map(|b| b.shape.as_slice())?;
+    let w_shape = fusion.inputs.get(1).map(|b| b.shape.as_slice())?;
+    let s_shape = fusion.inputs.get(2).map(|b| b.shape.as_slice())?;
+    let out_shape = fusion.outputs.first().map(|b| b.shape.as_slice())?;
+    if x_shape.is_empty() || w_shape.len() != 3 || s_shape.len() != 3 || out_shape.len() < 5 {
+        return None;
+    }
+    let k_dim = x_shape.last().copied().unwrap_or(0).max(1) as u32;
+    let out_dim = w_shape[1].max(1) as u32;
+    let packed = w_shape[2].max(1) as u32;
+    let n_groups = s_shape[2].max(1) as u32;
+    if out_shape.last().copied().unwrap_or(0).max(1) as u32 != out_dim {
+        return None;
+    }
+    if packed == 0 || n_groups == 0 || !k_dim.is_multiple_of(32) {
+        return None;
+    }
+    let bits = ((packed * 32) / k_dim).max(1);
+    let group_size = (k_dim / n_groups).max(1);
+    if group_size != 64 || !matches!(bits, 4 | 8) {
+        return None;
+    }
+    let active_tokens = crate::target::current_chip().active_tokens_for_shape(out_shape) as u64;
+    let routes_per_token = out_shape[2..out_shape.len().saturating_sub(1)]
+        .iter()
+        .map(|&d| d.max(0) as u64)
+        .product::<u64>()
+        .max(1);
+    let active_routes = active_tokens.saturating_mul(routes_per_token).max(1);
+    Some((k_dim, out_dim, active_routes, bits, group_size))
+}
+
+pub fn gather_qmm_mlx_qmv_shape(fusion: &Fusion) -> Option<(u32, u32, u64, u32, u32)> {
+    if std::env::var("FUSEKIT_GATHER_QMM_MLX_QMV").as_deref() != Ok("1") {
+        return None;
+    }
+    if fusion.inputs.len() < 6 || fusion.outputs.is_empty() {
+        return None;
+    }
+    let x_shape = fusion.inputs.first().map(|b| b.shape.as_slice())?;
+    let w_shape = fusion.inputs.get(1).map(|b| b.shape.as_slice())?;
+    let s_shape = fusion.inputs.get(2).map(|b| b.shape.as_slice())?;
+    let out_shape = fusion.outputs.first().map(|b| b.shape.as_slice())?;
+    if x_shape.is_empty() || w_shape.len() != 3 || s_shape.len() != 3 || out_shape.len() < 5 {
+        return None;
+    }
+    let k_dim = x_shape.last().copied().unwrap_or(0).max(1) as u32;
+    let out_dim = w_shape[1].max(1) as u32;
+    let packed = w_shape[2].max(1) as u32;
+    let n_groups = s_shape[2].max(1) as u32;
+    if out_shape.last().copied().unwrap_or(0).max(1) as u32 != out_dim {
+        return None;
+    }
+    if packed == 0 || n_groups == 0 {
+        return None;
+    }
+    let bits = ((packed * 32) / k_dim).max(1);
+    let group_size = (k_dim / n_groups).max(1);
+    if group_size != 64 || !matches!(bits, 4 | 8) {
+        return None;
+    }
+    if !qmv_fast_shape_is_tail_free(k_dim, out_dim, 1, bits) {
+        return None;
+    }
+    let active_tokens = crate::target::current_chip().active_tokens_for_shape(out_shape) as u64;
+    let routes_per_token = out_shape[2..out_shape.len().saturating_sub(1)]
+        .iter()
+        .map(|&d| d.max(0) as u64)
+        .product::<u64>()
+        .max(1);
+    let active_routes = active_tokens.saturating_mul(routes_per_token).max(1);
+    Some((k_dim, out_dim, active_routes, bits, group_size))
+}
+
 pub fn qmm_mlx_qmmt_tile(k_dim: u32, out_dim: u32, active_rows: u64, bits: u32) -> (u32, u32, u32) {
     if active_rows >= 128 && matches!(bits, 4 | 8) && k_dim >= 512 && out_dim >= 128 {
         // Full-prompt qMM is dominated by MLP gate/up/down weight
@@ -1202,7 +1630,26 @@ pub fn qmm_chain_mlx_qmv_fast_shape(fusion: &Fusion) -> Option<(u32, u32, u64, u
     let FusionAttrs::FusedChain { steps, .. } = &fusion.attrs else {
         reject!("not_fused_chain");
     };
-    if steps.len() != 1 {
+    let numel = |shape: &[i32]| -> i64 {
+        shape
+            .iter()
+            .map(|&d| i64::from(d.max(1)))
+            .product::<i64>()
+            .max(1)
+    };
+    let layout_only_tail = |steps: &[crate::fusion::ir::ChainStep]| -> bool {
+        if steps.len() <= 1 {
+            return true;
+        }
+        let elems = numel(&steps[0].output_shape);
+        steps.iter().skip(1).all(|s| {
+            matches!(
+                s.op_name.as_str(),
+                "Reshape" | "Squeeze" | "Unsqueeze" | "ExpandDims" | "Flatten"
+            ) && numel(&s.output_shape) == elems
+        })
+    };
+    if !layout_only_tail(steps) {
         reject!(format!("steps={}", steps.len()));
     }
     let step = &steps[0];
@@ -1236,21 +1683,27 @@ pub fn qmm_chain_mlx_qmv_fast_shape(fusion: &Fusion) -> Option<(u32, u32, u64, u
         .get(w_buf as usize)
         .map(|b| b.shape.as_slice())?;
     let out_shape = fusion.outputs.first().map(|b| b.shape.as_slice())?;
-    if x_shape.is_empty() || w_shape.len() != 2 || out_shape.is_empty() {
+    let qmm_out_shape = step.output_shape.as_slice();
+    if x_shape.is_empty() || w_shape.len() != 2 || out_shape.is_empty() || qmm_out_shape.is_empty()
+    {
         reject!(format!(
-            "ranks x={} w={} out={}",
+            "ranks x={} w={} qmm_out={} out={}",
             x_shape.len(),
             w_shape.len(),
+            qmm_out_shape.len(),
             out_shape.len()
         ));
     }
     let k_dim = x_shape.last().copied().unwrap_or(0).max(1) as u32;
     let out_dim = w_shape[0].max(1) as u32;
-    if out_shape.last().copied().unwrap_or(0).max(1) as u32 != out_dim {
-        return None;
+    if qmm_out_shape.last().copied().unwrap_or(0).max(1) as u32 != out_dim {
+        reject!("qmm_out_dim");
+    }
+    if numel(qmm_out_shape) != numel(out_shape) {
+        reject!("view_tail_numel");
     }
     let active_rows = crate::target::current_chip()
-        .active_rows_before_last(out_shape)
+        .active_rows_before_last(qmm_out_shape)
         .max(1);
     let pack_factor = match bits {
         3 | 5 => 8,
@@ -1503,11 +1956,11 @@ pub fn qgemv_unroll2_default_for_shape(bits: u32, input_dim: u32, output_dim: u3
         return false;
     }
     match bits {
-        // M5 q4 single-token decode loses more to live-value pressure than it
-        // gains from the 2-word qGEMV body once the surrounding semantic chain
-        // is fused. Keep q4 on the narrower loop; q8 still has enough memory
-        // work in flight to benefit on large projections.
-        4 => false,
+        // M5 q4 single-token decode is register-pressure sensitive on small
+        // projections, but large decode reductions have enough weight-stream
+        // work in flight for the two-word body to win. This is a shape policy
+        // for the qGEMV primitive, not a model-specific fusion rule.
+        4 => input_dim >= 2048 && output_dim >= 8192,
         // q8 explicit unpack wins on the 4B-class decode projections
         // where both axes are large enough to hide the extra live ranges.
         // Smaller q8 models keep the MLX qdot helper path; forcing the
@@ -1553,6 +2006,487 @@ pub fn emit_int4_gemv_inner<F: Fn(&str) -> String>(
     );
 }
 
+pub fn emit_int4_gemv_inner_pair<F: Fn(&str) -> String>(
+    w: &mut MslWriter,
+    acc_a: &str,
+    acc_b: &str,
+    w_a_packed_row: &str,
+    w_a_scales_row: &str,
+    w_a_biases_row: &str,
+    w_b_packed_row: &str,
+    w_b_scales_row: &str,
+    w_b_biases_row: &str,
+    m_const: &str,
+    bits: u32,
+    group_size: u32,
+    x_expr: F,
+) {
+    let lanes_per_word = 32 / bits;
+    if !matches!(bits, 4 | 8) || lanes_per_word == 0 {
+        emit_int4_gemv_inner(
+            w,
+            acc_a,
+            w_a_packed_row,
+            w_a_scales_row,
+            w_a_biases_row,
+            m_const,
+            bits,
+            group_size,
+            |off| x_expr(off),
+        );
+        emit_int4_gemv_inner(
+            w,
+            acc_b,
+            w_b_packed_row,
+            w_b_scales_row,
+            w_b_biases_row,
+            m_const,
+            bits,
+            group_size,
+            |off| x_expr(off),
+        );
+        return;
+    }
+    let qgroup_words = if group_size > 0 {
+        group_size / lanes_per_word
+    } else {
+        0
+    };
+    let qparam_broadcast = std::env::var("FUSEKIT_QPAIR_QPARAM_BROADCAST")
+        .ok()
+        .map(|s| {
+            let s = s.trim().to_ascii_lowercase();
+            matches!(s.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+        && group_size.is_multiple_of(lanes_per_word)
+        && qgroup_words >= 2
+        && qgroup_words <= 32
+        && 32u32.is_multiple_of(qgroup_words);
+    let pair_qdot = std::env::var("FUSEKIT_QPAIR_QDOT")
+        .ok()
+        .map(|s| {
+            let s = s.trim().to_ascii_lowercase();
+            matches!(s.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(bits == 4 && group_size >= 16 && group_size.is_multiple_of(16))
+        && !qparam_broadcast;
+    if pair_qdot {
+        emit_int4_gemv_inner_pair_qdot2(
+            w,
+            acc_a,
+            acc_b,
+            w_a_packed_row,
+            w_a_scales_row,
+            w_a_biases_row,
+            w_b_packed_row,
+            w_b_scales_row,
+            w_b_biases_row,
+            m_const,
+            group_size,
+            x_expr,
+        );
+        return;
+    }
+    let pair_unroll2 = std::env::var("FUSEKIT_QPAIR_UNROLL2")
+        .ok()
+        .map(|s| {
+            let s = s.trim().to_ascii_lowercase();
+            matches!(s.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(true)
+        && !qparam_broadcast;
+    if pair_unroll2 {
+        emit_int4_gemv_inner_pair_unroll2(
+            w,
+            acc_a,
+            acc_b,
+            w_a_packed_row,
+            w_a_scales_row,
+            w_a_biases_row,
+            w_b_packed_row,
+            w_b_scales_row,
+            w_b_biases_row,
+            m_const,
+            bits,
+            group_size,
+            x_expr,
+        );
+        return;
+    }
+
+    w.line("{");
+    w.push_indent();
+    w.writeln(format_args!("constexpr uint LANES_ = {lanes_per_word}u;"));
+    w.writeln(format_args!("constexpr uint BITS_  = {bits}u;"));
+    w.writeln(format_args!("constexpr uint GROUP_ = {group_size}u;"));
+    w.line("constexpr uint MASK_ = (1u << BITS_) - 1u;");
+    w.writeln(format_args!("uint in_words_ = {m_const} / LANES_;"));
+    w.writeln(format_args!(
+        "device const uint *w_a_row_ = {w_a_packed_row};"
+    ));
+    w.writeln(format_args!(
+        "device const uint *w_b_row_ = {w_b_packed_row};"
+    ));
+    if qparam_broadcast {
+        w.writeln(format_args!(
+            "constexpr uint QGROUP_WORDS_ = {qgroup_words}u;"
+        ));
+    }
+    w.line("for (uint widx_ = simd_lane; widx_ < in_words_; widx_ += 32u) {");
+    w.push_indent();
+    w.line("uint word_a_ = w_a_row_[widx_];");
+    w.line("uint word_b_ = w_b_row_[widx_];");
+    w.line("uint inb_ = widx_ * LANES_;");
+    w.line("uint group_ = inb_ / GROUP_;");
+    if qparam_broadcast {
+        w.line("uint qgroup_src_lane_ = (simd_lane / QGROUP_WORDS_) * QGROUP_WORDS_;");
+        w.writeln(format_args!(
+            "float scale_a_src_ = (simd_lane == qgroup_src_lane_) ? float(({w_a_scales_row})[group_]) : 0.0f;"
+        ));
+        w.writeln(format_args!(
+            "float bias_a_src_  = (simd_lane == qgroup_src_lane_) ? float(({w_a_biases_row})[group_]) : 0.0f;"
+        ));
+        w.writeln(format_args!(
+            "float scale_b_src_ = (simd_lane == qgroup_src_lane_) ? float(({w_b_scales_row})[group_]) : 0.0f;"
+        ));
+        w.writeln(format_args!(
+            "float bias_b_src_  = (simd_lane == qgroup_src_lane_) ? float(({w_b_biases_row})[group_]) : 0.0f;"
+        ));
+        w.line("float scale_a_ = simd_broadcast(scale_a_src_, qgroup_src_lane_);");
+        w.line("float bias_a_  = simd_broadcast(bias_a_src_, qgroup_src_lane_);");
+        w.line("float scale_b_ = simd_broadcast(scale_b_src_, qgroup_src_lane_);");
+        w.line("float bias_b_  = simd_broadcast(bias_b_src_, qgroup_src_lane_);");
+    } else {
+        w.writeln(format_args!(
+            "float scale_a_ = float(({w_a_scales_row})[group_]);"
+        ));
+        w.writeln(format_args!(
+            "float bias_a_  = float(({w_a_biases_row})[group_]);"
+        ));
+        w.writeln(format_args!(
+            "float scale_b_ = float(({w_b_scales_row})[group_]);"
+        ));
+        w.writeln(format_args!(
+            "float bias_b_  = float(({w_b_biases_row})[group_]);"
+        ));
+    }
+    for off in 0..lanes_per_word {
+        let shift = off * bits;
+        let mask = if bits == 8 { "0xFFu" } else { "0xFu" };
+        w.writeln(format_args!(
+            "float x_{off}_ = {x};",
+            x = x_expr(&format!("inb_ + {off}u"))
+        ));
+        w.writeln(format_args!(
+            "{acc_a} += x_{off}_ * (float((word_a_ >> {shift}u) & {mask}) * scale_a_ + bias_a_);"
+        ));
+        w.writeln(format_args!(
+            "{acc_b} += x_{off}_ * (float((word_b_ >> {shift}u) & {mask}) * scale_b_ + bias_b_);"
+        ));
+    }
+    w.pop_indent();
+    w.line("}");
+    w.pop_indent();
+    w.line("}");
+}
+
+fn emit_int4_gemv_inner_pair_qdot2<F: Fn(&str) -> String>(
+    w: &mut MslWriter,
+    acc_a: &str,
+    acc_b: &str,
+    w_a_packed_row: &str,
+    w_a_scales_row: &str,
+    w_a_biases_row: &str,
+    w_b_packed_row: &str,
+    w_b_scales_row: &str,
+    w_b_biases_row: &str,
+    m_const: &str,
+    group_size: u32,
+    x_expr: F,
+) {
+    w.line("{");
+    w.push_indent();
+    w.line("constexpr uint LANES_ = 8u;");
+    w.writeln(format_args!("constexpr uint GROUP_ = {group_size}u;"));
+    w.writeln(format_args!("uint in_words_ = {m_const} / LANES_;"));
+    w.writeln(format_args!(
+        "device const uint *w_a_row_ = {w_a_packed_row};"
+    ));
+    w.writeln(format_args!(
+        "device const uint *w_b_row_ = {w_b_packed_row};"
+    ));
+    w.line("uint base_word_ = 0u;");
+    w.line("for (; base_word_ + 64u <= in_words_; base_word_ += 64u) {");
+    w.push_indent();
+    w.line("uint lane_word_ = base_word_ + simd_lane * 2u;");
+    w.line("uint word_a0_ = w_a_row_[lane_word_];");
+    w.line("uint word_a1_ = w_a_row_[lane_word_ + 1u];");
+    w.line("uint word_b0_ = w_b_row_[lane_word_];");
+    w.line("uint word_b1_ = w_b_row_[lane_word_ + 1u];");
+    w.line("uint inb_ = lane_word_ * LANES_;");
+    w.line("uint group_ = inb_ / GROUP_;");
+    let qdot2_group_lanes = group_size / 16;
+    if qdot2_group_lanes >= 2 && qdot2_group_lanes <= 32 && 32u32.is_multiple_of(qdot2_group_lanes)
+    {
+        w.writeln(format_args!(
+            "constexpr uint QPARAM_GROUP_LANES_ = {qdot2_group_lanes}u;"
+        ));
+        w.line("uint qparam_src_lane_ = (simd_lane / QPARAM_GROUP_LANES_) * QPARAM_GROUP_LANES_;");
+        w.writeln(format_args!(
+            "float scale_a_src_ = (simd_lane == qparam_src_lane_) ? float(({w_a_scales_row})[group_]) : 0.0f;"
+        ));
+        w.writeln(format_args!(
+            "float bias_a_src_  = (simd_lane == qparam_src_lane_) ? float(({w_a_biases_row})[group_]) : 0.0f;"
+        ));
+        w.writeln(format_args!(
+            "float scale_b_src_ = (simd_lane == qparam_src_lane_) ? float(({w_b_scales_row})[group_]) : 0.0f;"
+        ));
+        w.writeln(format_args!(
+            "float bias_b_src_  = (simd_lane == qparam_src_lane_) ? float(({w_b_biases_row})[group_]) : 0.0f;"
+        ));
+        w.line("float scale_a_ = simd_broadcast(scale_a_src_, qparam_src_lane_);");
+        w.line("float bias_a_  = simd_broadcast(bias_a_src_, qparam_src_lane_);");
+        w.line("float scale_b_ = simd_broadcast(scale_b_src_, qparam_src_lane_);");
+        w.line("float bias_b_  = simd_broadcast(bias_b_src_, qparam_src_lane_);");
+    } else {
+        w.writeln(format_args!(
+            "float scale_a_ = float(({w_a_scales_row})[group_]);"
+        ));
+        w.writeln(format_args!(
+            "float bias_a_  = float(({w_a_biases_row})[group_]);"
+        ));
+        w.writeln(format_args!(
+            "float scale_b_ = float(({w_b_scales_row})[group_]);"
+        ));
+        w.writeln(format_args!(
+            "float bias_b_  = float(({w_b_biases_row})[group_]);"
+        ));
+    }
+    w.line("float sum_x_ = 0.0f;");
+    w.line("float qacc_a_ = 0.0f;");
+    w.line("float qacc_b_ = 0.0f;");
+    for word_idx in 0..2u32 {
+        let word_off = word_idx * 8;
+        let word_a = format!("word_a{word_idx}_");
+        let word_b = format!("word_b{word_idx}_");
+        for half in 0..2u32 {
+            let half_shift = half * 16;
+            for lane in 0..4u32 {
+                let off = word_off + half * 4 + lane;
+                let mask = match lane {
+                    0 => "0x000fu",
+                    1 => "0x00f0u",
+                    2 => "0x0f00u",
+                    _ => "0xf000u",
+                };
+                let divisor = match lane {
+                    0 => "1.0f",
+                    1 => "16.0f",
+                    2 => "256.0f",
+                    _ => "4096.0f",
+                };
+                w.writeln(format_args!(
+                    "float xq_{off}_ = {x};",
+                    x = x_expr(&format!("inb_ + {off}u"))
+                ));
+                w.writeln(format_args!("sum_x_ += xq_{off}_;"));
+                let word_expr_a = if half_shift == 0 {
+                    word_a.clone()
+                } else {
+                    format!("({word_a} >> {half_shift}u)")
+                };
+                let word_expr_b = if half_shift == 0 {
+                    word_b.clone()
+                } else {
+                    format!("({word_b} >> {half_shift}u)")
+                };
+                w.writeln(format_args!(
+                    "qacc_a_ += (xq_{off}_ / {divisor}) * float({word_expr_a} & {mask});"
+                ));
+                w.writeln(format_args!(
+                    "qacc_b_ += (xq_{off}_ / {divisor}) * float({word_expr_b} & {mask});"
+                ));
+            }
+        }
+    }
+    w.writeln(format_args!(
+        "{acc_a} += scale_a_ * qacc_a_ + sum_x_ * bias_a_;"
+    ));
+    w.writeln(format_args!(
+        "{acc_b} += scale_b_ * qacc_b_ + sum_x_ * bias_b_;"
+    ));
+    w.pop_indent();
+    w.line("}");
+    w.line("for (uint widx_ = base_word_ + simd_lane; widx_ < in_words_; widx_ += 32u) {");
+    w.push_indent();
+    w.line("uint word_a_ = w_a_row_[widx_];");
+    w.line("uint word_b_ = w_b_row_[widx_];");
+    w.line("uint inb_ = widx_ * LANES_;");
+    w.line("uint group_ = inb_ / GROUP_;");
+    w.writeln(format_args!(
+        "float scale_a_ = float(({w_a_scales_row})[group_]);"
+    ));
+    w.writeln(format_args!(
+        "float bias_a_  = float(({w_a_biases_row})[group_]);"
+    ));
+    w.writeln(format_args!(
+        "float scale_b_ = float(({w_b_scales_row})[group_]);"
+    ));
+    w.writeln(format_args!(
+        "float bias_b_  = float(({w_b_biases_row})[group_]);"
+    ));
+    for off in 0..8u32 {
+        let shift = off * 4;
+        w.writeln(format_args!(
+            "float x_{off}_ = {x};",
+            x = x_expr(&format!("inb_ + {off}u"))
+        ));
+        w.writeln(format_args!(
+            "{acc_a} += x_{off}_ * (float((word_a_ >> {shift}u) & 0xFu) * scale_a_ + bias_a_);"
+        ));
+        w.writeln(format_args!(
+            "{acc_b} += x_{off}_ * (float((word_b_ >> {shift}u) & 0xFu) * scale_b_ + bias_b_);"
+        ));
+    }
+    w.pop_indent();
+    w.line("}");
+    w.pop_indent();
+    w.line("}");
+}
+
+fn emit_int4_gemv_inner_pair_unroll2<F: Fn(&str) -> String>(
+    w: &mut MslWriter,
+    acc_a: &str,
+    acc_b: &str,
+    w_a_packed_row: &str,
+    w_a_scales_row: &str,
+    w_a_biases_row: &str,
+    w_b_packed_row: &str,
+    w_b_scales_row: &str,
+    w_b_biases_row: &str,
+    m_const: &str,
+    bits: u32,
+    group_size: u32,
+    x_expr: F,
+) {
+    let lanes_per_word = 32 / bits;
+    w.line("{");
+    w.push_indent();
+    w.writeln(format_args!("constexpr uint LANES_ = {lanes_per_word}u;"));
+    w.writeln(format_args!("constexpr uint BITS_  = {bits}u;"));
+    w.writeln(format_args!("constexpr uint GROUP_ = {group_size}u;"));
+    w.line("constexpr uint MASK_ = (1u << BITS_) - 1u;");
+    w.writeln(format_args!("uint in_words_ = {m_const} / LANES_;"));
+    w.writeln(format_args!(
+        "device const uint *w_a_row_ = {w_a_packed_row};"
+    ));
+    w.writeln(format_args!(
+        "device const uint *w_b_row_ = {w_b_packed_row};"
+    ));
+    w.line("uint widx_ = simd_lane;");
+    w.line("for (; widx_ + 32u < in_words_; widx_ += 64u) {");
+    w.push_indent();
+    w.line("uint word_a0_ = w_a_row_[widx_];");
+    w.line("uint word_b0_ = w_b_row_[widx_];");
+    w.line("uint word_a1_ = w_a_row_[widx_ + 32u];");
+    w.line("uint word_b1_ = w_b_row_[widx_ + 32u];");
+    w.line("uint inb0_ = widx_ * LANES_;");
+    w.line("uint inb1_ = (widx_ + 32u) * LANES_;");
+    w.line("uint group0_ = inb0_ / GROUP_;");
+    w.line("uint group1_ = inb1_ / GROUP_;");
+    w.writeln(format_args!(
+        "float scale_a0_ = float(({w_a_scales_row})[group0_]);"
+    ));
+    w.writeln(format_args!(
+        "float bias_a0_  = float(({w_a_biases_row})[group0_]);"
+    ));
+    w.writeln(format_args!(
+        "float scale_b0_ = float(({w_b_scales_row})[group0_]);"
+    ));
+    w.writeln(format_args!(
+        "float bias_b0_  = float(({w_b_biases_row})[group0_]);"
+    ));
+    w.writeln(format_args!(
+        "float scale_a1_ = float(({w_a_scales_row})[group1_]);"
+    ));
+    w.writeln(format_args!(
+        "float bias_a1_  = float(({w_a_biases_row})[group1_]);"
+    ));
+    w.writeln(format_args!(
+        "float scale_b1_ = float(({w_b_scales_row})[group1_]);"
+    ));
+    w.writeln(format_args!(
+        "float bias_b1_  = float(({w_b_biases_row})[group1_]);"
+    ));
+    for off in 0..lanes_per_word {
+        let shift = off * bits;
+        let mask = if bits == 8 { "0xFFu" } else { "0xFu" };
+        w.writeln(format_args!(
+            "float x0_{off}_ = {x};",
+            x = x_expr(&format!("inb0_ + {off}u"))
+        ));
+        w.writeln(format_args!(
+            "{acc_a} += x0_{off}_ * (float((word_a0_ >> {shift}u) & {mask}) * scale_a0_ + bias_a0_);"
+        ));
+        w.writeln(format_args!(
+            "{acc_b} += x0_{off}_ * (float((word_b0_ >> {shift}u) & {mask}) * scale_b0_ + bias_b0_);"
+        ));
+    }
+    for off in 0..lanes_per_word {
+        let shift = off * bits;
+        let mask = if bits == 8 { "0xFFu" } else { "0xFu" };
+        w.writeln(format_args!(
+            "float x1_{off}_ = {x};",
+            x = x_expr(&format!("inb1_ + {off}u"))
+        ));
+        w.writeln(format_args!(
+            "{acc_a} += x1_{off}_ * (float((word_a1_ >> {shift}u) & {mask}) * scale_a1_ + bias_a1_);"
+        ));
+        w.writeln(format_args!(
+            "{acc_b} += x1_{off}_ * (float((word_b1_ >> {shift}u) & {mask}) * scale_b1_ + bias_b1_);"
+        ));
+    }
+    w.pop_indent();
+    w.line("}");
+    w.line("if (widx_ < in_words_) {");
+    w.push_indent();
+    w.line("uint word_a_ = w_a_row_[widx_];");
+    w.line("uint word_b_ = w_b_row_[widx_];");
+    w.line("uint inb_ = widx_ * LANES_;");
+    w.line("uint group_ = inb_ / GROUP_;");
+    w.writeln(format_args!(
+        "float scale_a_ = float(({w_a_scales_row})[group_]);"
+    ));
+    w.writeln(format_args!(
+        "float bias_a_  = float(({w_a_biases_row})[group_]);"
+    ));
+    w.writeln(format_args!(
+        "float scale_b_ = float(({w_b_scales_row})[group_]);"
+    ));
+    w.writeln(format_args!(
+        "float bias_b_  = float(({w_b_biases_row})[group_]);"
+    ));
+    for off in 0..lanes_per_word {
+        let shift = off * bits;
+        let mask = if bits == 8 { "0xFFu" } else { "0xFu" };
+        w.writeln(format_args!(
+            "float x_{off}_ = {x};",
+            x = x_expr(&format!("inb_ + {off}u"))
+        ));
+        w.writeln(format_args!(
+            "{acc_a} += x_{off}_ * (float((word_a_ >> {shift}u) & {mask}) * scale_a_ + bias_a_);"
+        ));
+        w.writeln(format_args!(
+            "{acc_b} += x_{off}_ * (float((word_b_ >> {shift}u) & {mask}) * scale_b_ + bias_b_);"
+        ));
+    }
+    w.pop_indent();
+    w.line("}");
+    w.pop_indent();
+    w.line("}");
+}
+
 pub fn emit_int4_gemv_inner_with_unroll2_default<F: Fn(&str) -> String>(
     w: &mut MslWriter,
     acc: &str,
@@ -1584,6 +2518,7 @@ pub fn emit_int4_gemv_inner_with_unroll2_default<F: Fn(&str) -> String>(
 pub enum QdotPolicy {
     Default,
     Disable,
+    Force,
 }
 
 pub fn emit_int4_gemv_inner_with_options<F: Fn(&str) -> String>(
@@ -1693,6 +2628,7 @@ pub fn emit_int4_gemv_inner_with_options_and_qdot<F: Fn(&str) -> String>(
             // chain fusion has already raised register pressure.
             .unwrap_or(qgemv_qdot_default),
         QdotPolicy::Disable => false,
+        QdotPolicy::Force => true,
     } && (bits == 4 || bits == 8)
         && group_size.is_multiple_of(lanes_per_word * 2);
     if qgemv_mlx_qdot {
@@ -2264,6 +3200,132 @@ pub fn emit_int4_gemv_inner_with_options_and_qdot<F: Fn(&str) -> String>(
     w.line("}");
 }
 
+fn emit_int4_gemv_inner_multirow_qdot2<F, FW, FS, FB>(
+    w: &mut MslWriter,
+    acc_fn: F,
+    w_packed_row_fn: FW,
+    w_scales_row_fn: FS,
+    w_biases_row_fn: FB,
+    m_const: &str,
+    group_size: u32,
+    rows: u32,
+    x_expr: impl Fn(&str) -> String,
+) where
+    F: Fn(u32) -> String,
+    FW: Fn(u32) -> String,
+    FS: Fn(u32) -> String,
+    FB: Fn(u32) -> String,
+{
+    w.line("{");
+    w.push_indent();
+    w.line("constexpr uint LANES_ = 8u;");
+    w.writeln(format_args!("constexpr uint GROUP_ = {group_size}u;"));
+    w.writeln(format_args!("uint in_words_ = {m_const} / LANES_;"));
+    for r in 0..rows {
+        w.writeln(format_args!(
+            "device const uint *w_row_{r} = {p};",
+            p = w_packed_row_fn(r)
+        ));
+    }
+    w.line("uint base_word_ = 0u;");
+    w.line("for (; base_word_ + 64u <= in_words_; base_word_ += 64u) {");
+    w.push_indent();
+    w.line("uint lane_word_ = base_word_ + simd_lane * 2u;");
+    w.line("uint inb_ = lane_word_ * LANES_;");
+    w.line("uint group_ = inb_ / GROUP_;");
+    w.line("float sum_x_ = 0.0f;");
+    for off in 0..16u32 {
+        w.writeln(format_args!(
+            "float xq_{off}_ = {x};",
+            x = x_expr(&format!("inb_ + {off}u"))
+        ));
+        w.writeln(format_args!("sum_x_ += xq_{off}_;"));
+    }
+    for r in 0..rows {
+        w.writeln(format_args!("uint word0_{r}_ = w_row_{r}[lane_word_];"));
+        w.writeln(format_args!(
+            "uint word1_{r}_ = w_row_{r}[lane_word_ + 1u];"
+        ));
+        w.writeln(format_args!(
+            "float scale_{r}_ = float(({s})[group_]);",
+            s = w_scales_row_fn(r)
+        ));
+        w.writeln(format_args!(
+            "float bias_{r}_ = float(({b})[group_]);",
+            b = w_biases_row_fn(r)
+        ));
+        w.writeln(format_args!("float qacc_{r}_ = 0.0f;"));
+        for word_idx in 0..2u32 {
+            let word = format!("word{word_idx}_{r}_");
+            let word_off = word_idx * 8;
+            for half in 0..2u32 {
+                let half_shift = half * 16;
+                for lane in 0..4u32 {
+                    let off = word_off + half * 4 + lane;
+                    let mask = match lane {
+                        0 => "0x000fu",
+                        1 => "0x00f0u",
+                        2 => "0x0f00u",
+                        _ => "0xf000u",
+                    };
+                    let divisor = match lane {
+                        0 => "1.0f",
+                        1 => "16.0f",
+                        2 => "256.0f",
+                        _ => "4096.0f",
+                    };
+                    let word_expr = if half_shift == 0 {
+                        word.clone()
+                    } else {
+                        format!("({word} >> {half_shift}u)")
+                    };
+                    w.writeln(format_args!(
+                        "qacc_{r}_ += (xq_{off}_ / {divisor}) * float({word_expr} & {mask});"
+                    ));
+                }
+            }
+        }
+        w.writeln(format_args!(
+            "{acc} += scale_{r}_ * qacc_{r}_ + bias_{r}_ * sum_x_;",
+            acc = acc_fn(r)
+        ));
+    }
+    w.pop_indent();
+    w.line("}");
+    w.line("for (uint widx_ = base_word_ + simd_lane; widx_ < in_words_; widx_ += 32u) {");
+    w.push_indent();
+    w.line("uint inb_ = widx_ * LANES_;");
+    w.line("uint group_ = inb_ / GROUP_;");
+    for off in 0..8u32 {
+        w.writeln(format_args!(
+            "float x_{off}_ = {x};",
+            x = x_expr(&format!("inb_ + {off}u"))
+        ));
+    }
+    for r in 0..rows {
+        w.writeln(format_args!("uint word_{r}_ = w_row_{r}[widx_];"));
+        w.writeln(format_args!(
+            "float scale_{r}_ = float(({s})[group_]);",
+            s = w_scales_row_fn(r)
+        ));
+        w.writeln(format_args!(
+            "float bias_{r}_ = float(({b})[group_]);",
+            b = w_biases_row_fn(r)
+        ));
+        for off in 0..8u32 {
+            let shift = off * 4;
+            w.writeln(format_args!(
+                "{acc} += x_{off}_ * (float((word_{r}_ >> {shift}u) & 0xFu) * scale_{r}_ + bias_{r}_);",
+                acc = acc_fn(r)
+            ));
+        }
+    }
+    w.pop_indent();
+    w.line("}");
+    w.pop_indent();
+    w.line("}");
+}
+
 /// Multi-row variant of `emit_int4_gemv_inner`. Each simdgroup
 /// computes `rows` output rows simultaneously, sharing the dequant
 /// math for `x` across rows (only the weight word changes per row).
@@ -2337,6 +3399,37 @@ pub fn emit_int4_gemv_inner_multirow<F, FW, FS, FB>(
         .unwrap_or(false)
         && (bits == 4 || bits == 8)
         && !qparam_broadcast;
+    let qgemv_multirow_qdot = std::env::var("FUSEKIT_QGEMV_MULTIROW_QDOT")
+        .ok()
+        .map(|s| {
+            let s = s.trim().to_ascii_lowercase();
+            matches!(s.as_str(), "1" | "true" | "yes" | "on")
+        })
+        .unwrap_or(false)
+        && bits == 4
+        && rows <= 4
+        && group_size >= 16
+        && group_size.is_multiple_of(16)
+        && !qparam_broadcast;
+    // q4 multirow fanout is the main decode weight-streaming bottleneck on
+    // 4B-class quantized models. Keep the MLX qdot scale/bias placement but
+    // do it one packed word at a time, so rows=8 does not carry qdot2's large
+    // 16-value live range.
+    let qgemv_multirow_qdot1 = bits == 4 && rows <= 8 && !qparam_broadcast;
+    if qgemv_multirow_qdot {
+        emit_int4_gemv_inner_multirow_qdot2(
+            w,
+            acc_fn,
+            w_packed_row_fn,
+            w_scales_row_fn,
+            w_biases_row_fn,
+            m_const,
+            group_size,
+            rows,
+            x_expr_in_smem,
+        );
+        return;
+    }
     w.line("{");
     w.push_indent();
     w.writeln(format_args!("constexpr uint LANES_ = {lanes_per_word}u;"));
@@ -2409,6 +3502,9 @@ pub fn emit_int4_gemv_inner_multirow<F, FW, FS, FB>(
                     x_expr_in_smem(&format!("inb_ + {off}u"))
                 ));
             }
+            if qgemv_multirow_qdot1 {
+                w.line("float sum_x_ = x_0_ + x_1_ + x_2_ + x_3_ + x_4_ + x_5_ + x_6_ + x_7_;");
+            }
             for r in 0..rows {
                 w.writeln(format_args!("uint w_{r}_ = w_row_{r}[widx_];"));
                 let s_expr = format!("({})[group_]", w_scales_row_fn(r));
@@ -2464,12 +3560,30 @@ pub fn emit_int4_gemv_inner_multirow<F, FW, FS, FB>(
                     w.writeln(format_args!("float s_{r}_ = float({s_expr});"));
                     w.writeln(format_args!("float b_{r}_ = float({b_expr});"));
                 }
-                for off in 0..8u32 {
-                    let shift = off * 4;
+                if qgemv_multirow_qdot1 {
+                    w.writeln(format_args!(
+                        "float qacc_{r}_ = \
+                         x_0_ * float(w_{r}_ & 0x0000000fu) + \
+                         (x_1_ * 0.0625f) * float(w_{r}_ & 0x000000f0u) + \
+                         (x_2_ * 0.00390625f) * float(w_{r}_ & 0x00000f00u) + \
+                         (x_3_ * 0.000244140625f) * float(w_{r}_ & 0x0000f000u) + \
+                         x_4_ * float((w_{r}_ >> 16u) & 0x000fu) + \
+                         (x_5_ * 0.0625f) * float((w_{r}_ >> 16u) & 0x00f0u) + \
+                         (x_6_ * 0.00390625f) * float((w_{r}_ >> 16u) & 0x0f00u) + \
+                         (x_7_ * 0.000244140625f) * float((w_{r}_ >> 16u) & 0xf000u);"
+                    ));
                     let acc = acc_fn(r);
                     w.writeln(format_args!(
-                    "{acc} += x_{off}_ * (float((w_{r}_ >> {shift}u) & 0xFu) * s_{r}_ + b_{r}_);"
-                ));
+                        "{acc} += qacc_{r}_ * s_{r}_ + sum_x_ * b_{r}_;"
+                    ));
+                } else {
+                    for off in 0..8u32 {
+                        let shift = off * 4;
+                        let acc = acc_fn(r);
+                        w.writeln(format_args!(
+                            "{acc} += x_{off}_ * (float((w_{r}_ >> {shift}u) & 0xFu) * s_{r}_ + b_{r}_);"
+                        ));
+                    }
                 }
             }
             w.pop_indent();
@@ -3657,6 +4771,10 @@ pub enum SlotRole {
     NextTokenOut,
     /// `cache.offset` for the owning layer.
     LayerOffset,
+    /// Physical cache row where the current token's K/V should be
+    /// written. Equal to `LayerOffset` for linear KV caches, but wraps
+    /// for rotating/sliding-window caches.
+    LayerCacheWriteOffset,
     /// `cache.keys.shape[2]` — total capacity.
     LayerCapacity,
     /// `offset + L` — host writes each step.
@@ -3877,21 +4995,31 @@ pub fn extra_bindings_for(fusion: &Fusion, meta: &ModelMeta) -> Vec<ExtraBinding
                 },
                 ExtraBinding {
                     slot: base + 3,
+                    role: SlotRole::LayerCacheWriteOffset,
+                },
+                ExtraBinding {
+                    slot: base + 4,
                     role: SlotRole::LayerCapacity,
                 },
             ]
         }
         // Trace-bound `SdpaDecode`. K/V always read the live cache.
         // Q normally reads the compact semantic q_buf and the SDPA
-        // kernel applies its scale. MLA-style traces, however, carry
-        // an already-scaled Q tensor in the direct task input
-        // (scale == 1); leave slot 0 unbound there so the runtime
-        // passes that trace-layout scratch instead.
+        // kernel applies its scale. MLA-style traces can carry Q in a
+        // direct task input; keep that decision independent from the
+        // numeric scale so Q pre-scale absorption does not silently
+        // switch the kernel to semantic q_buf.
         FusionKind::SdpaDecode => {
-            let direct_scaled_q = matches!(
+            let q_split = matches!(
                 fusion.attrs,
-                FusionAttrs::SdpaDecode { scale, .. } if (scale - 1.0).abs() < f32::EPSILON
-            ) && !fusion.inputs.is_empty();
+                FusionAttrs::SdpaDecode {
+                    q_split: Some(_),
+                    ..
+                }
+            ) && fusion.inputs.len() >= 4;
+            let direct_scaled_q =
+                matches!(fusion.attrs, FusionAttrs::SdpaDecode { trace_q: true, .. })
+                    && !fusion.inputs.is_empty();
             let mut v = Vec::new();
             if !direct_scaled_q {
                 v.push(ExtraBinding {
@@ -3899,7 +5027,104 @@ pub fn extra_bindings_for(fusion: &Fusion, meta: &ModelMeta) -> Vec<ExtraBinding
                     role: SlotRole::LayerScratch(LayerScratchKind::QBuf),
                 });
             }
+            let k_slot = if q_split { 2 } else { 1 };
+            let v_slot = if q_split { 3 } else { 2 };
+            let kv_len_slot = if q_split { 4 } else { 3 };
+            let capacity_slot = if q_split { 5 } else { 4 };
             v.extend([
+                ExtraBinding {
+                    slot: k_slot,
+                    role: SlotRole::LayerCacheK,
+                },
+                ExtraBinding {
+                    slot: v_slot,
+                    role: SlotRole::LayerCacheV,
+                },
+                ExtraBinding {
+                    slot: kv_len_slot,
+                    role: SlotRole::LayerKvLen,
+                },
+                ExtraBinding {
+                    slot: capacity_slot,
+                    role: SlotRole::LayerCapacity,
+                },
+            ]);
+            let qk_dim = fusion
+                .inputs
+                .first()
+                .and_then(|b| b.shape.last().copied())
+                .map(|d| {
+                    if q_split {
+                        d + fusion
+                            .inputs
+                            .get(1)
+                            .and_then(|b| b.shape.last().copied())
+                            .unwrap_or(0)
+                    } else {
+                        d
+                    }
+                })
+                .unwrap_or(meta.head_dim as i32)
+                .max(1) as u32;
+            let v_dim = fusion
+                .inputs
+                .get(if q_split { 3 } else { 2 })
+                .and_then(|b| b.shape.last().copied())
+                .or_else(|| {
+                    fusion.outputs.first().and_then(|b| {
+                        b.shape
+                            .last()
+                            .copied()
+                            .map(|d| d / (meta.num_attention_heads as i32).max(1))
+                    })
+                })
+                .unwrap_or(meta.head_dim as i32)
+                .max(1) as u32;
+            let active_m = fusion
+                .outputs
+                .first()
+                .map(|b| {
+                    sdpa_decode::active_rows_for_shape(&b.shape, meta.num_attention_heads, v_dim)
+                })
+                .unwrap_or_else(|| crate::target::current_chip().active_m_for_unshaped(8))
+                .max(1);
+            if sdpa_decode::flash_decoding_enabled_for(
+                meta.num_attention_heads,
+                meta.num_key_value_heads,
+                qk_dim,
+                v_dim,
+                active_m,
+            ) {
+                // Slot 5 (out) is normally filled by `t["outputs"]`
+                // append in dispatch.py, but adding extras at slots 6+
+                // breaks that index assumption. Bind out explicitly so
+                // the slot-5 hole gets filled before the appends.
+                v.push(ExtraBinding {
+                    slot: if q_split { 6 } else { 5 },
+                    role: SlotRole::LayerScratch(LayerScratchKind::SdpaBuf),
+                });
+                v.push(ExtraBinding {
+                    slot: if q_split { 7 } else { 6 },
+                    role: SlotRole::GlobalScratch(GlobalScratchKind::SdpaPartials),
+                });
+                v.push(ExtraBinding {
+                    slot: if q_split { 8 } else { 7 },
+                    role: SlotRole::GlobalScratch(GlobalScratchKind::SdpaCounter),
+                });
+            }
+            v
+        }
+        // Trace-native prefill attention often survives as a single
+        // `ScaledDotProductAttention` op after the QKV projection has
+        // already written the live K/V cache. Bind it to the same
+        // semantic buffers as SdpaDecode so the M>1 prefill variant can
+        // dispatch without relying on model-name patterns.
+        FusionKind::Single(ref name) if name == "ScaledDotProductAttention" => {
+            let mut v = vec![
+                ExtraBinding {
+                    slot: 0,
+                    role: SlotRole::LayerScratch(QBuf),
+                },
                 ExtraBinding {
                     slot: 1,
                     role: SlotRole::LayerCacheK,
@@ -3916,48 +5141,14 @@ pub fn extra_bindings_for(fusion: &Fusion, meta: &ModelMeta) -> Vec<ExtraBinding
                     slot: 4,
                     role: SlotRole::LayerCapacity,
                 },
-            ]);
-            let active_m = fusion
-                .outputs
-                .first()
-                .map(|b| crate::target::current_chip().active_tokens_for_shape(&b.shape))
-                .unwrap_or_else(|| crate::target::current_chip().active_m_for_unshaped(8))
-                .max(1);
-            let qk_dim = fusion
-                .inputs
-                .first()
-                .and_then(|b| b.shape.last().copied())
-                .unwrap_or(meta.head_dim as i32)
-                .max(1) as u32;
-            let v_dim = fusion
-                .inputs
-                .get(2)
-                .and_then(|b| b.shape.last().copied())
-                .or_else(|| {
-                    fusion.outputs.first().and_then(|b| {
-                        b.shape
-                            .last()
-                            .copied()
-                            .map(|d| d / (meta.num_attention_heads as i32).max(1))
-                    })
-                })
-                .unwrap_or(meta.head_dim as i32)
-                .max(1) as u32;
-            if sdpa_decode::flash_decoding_enabled_for(
-                meta.num_attention_heads,
-                meta.num_key_value_heads,
-                qk_dim,
-                v_dim,
-                active_m,
-            ) {
-                // Slot 5 (out) is normally filled by `t["outputs"]`
-                // append in dispatch.py, but adding extras at slots 6+
-                // breaks that index assumption. Bind out explicitly so
-                // the slot-5 hole gets filled before the appends.
+            ];
+            if single::sdpa_single_decode_enabled(fusion, meta) {
                 v.push(ExtraBinding {
                     slot: 5,
                     role: SlotRole::LayerScratch(LayerScratchKind::SdpaBuf),
                 });
+            }
+            if single::sdpa_single_decode_flash_enabled(fusion, meta) {
                 v.push(ExtraBinding {
                     slot: 6,
                     role: SlotRole::GlobalScratch(GlobalScratchKind::SdpaPartials),
@@ -3969,33 +5160,6 @@ pub fn extra_bindings_for(fusion: &Fusion, meta: &ModelMeta) -> Vec<ExtraBinding
             }
             v
         }
-        // Trace-native prefill attention often survives as a single
-        // `ScaledDotProductAttention` op after the QKV projection has
-        // already written the live K/V cache. Bind it to the same
-        // semantic buffers as SdpaDecode so the M>1 prefill variant can
-        // dispatch without relying on model-name patterns.
-        FusionKind::Single(ref name) if name == "ScaledDotProductAttention" => vec![
-            ExtraBinding {
-                slot: 0,
-                role: SlotRole::LayerScratch(QBuf),
-            },
-            ExtraBinding {
-                slot: 1,
-                role: SlotRole::LayerCacheK,
-            },
-            ExtraBinding {
-                slot: 2,
-                role: SlotRole::LayerCacheV,
-            },
-            ExtraBinding {
-                slot: 3,
-                role: SlotRole::LayerKvLen,
-            },
-            ExtraBinding {
-                slot: 4,
-                role: SlotRole::LayerCapacity,
-            },
-        ],
         // `LinearResidual`'s o_proj variant needs its `x` slot
         // overridden to `LayerScratch(SdpaBuf)` because the trace
         // routes SDPA's output through a transpose+reshape we skip
@@ -4083,28 +5247,41 @@ pub fn extra_bindings_for(fusion: &Fusion, meta: &ModelMeta) -> Vec<ExtraBinding
             },
             ExtraBinding {
                 slot: 5,
+                role: SlotRole::LayerCacheWriteOffset,
+            },
+            ExtraBinding {
+                slot: 6,
                 role: SlotRole::LayerCapacity,
             },
         ],
         // (current_k, current_v, cache_k, cache_v, offset, capacity) → ()
-        FusionKind::KvCacheStoreDecode => vec![
-            ExtraBinding {
-                slot: 2,
-                role: SlotRole::LayerCacheK,
-            },
-            ExtraBinding {
-                slot: 3,
-                role: SlotRole::LayerCacheV,
-            },
-            ExtraBinding {
-                slot: 4,
-                role: SlotRole::LayerOffset,
-            },
-            ExtraBinding {
-                slot: 5,
-                role: SlotRole::LayerCapacity,
-            },
-        ],
+        // or (current_k_part0, current_k_part1, current_v, cache_k,
+        // cache_v, offset, capacity) after concat-sink lowering.
+        FusionKind::KvCacheStoreDecode => {
+            let base = fusion.inputs.len() as u32;
+            vec![
+                ExtraBinding {
+                    slot: base,
+                    role: SlotRole::LayerCacheK,
+                },
+                ExtraBinding {
+                    slot: base + 1,
+                    role: SlotRole::LayerCacheV,
+                },
+                ExtraBinding {
+                    slot: base + 2,
+                    role: SlotRole::LayerOffset,
+                },
+                ExtraBinding {
+                    slot: base + 3,
+                    role: SlotRole::LayerCacheWriteOffset,
+                },
+                ExtraBinding {
+                    slot: base + 4,
+                    role: SlotRole::LayerCapacity,
+                },
+            ]
+        }
         // (q_proj, q_norm_weight, offset) → (q_buf, gate_buf)
         FusionKind::RmsNormRopeQGateDecode => vec![ExtraBinding {
             slot: 2,
@@ -4126,6 +5303,10 @@ pub fn extra_bindings_for(fusion: &Fusion, meta: &ModelMeta) -> Vec<ExtraBinding
             },
             ExtraBinding {
                 slot: 6,
+                role: SlotRole::LayerCacheWriteOffset,
+            },
+            ExtraBinding {
+                slot: 7,
                 role: SlotRole::LayerCapacity,
             },
         ],
@@ -4355,6 +5536,7 @@ pub fn slot_role_key(role: SlotRole) -> String {
         SlotRole::TokenIdIn => "token_id_in".into(),
         SlotRole::NextTokenOut => "next_token_out".into(),
         SlotRole::LayerOffset => "layer_offset".into(),
+        SlotRole::LayerCacheWriteOffset => "layer_cache_write_offset".into(),
         SlotRole::LayerCapacity => "layer_capacity".into(),
         SlotRole::LayerKvLen => "layer_kv_len".into(),
         SlotRole::LayerCacheK => "layer_cache_k".into(),
@@ -4437,6 +5619,20 @@ pub fn kernel_function_name(fusion: &Fusion) -> String {
     }
 }
 
+fn single_dispatch_name(fusion: &Fusion) -> Option<&str> {
+    if let FusionAttrs::Single { op_name, .. } = &fusion.attrs {
+        return Some(op_name.as_str());
+    }
+    if let FusionKind::Single(name) = &fusion.kind {
+        return Some(name.as_str());
+    }
+    None
+}
+
+fn preserves_mlx_custom_dispatch(fusion: &Fusion) -> bool {
+    matches!(single_dispatch_name(fusion), Some("CustomKernel"))
+}
+
 /// Default threadgroup size when a pattern doesn't pick its own.
 /// 128 threads = 4 simdgroups, multiple of 32 (Metal's simdgroup
 /// width) — enough warps for the partial-sum reduction every
@@ -4477,6 +5673,13 @@ pub fn kernel_threadgroup(fusion: &Fusion) -> u64 {
         FusionKind::RmsNormRopeQGateDecode | FusionKind::RmsNormRopeKvCacheStoreDecode => 64,
         FusionKind::QmvFanout | FusionKind::QmvSwiglu => 64,
         FusionKind::RoutedQmvSwiglu | FusionKind::RoutedQmvReduce => 256,
+        FusionKind::FusedChain if fused_chain_gather_qmm_swiglu_shape(fusion).is_some() => 256,
+        FusionKind::FusedChain
+            if fused_chain::dense_heavy_first_simdgroup_shape(fusion).is_some() =>
+        {
+            32
+        }
+        FusionKind::Single(ref name) if name == "GatherQMMReduce" => 256,
         _ => TG_THREADS,
     }
 }
@@ -4504,6 +5707,45 @@ pub fn kernel_threadgroup_for(
     // size SMEM proportional to TG threads.
     let _ = smem_needed;
 
+    if matches!(
+        single_dispatch_name(fusion),
+        Some("ScaledDotProductAttention")
+    ) {
+        let v_dim = fusion
+            .inputs
+            .get(2)
+            .and_then(|bd| bd.shape.last().copied())
+            .or_else(|| {
+                fusion
+                    .outputs
+                    .first()
+                    .and_then(|bd| bd.shape.last().copied())
+            })
+            .unwrap_or(meta.head_dim as i32)
+            .max(1) as u32;
+        let flash_sgs = if single::sdpa_single_decode_flash_enabled(fusion, meta) {
+            ceil_div_u64(v_dim as u64, b.simd_width as u64) as u32
+        } else {
+            match single::sdpa_prefill_plan(fusion, meta) {
+                single::SdpaPrefillPlan::BlockNax => 2,
+                single::SdpaPrefillPlan::Online => 1,
+                single::SdpaPrefillPlan::OnlineVector => 32,
+                single::SdpaPrefillPlan::FlashGqa => {
+                    let (_, _, _, flash_sgs) = single::sdpa_prefill_flash_tiling(meta);
+                    flash_sgs.max(1)
+                }
+                single::SdpaPrefillPlan::Materialized => 4,
+            }
+        };
+        return (std::env::var("FUSEKIT_SDPA_TG_SGS")
+            .ok()
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|&n| (1..=32).contains(&n))
+            .unwrap_or(flash_sgs.max(1))
+            .max(1) as u64)
+            .saturating_mul(b.simd_width as u64);
+    }
+
     // SDPA has a hand-tuned dependency: TG=128 + sgs_per_tg=4 keeps
     // the partial-sum reduction order stable for the legacy two-pass
     // path. Flash SDPA is different: each output dimension is owned by
@@ -4512,21 +5754,33 @@ pub fn kernel_threadgroup_for(
     // semantic V/head dim; this is shape based, not model-name based.
     let sgs = match fusion.kind {
         FusionKind::SdpaDecode => {
-            let active_m = fusion
-                .outputs
-                .first()
-                .map(|b| crate::target::current_chip().active_tokens_for_shape(&b.shape))
-                .unwrap_or_else(|| crate::target::current_chip().active_m_for_unshaped(8))
-                .max(1);
+            let q_split = matches!(
+                fusion.attrs,
+                FusionAttrs::SdpaDecode {
+                    q_split: Some(_),
+                    ..
+                }
+            ) && fusion.inputs.len() >= 4;
             let qk_dim = fusion
                 .inputs
                 .first()
                 .and_then(|b| b.shape.last().copied())
+                .map(|d| {
+                    if q_split {
+                        d + fusion
+                            .inputs
+                            .get(1)
+                            .and_then(|b| b.shape.last().copied())
+                            .unwrap_or(0)
+                    } else {
+                        d
+                    }
+                })
                 .unwrap_or(meta.head_dim as i32)
                 .max(1) as u32;
             let v_dim = fusion
                 .inputs
-                .get(2)
+                .get(if q_split { 3 } else { 2 })
                 .and_then(|b| b.shape.last().copied())
                 .or_else(|| {
                     fusion.outputs.first().and_then(|b| {
@@ -4538,6 +5792,14 @@ pub fn kernel_threadgroup_for(
                 })
                 .unwrap_or(meta.head_dim as i32)
                 .max(1) as u32;
+            let active_m = fusion
+                .outputs
+                .first()
+                .map(|b| {
+                    sdpa_decode::active_rows_for_shape(&b.shape, meta.num_attention_heads, v_dim)
+                })
+                .unwrap_or_else(|| crate::target::current_chip().active_m_for_unshaped(8))
+                .max(1);
             let flash_sdpa = sdpa_decode::flash_decoding_enabled_for(
                 meta.num_attention_heads,
                 meta.num_key_value_heads,
@@ -4562,6 +5824,14 @@ pub fn kernel_threadgroup_for(
             .filter(|&n| (1..=8).contains(&n))
             .unwrap_or(4),
         FusionKind::FinalRmsNormLmHead => 8,
+        FusionKind::FusedChain if fused_chain_gather_qmm_swiglu_shape(fusion).is_some() => {
+            target.chip.gatherqmm_simdgroups_per_tg()
+        }
+        FusionKind::FusedChain
+            if fused_chain::dense_heavy_first_simdgroup_shape(fusion).is_some() =>
+        {
+            1
+        }
         FusionKind::FusedChain if fused_chain_dense_default_simdgroups(fusion).is_some() => {
             let default_sgs = fused_chain_dense_default_simdgroups(fusion).expect("shape checked");
             std::env::var("FUSEKIT_CHAIN_TG_SGS")
@@ -4604,39 +5874,107 @@ pub fn kernel_threadgroup_for(
                 2
             }
         }
-        FusionKind::RoutedQmvSwiglu | FusionKind::RoutedQmvReduce => {
-            target.chip.gatherqmm_simdgroups_per_tg()
+        FusionKind::RoutedQmvSwiglu if routed_qmv_swiglu_fast_shape(fusion).is_some() => {
+            let (k_dim, out_dim, _active_routes, bits, _) =
+                routed_qmv_swiglu_fast_shape(fusion).expect("shape checked");
+            qmv_fast_simdgroups(1, bits, k_dim, out_dim)
+        }
+        FusionKind::RoutedQmvSwiglu => routed_qmv_swiglu_simdgroups_per_tg(target),
+        FusionKind::RoutedQmvReduce if routed_qmv_reduce_fold_routes(fusion) => 1,
+        FusionKind::RoutedQmvReduce
+            if matches!(
+                &fusion.attrs,
+                FusionAttrs::RoutedQmvReduce {
+                    residual_linear: Some(_),
+                    ..
+                }
+            ) =>
+        {
+            let max_sgs = target.chip.gatherqmm_default_simdgroups_per_tg();
+            routed_qmv_reduce_routes_per_token(fusion)
+                .map(|n| n.saturating_add(1))
+                .unwrap_or(max_sgs)
+                .clamp(1, max_sgs.max(1))
+        }
+        FusionKind::RoutedQmvReduce => {
+            let max_sgs = target.chip.gatherqmm_default_simdgroups_per_tg();
+            routed_qmv_reduce_routes_per_token(fusion)
+                .unwrap_or(max_sgs)
+                .clamp(1, max_sgs.max(1))
+        }
+        FusionKind::Single(ref name) if name == "GatherQMMReduce" => {
+            let max_sgs = target.chip.gatherqmm_default_simdgroups_per_tg();
+            gather_qmm_reduce_simdgroups_per_tg(fusion)
+                .unwrap_or(max_sgs)
+                .clamp(1, max_sgs.max(1))
         }
         FusionKind::Single(ref name)
             if name == "QuantizedMatmul" && qmm_mlx_qmmt_shape(fusion).is_some() =>
         {
             4
         }
+        FusionKind::Single(ref name)
+            if name == "GatherQMM" && gather_qmm_mlx_qmv_shape(fusion).is_some() =>
+        {
+            let (k_dim, out_dim, _active_routes, bits, _) =
+                gather_qmm_mlx_qmv_shape(fusion).expect("shape checked");
+            qmv_fast_simdgroups(1, bits, k_dim, out_dim)
+        }
+        FusionKind::Single(ref name)
+            if name == "GatherQMM" && gather_qmm_nax_shape(fusion).is_some() =>
+        {
+            4
+        }
         FusionKind::Single(ref name) if name == "ScaledDotProductAttention" => {
-            match single::sdpa_prefill_plan(fusion, meta) {
-                single::SdpaPrefillPlan::BlockNax => {
-                    // Block-NAX SDPA maps one query block/head to one
-                    // threadgroup and uses WM=1, WN=2, i.e. two
-                    // simdgroups per threadgroup.
-                    2
+            if single::sdpa_single_decode_enabled(fusion, meta) {
+                let v_dim = fusion
+                    .inputs
+                    .get(2)
+                    .and_then(|bd| bd.shape.last().copied())
+                    .or_else(|| {
+                        fusion
+                            .outputs
+                            .first()
+                            .and_then(|bd| bd.shape.last().copied())
+                    })
+                    .unwrap_or(meta.head_dim as i32)
+                    .max(1) as u32;
+                let flash_sgs = if single::sdpa_single_decode_flash_enabled(fusion, meta) {
+                    ceil_div_u64(v_dim as u64, b.simd_width as u64) as u32
+                } else {
+                    4
+                };
+                std::env::var("FUSEKIT_SDPA_TG_SGS")
+                    .ok()
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .filter(|&n| (1..=8).contains(&n))
+                    .unwrap_or_else(|| flash_sgs.clamp(4, 8))
+            } else {
+                match single::sdpa_prefill_plan(fusion, meta) {
+                    single::SdpaPrefillPlan::BlockNax => {
+                        // Block-NAX SDPA maps one query block/head to one
+                        // threadgroup and uses WM=1, WN=2, i.e. two
+                        // simdgroups per threadgroup.
+                        2
+                    }
+                    single::SdpaPrefillPlan::Online => {
+                        // The default online prefill emitter maps one query/head
+                        // to one simdgroup; vectorized K/V splitting is kept as a
+                        // forced debug path because it profiles slower here.
+                        1
+                    }
+                    single::SdpaPrefillPlan::OnlineVector => {
+                        // MLX sdpa_vector shape: one query/head per TG, with 32
+                        // simdgroups splitting K/V rows and reducing partial
+                        // softmax state inside the TG.
+                        32
+                    }
+                    single::SdpaPrefillPlan::FlashGqa => {
+                        let (_, _, _, flash_sgs) = single::sdpa_prefill_flash_tiling(meta);
+                        flash_sgs.max(1)
+                    }
+                    single::SdpaPrefillPlan::Materialized => 4,
                 }
-                single::SdpaPrefillPlan::Online => {
-                    // The default online prefill emitter maps one query/head
-                    // to one simdgroup; vectorized K/V splitting is kept as a
-                    // forced debug path because it profiles slower here.
-                    1
-                }
-                single::SdpaPrefillPlan::OnlineVector => {
-                    // MLX sdpa_vector shape: one query/head per TG, with 32
-                    // simdgroups splitting K/V rows and reducing partial
-                    // softmax state inside the TG.
-                    32
-                }
-                single::SdpaPrefillPlan::FlashGqa => {
-                    let (_, _, _, flash_sgs) = single::sdpa_prefill_flash_tiling(meta);
-                    flash_sgs.max(1)
-                }
-                single::SdpaPrefillPlan::Materialized => 4,
             }
         }
         FusionKind::Single(ref name)
@@ -4647,8 +5985,13 @@ pub fn kernel_threadgroup_for(
         FusionKind::Single(ref name)
             if name == "QuantizedMatmul" && qmm_mlx_qmv_fast_shape(fusion).is_some() =>
         {
-            let (k_dim, out_dim, active_rows, bits, _) =
+            let (k_dim, out_dim, active_rows, bits, group_size) =
                 qmm_mlx_qmv_fast_shape(fusion).expect("shape checked");
+            if let Some((_vecs_per_tg, _k_lanes, _rows_per_tg)) =
+                qmv_wide_params(active_rows, bits, group_size, k_dim, out_dim)
+            {
+                return 2;
+            }
             qmv_fast_simdgroups(active_rows, bits, k_dim, out_dim)
         }
         FusionKind::LinearResidual
@@ -4684,7 +6027,8 @@ pub fn kernel_threadgroup_for(
     // sweep TG sizes without recompiling per change. Bypasses the
     // chip-budget pick above.
     let sgs = match fusion.kind {
-        FusionKind::SdpaDecode | FusionKind::LayerBlock => sgs,
+        FusionKind::SdpaDecode | FusionKind::LayerBlock | FusionKind::RoutedQmvReduce => sgs,
+        FusionKind::Single(ref name) if name == "GatherQMMReduce" => sgs,
         _ => std::env::var("FUSEKIT_TG_SGS")
             .ok()
             .and_then(|s| s.parse::<u32>().ok())
@@ -4826,16 +6170,18 @@ pub fn kernel_threadgroup3_for(
     meta: &ModelMeta,
     target: &crate::target::Target,
 ) -> [u64; 3] {
-    if let FusionAttrs::Single {
-        op_attrs: crate::graph::Attrs::CustomKernel { threadgroup, .. },
-        ..
-    } = &fusion.attrs
-    {
-        return [
-            threadgroup[0].max(1) as u64,
-            threadgroup[1].max(1) as u64,
-            threadgroup[2].max(1) as u64,
-        ];
+    if preserves_mlx_custom_dispatch(fusion) {
+        if let FusionAttrs::Single {
+            op_attrs: crate::graph::Attrs::CustomKernel { threadgroup, .. },
+            ..
+        } = &fusion.attrs
+        {
+            return [
+                threadgroup[0].max(1) as u64,
+                threadgroup[1].max(1) as u64,
+                threadgroup[2].max(1) as u64,
+            ];
+        }
     }
     [kernel_threadgroup_for(fusion, meta, target), 1, 1]
 }
@@ -4912,6 +6258,18 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
                     })
             })
             .max(1)
+    };
+    let penultimate_dim = |shape: Option<&[i32]>, fallback: u64| -> u64 {
+        shape
+            .and_then(|s| s.get(s.len().saturating_sub(2)))
+            .map(|&d| d.max(1) as u64)
+            .unwrap_or(fallback.max(1))
+    };
+    let last_dim = |shape: Option<&[i32]>, fallback: u64| -> u64 {
+        shape
+            .and_then(|s| s.last())
+            .map(|&d| d.max(1) as u64)
+            .unwrap_or(fallback.max(1))
     };
     let argmax_active_rows = || -> u64 {
         let default_active_rows = crate::target::current_chip()
@@ -5003,6 +6361,13 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
                 1
             };
             let routes = active_tokens.saturating_mul(routes_per_token).max(1);
+            if let Some((k_dim, out_dim, _active_routes, bits, _)) =
+                routed_qmv_swiglu_fast_shape(fusion)
+            {
+                let cols_per_tg = qmv_fast_cols_per_threadgroup(1, bits, k_dim, out_dim) as u64;
+                let y_tiles = ceil_div(out_dim as u64, cols_per_tg.max(1));
+                return [routes.saturating_mul(tg), y_tiles.max(1), 1];
+            }
             let chip_rows = crate::target::current_chip().gatherqmm_rows_per_simdgroup() as u64;
             let rows_per_sg = if chip_rows > 1
                 && gate.out_dim as u64 >= chip_rows
@@ -5017,17 +6382,49 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
             [ceil_div(total_sgs, sgs_per_tg.max(1)) * tg, 1, 1]
         }
         FusionKind::RoutedQmvReduce => {
-            let FusionAttrs::RoutedQmvReduce { target } = &fusion.attrs else {
+            let FusionAttrs::RoutedQmvReduce { target, .. } = &fusion.attrs else {
                 return [TG_THREADS, 1, 1];
             };
             let Some(shape) = fusion.outputs.first().map(|b| b.shape.as_slice()) else {
                 return [TG_THREADS, 1, 1];
             };
             let active_tokens = crate::target::current_chip().active_tokens_for_shape(shape) as u64;
-            let total_sgs = active_tokens.saturating_mul(target.out_dim as u64).max(1);
-            [ceil_div(total_sgs, sgs_per_tg.max(1)) * tg, 1, 1]
+            let out_cols = routed_qmv_reduce_cols_per_simdgroup(fusion).unwrap_or(1) as u64;
+            let out_blocks = ceil_div(target.out_dim as u64, out_cols.max(1));
+            let n_work = active_tokens.saturating_mul(out_blocks).max(1);
+            [n_work.saturating_mul(tg), 1, 1]
         }
         FusionKind::FusedChain => {
+            if let Some((rows, _intermediate, _out_dim)) =
+                fused_chain::dense_swiglu_down_grid_shape(fusion)
+            {
+                return [rows.saturating_mul(tg), 1, 1];
+            }
+            if let Some((batch, m, _k, n_dim, _b_transposed)) =
+                fused_chain::dense_heavy_first_simdgroup_shape(fusion)
+            {
+                let tiles = (batch as u64)
+                    .saturating_mul((m / 8) as u64)
+                    .saturating_mul((n_dim / 8) as u64)
+                    .max(1);
+                return [tiles.saturating_mul(32), 1, 1];
+            }
+            if let Some((_k_dim, out_dim, active_routes, _bits, _group_size)) =
+                fused_chain_gather_qmm_swiglu_shape(fusion)
+            {
+                let chip_rows = crate::target::current_chip().gatherqmm_rows_per_simdgroup() as u64;
+                let rows_per_sg = if chip_rows > 1
+                    && out_dim as u64 >= chip_rows
+                    && out_dim as u64 % chip_rows == 0
+                {
+                    chip_rows
+                } else {
+                    1
+                };
+                let row_blocks = ceil_div(out_dim as u64, rows_per_sg.max(1));
+                let total_sgs = active_routes.saturating_mul(row_blocks).max(1);
+                return [ceil_div(total_sgs, sgs_per_tg.max(1)) * tg, 1, 1];
+            }
             let steps = match &fusion.attrs {
                 FusionAttrs::FusedChain { steps, .. } => steps,
                 _ => return [TG_THREADS, 1, 1],
@@ -5143,22 +6540,59 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
                     // is divisible by that factor. This mirrors the
                     // gating in `emit_reduction_fanout_chain` so the
                     // dispatch shape matches the kernel's expectation.
-                    let (rows, _) = rows_and_last(&steps[0].output_shape);
+                    let (trace_rows, _) = rows_and_last(&steps[0].output_shape);
+                    let active_rows = crate::target::current_chip()
+                        .active_rows_before_last(&steps[0].output_shape)
+                        .max(1);
                     let heavy_dims: Vec<u64> = steps
                         .iter()
                         .skip(1)
                         .filter(|s| categorize_name(&s.op_name) == OpCategory::Heavy)
                         .map(|s| *s.output_shape.last().unwrap_or(&1) as u64)
                         .collect();
-                    let swiglu_absorbed = steps.len() == 6
+                    let swiglu_absorbed = steps.len() >= 6
                         && fusion.outputs.len() == 1
                         && steps[0].op_name == "RMSNorm"
                         && categorize_name(&steps[1].op_name) == OpCategory::Heavy
                         && categorize_name(&steps[2].op_name) == OpCategory::Heavy
                         && steps[3].op_name == "Sigmoid"
                         && steps[4].op_name == "Multiply"
-                        && steps[5].op_name == "Multiply";
+                        && steps[5].op_name == "Multiply"
+                        && steps.iter().skip(6).all(|s| {
+                            categorize_name(&s.op_name) == OpCategory::View
+                                && crate::fusion::category::is_chain_absorbable_view(&s.op_name)
+                        });
+                    let quant_pair_fanout = env_bool_on("FUSEKIT_EXPERIMENTAL_QUANT_PAIR_FANOUT")
+                        && steps.len() == 3
+                        && fusion.outputs.len() == 2
+                        && steps[0].op_name == "RMSNorm"
+                        && steps[1].op_name == "QuantizedMatmul"
+                        && steps[2].op_name == "QuantizedMatmul"
+                        && matches!(
+                            steps[1].inputs.first(),
+                            Some(ChainOperand::Register { step_index: 0 })
+                        )
+                        && matches!(
+                            steps[2].inputs.first(),
+                            Some(ChainOperand::Register { step_index: 0 })
+                        )
+                        && steps[1].output_shape.last() == steps[2].output_shape.last()
+                        && matches!(
+                            (&steps[1].op_attrs, &steps[2].op_attrs),
+                            (
+                                crate::graph::Attrs::Quantized {
+                                    bits: bits0,
+                                    group_size: group0,
+                                },
+                                crate::graph::Attrs::Quantized {
+                                    bits: bits1,
+                                    group_size: group1,
+                                }
+                            ) if bits0 == bits1 && group0 == group1 && matches!(*bits0, 4 | 8)
+                        );
                     let out_total: u64 = if swiglu_absorbed {
+                        heavy_dims.first().copied().unwrap_or(1)
+                    } else if quant_pair_fanout {
                         heavy_dims.first().copied().unwrap_or(1)
                     } else {
                         heavy_dims.iter().sum::<u64>().max(1)
@@ -5220,7 +6654,7 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
                         .and_then(|s| s.parse::<u64>().ok())
                         .filter(|&n| n > 0)
                         .unwrap_or(u64::MAX); // disabled by default
-                    let token_m_rows = if rows > 1
+                    let token_m_rows = if active_rows > 1
                         && rows_per_sg == 1
                         && steps[0].op_name == "RMSNorm"
                         && heavy_count >= 2
@@ -5246,7 +6680,7 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
                             let out_dim = s.output_shape.last().copied().unwrap_or(1).max(1) as u32;
                             best =
                                 best.min(crate::target::current_chip().qgemm_m_rows_per_simdgroup(
-                                    rows as u32,
+                                    active_rows as u32,
                                     bits,
                                     hidden_dim,
                                     out_dim,
@@ -5260,11 +6694,11 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
                     } else {
                         1
                     };
-                    let tgs_per_row = if rows == 1 && swiglu_absorbed {
+                    let tgs_per_row = if active_rows == 1 && swiglu_absorbed {
                         exact_tgs.min(cap_swiglu)
-                    } else if rows == 1 && heavy_count == 1 && out_total >= 10000 {
+                    } else if active_rows == 1 && heavy_count == 1 && out_total >= 10000 {
                         exact_tgs.min(cap_lmhead)
-                    } else if rows == 1
+                    } else if active_rows == 1
                         && heavy_count >= 2
                         && !swiglu_absorbed
                         && exact_tgs > cap_fanout
@@ -5274,10 +6708,11 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
                         exact_tgs
                     };
                     let row_groups = if token_m_rows > 1 {
-                        ceil_div(rows.max(1), token_m_rows as u64)
+                        ceil_div(active_rows.max(1), token_m_rows as u64)
                     } else {
-                        rows.max(1)
+                        active_rows.max(1)
                     };
+                    let _ = trace_rows;
                     [row_groups * tgs_per_row * tg, 1, 1]
                 }
                 OpCategory::Reduction => {
@@ -5301,7 +6736,25 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
                     // captured trace sequence length.
                     let shape = &fusion.outputs[0].shape;
                     let last_dim = shape.last().copied().unwrap_or(0) as u64;
-                    let active_rows = crate::target::current_chip().active_rows_before_last(shape);
+                    // Heavy-first chains may absorb a trailing Reshape, e.g.
+                    // QuantizedMatmul [B,T,N] -> Reshape [B,T,H,D]. The
+                    // emitter still dispatches one simdgroup over the heavy
+                    // op's logical output column N, so grid sizing must use
+                    // the head step's output width rather than the final
+                    // reshaped last dimension D.
+                    let work_out_dim = steps[0]
+                        .output_shape
+                        .last()
+                        .copied()
+                        .unwrap_or(last_dim as i32)
+                        .max(1) as u64;
+                    let active_rows = if steps[0].op_name == "Matmul" {
+                        fused_chain::dense_heavy_first_active_rows(fusion).unwrap_or_else(|| {
+                            crate::target::current_chip().active_rows_before_last(shape)
+                        })
+                    } else {
+                        crate::target::current_chip().active_rows_before_last(shape)
+                    };
                     let k_dim = steps[0]
                         .inputs
                         .first()
@@ -5316,16 +6769,18 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
                         .max(1) as u32;
                     let chip_rows = if steps[0].op_name == "Matmul" || steps[0].op_name == "AddMM" {
                         crate::target::current_chip()
-                            .dense_gemv_rows_per_simdgroup(k_dim, last_dim as u32)
+                            .dense_gemv_rows_per_simdgroup(k_dim, work_out_dim as u32)
                     } else {
                         crate::target::current_chip().gemv_rows_per_simdgroup()
                     } as u64;
-                    let rows_per_sg =
-                        if chip_rows > 1 && last_dim >= chip_rows && last_dim % chip_rows == 0 {
-                            chip_rows
-                        } else {
-                            1
-                        };
+                    let rows_per_sg = if chip_rows > 1
+                        && work_out_dim >= chip_rows
+                        && work_out_dim % chip_rows == 0
+                    {
+                        chip_rows
+                    } else {
+                        1
+                    };
                     let token_m_rows = if steps[0].op_name == "QuantizedMatmul"
                         && active_rows > 1
                         && rows_per_sg == 1
@@ -5341,7 +6796,7 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
                             active_rows as u32,
                             bits,
                             k_dim,
-                            last_dim as u32,
+                            work_out_dim as u32,
                         ) as u64
                     } else {
                         1
@@ -5362,7 +6817,7 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
                             active_rows as u32,
                             bits,
                             k_dim,
-                            last_dim as u32,
+                            work_out_dim as u32,
                         ) as u64
                     } else {
                         rows_per_sg
@@ -5370,7 +6825,7 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
                     [
                         active_row_groups
                             * ceil_div(
-                                last_dim.max(1),
+                                work_out_dim.max(1),
                                 sgs_per_tg.saturating_mul(qgemm_cols).max(1),
                             )
                             * tg,
@@ -5382,8 +6837,7 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
                     // Pointwise/view chains follow the same active-M
                     // policy as their emitter. This preserves
                     // post-sequence axes such as heads or MoE routes.
-                    let shape = &fusion.outputs[0].shape;
-                    let n = crate::target::current_chip().active_elems(shape);
+                    let n = fused_chain::pointwise_chain_work_elems(fusion, meta);
                     [ceil_div(n, tg) * tg, 1, 1]
                 }
             }
@@ -5393,28 +6847,39 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
             // pointwise layout; the ones that don't (Quantized,
             // CustomKernel) land below.
             use crate::fusion::ir::FusionAttrs;
-            if let FusionAttrs::Single {
-                op_attrs:
-                    crate::graph::Attrs::CustomKernel {
-                        grid, threadgroup, ..
-                    },
-                ..
-            } = &fusion.attrs
-            {
-                // mlx `metal_kernel(grid=..., threadgroup=...)` uses
-                // `grid` as dispatchThreads' total thread grid, not as
-                // threadgroup count. Preserve it exactly; multiplying
-                // by threadgroup over-dispatches kernels such as
-                // gated_delta by 4x on Y and corrupts state.
-                let _ = threadgroup;
-                return [
-                    grid[0].max(1) as u64,
-                    grid[1].max(1) as u64,
-                    grid[2].max(1) as u64,
-                ];
+            if preserves_mlx_custom_dispatch(fusion) {
+                if let FusionAttrs::Single {
+                    op_attrs:
+                        crate::graph::Attrs::CustomKernel {
+                            grid, threadgroup, ..
+                        },
+                    ..
+                } = &fusion.attrs
+                {
+                    // mlx `metal_kernel(grid=..., threadgroup=...)` uses
+                    // `grid` as dispatchThreads' total thread grid, not as
+                    // threadgroup count. Preserve it exactly for true opaque
+                    // CustomKernel ops. Known ops carrying mlx custom
+                    // metadata still follow fusekit's emitter contract.
+                    let _ = threadgroup;
+                    return [
+                        grid[0].max(1) as u64,
+                        grid[1].max(1) as u64,
+                        grid[2].max(1) as u64,
+                    ];
+                }
             }
-            if let FusionKind::Single(name) = &fusion.kind {
+            if let FusionKind::Single(kind_name) = &fusion.kind {
+                let name = single_dispatch_name(fusion).unwrap_or(kind_name.as_str());
                 if name == "Split" {
+                    let n: u64 = fusion
+                        .outputs
+                        .iter()
+                        .map(|o| crate::target::current_chip().active_elems(&o.shape))
+                        .sum();
+                    return [ceil_div(n.max(1), tg) * tg, 1, 1];
+                }
+                if name == "TransposeSplit" {
                     let n: u64 = fusion.outputs.iter().map(|o| elems(&o.shape)).sum();
                     return [ceil_div(n.max(1), tg) * tg, 1, 1];
                 }
@@ -5467,6 +6932,15 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
                     if let Some((k_dim, out_dim, active_rows, bits, _group_size)) =
                         qmm_mlx_qmv_fast_shape(fusion)
                     {
+                        if let Some((vecs_per_tg, _k_lanes, rows_per_tg)) =
+                            qmv_wide_params(active_rows, bits, _group_size, k_dim, out_dim)
+                        {
+                            return [
+                                ceil_div(active_rows, vecs_per_tg as u64).saturating_mul(2 * 32),
+                                ceil_div(out_dim as u64, rows_per_tg as u64),
+                                1,
+                            ];
+                        }
                         let token_rows =
                             qmv_fast_token_rows(active_rows, bits, k_dim, out_dim) as u64;
                         let qmv_sgs = qmv_fast_simdgroups(active_rows, bits, k_dim, out_dim) as u64;
@@ -5573,6 +7047,20 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
                     } else {
                         meta.num_attention_heads.max(1) as u64
                     };
+                    if single::sdpa_single_decode_enabled(fusion, meta) {
+                        let active_m = crate::codegen::kernels::sdpa_decode::active_rows_for_shape(
+                            shape,
+                            meta.num_attention_heads,
+                            meta.head_dim,
+                        )
+                        .max(1) as u64;
+                        let chunks = if single::sdpa_single_decode_flash_enabled(fusion, meta) {
+                            sdpa_decode::FLASH_DEC_MAX_CHUNKS as u64
+                        } else {
+                            1
+                        };
+                        return [active_m * n_heads * chunks * tg, 1, 1];
+                    }
                     let trace_m = if shape.len() >= 2 {
                         shape[shape.len() - 2].max(1) as u32
                     } else {
@@ -5606,6 +7094,26 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
                     return [active_m.saturating_mul(n_heads).saturating_mul(tg), 1, 1];
                 }
                 if name == "GatherQMM" {
+                    if let Some((k_dim, out_dim, active_routes, bits, _group_size)) =
+                        gather_qmm_mlx_qmv_shape(fusion)
+                    {
+                        let qmv_sgs = qmv_fast_simdgroups(1, bits, k_dim, out_dim) as u64;
+                        let cols_per_tg =
+                            qmv_fast_cols_per_threadgroup(1, bits, k_dim, out_dim) as u64;
+                        return [
+                            ceil_div(out_dim as u64, cols_per_tg.max(1))
+                                .saturating_mul(qmv_sgs.saturating_mul(32)),
+                            active_routes.max(1),
+                            1,
+                        ];
+                    }
+                    if let Some((_k_dim, out_dim, active_routes, bits, _group_size)) =
+                        gather_qmm_nax_shape(fusion)
+                    {
+                        let _ = (_k_dim, bits);
+                        let bn = 64u64;
+                        return [ceil_div(out_dim as u64, bn) * 128, active_routes.max(1), 1];
+                    }
                     // Routed expert QMM uses the same simdgroup-coop
                     // dot-product layout as regular QMM, but the
                     // traced output is `[B, trace_T, routes..., O]`
@@ -5639,7 +7147,22 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
                     let total_sgs = routes.saturating_mul(row_blocks).max(1);
                     return [ceil_div(total_sgs, sgs_per_tg.max(1)) * tg, 1, 1];
                 }
-                if name == "WeightedRouteReduce" {
+                if name == "GatherQMMReduce" {
+                    let Some(w_shape) = fusion.inputs.get(1).map(|b| b.shape.as_slice()) else {
+                        return [TG_THREADS, 1, 1];
+                    };
+                    let Some(shape) = fusion.outputs.first().map(|b| b.shape.as_slice()) else {
+                        return [TG_THREADS, 1, 1];
+                    };
+                    let out_dim = w_shape.get(1).copied().unwrap_or(1).max(1) as u64;
+                    let active_tokens =
+                        crate::target::current_chip().active_tokens_for_shape(shape) as u64;
+                    let out_cols = gather_qmm_reduce_cols_per_simdgroup(fusion).unwrap_or(1) as u64;
+                    let out_blocks = ceil_div(out_dim, out_cols.max(1));
+                    let n_work = active_tokens.saturating_mul(out_blocks).max(1);
+                    return [n_work.saturating_mul(tg), 1, 1];
+                }
+                if name == "ScaledSumReduce" || name == "WeightedRouteReduce" {
                     let n = crate::target::current_chip().active_elems(&fusion.outputs[0].shape);
                     return [ceil_div(n.max(1), tg) * tg, 1, 1];
                 }
@@ -5650,6 +7173,13 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
                     let shape = &fusion.outputs[0].shape;
                     let rows = crate::target::current_chip().active_rows_before_last(shape);
                     return [rows * tg, 1, 1];
+                }
+                if categorize_name(name) == OpCategory::Pointwise {
+                    let shape = &fusion.outputs[0].shape;
+                    if shape.last().copied().unwrap_or(0) >= 32_768 {
+                        let n = crate::target::current_chip().active_elems(shape);
+                        return [ceil_div(n.max(1), tg) * tg, 1, 1];
+                    }
                 }
             }
             let n = elems(&fusion.outputs[0].shape);
@@ -5722,62 +7252,42 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
                         .max(1)
                 })
                 .unwrap_or(1);
-            let vocab = *fusion.outputs[0].shape.last().unwrap_or(&1) as u64;
-            let default_tgs = match fusion.attrs {
-                FusionAttrs::FinalRmsNormLmHead { quant: Some(q), .. }
-                    if matches!(crate::target::current_chip(), crate::target::ChipModel::M5)
-                        && q.bits == 4
-                        && meta.hidden_size <= 1024 =>
-                {
-                    128
-                }
-                FusionAttrs::FinalRmsNormLmHead { quant: Some(q), .. }
-                    if matches!(crate::target::current_chip(), crate::target::ChipModel::M5)
-                        && q.bits == 4
-                        && meta.hidden_size <= 4096 =>
-                {
-                    // Mid-size q4 LM heads are memory-streaming dominated.
-                    // M5 L512 profiles favor 32 TG slices; wider splits
-                    // repeat scan/finalize work without enough extra vocab
-                    // parallelism to pay for it. Keep tiny heads on the
-                    // earlier 128-TG rule above.
-                    32
-                }
-                FusionAttrs::FinalRmsNormLmHead { quant: Some(q), .. }
-                    if matches!(crate::target::current_chip(), crate::target::ChipModel::M5)
-                        && q.bits == 8
-                        && (2048..=4096).contains(&meta.hidden_size) =>
-                {
-                    // q8 mid-size LM heads still stream a large vocab
-                    // matrix, but the q8 scan has lower arithmetic density
-                    // than q4 and pays more finalize overhead when split too
-                    // widely. M5 L512 profiles favored 32 scan slices over
-                    // 48/64 for this hidden-width class.
-                    32
-                }
-                _ => 64,
+            let quant = match fusion.attrs {
+                FusionAttrs::FinalRmsNormLmHead { quant, .. } => quant,
+                _ => None,
             };
-            let target_tgs: u64 = std::env::var("FUSEKIT_FINAL_LM_HEAD_TGS")
-                .ok()
-                .and_then(|s| s.parse::<u64>().ok())
-                .filter(|&n| n > 0)
-                .unwrap_or(default_tgs);
-            let max_useful_tgs = ceil_div(vocab, sgs_per_tg);
-            let n_tgs = target_tgs.min(max_useful_tgs);
+            let n_tgs = final_rmsnorm_lm_head::target_tgs(meta, quant);
             [rows * n_tgs * tg, 1, 1]
         }
         FusionKind::SdpaDecode => {
             let n_heads = meta.num_attention_heads as u64;
-            let active_m = active_m_from_shape(fusion.outputs.first().map(|b| b.shape.as_slice()));
+            let q_split = matches!(
+                fusion.attrs,
+                FusionAttrs::SdpaDecode {
+                    q_split: Some(_),
+                    ..
+                }
+            ) && fusion.inputs.len() >= 4;
             let qk_dim = fusion
                 .inputs
                 .first()
                 .and_then(|b| b.shape.last().copied())
+                .map(|d| {
+                    if q_split {
+                        d + fusion
+                            .inputs
+                            .get(1)
+                            .and_then(|b| b.shape.last().copied())
+                            .unwrap_or(0)
+                    } else {
+                        d
+                    }
+                })
                 .unwrap_or(meta.head_dim as i32)
                 .max(1) as u32;
             let v_dim = fusion
                 .inputs
-                .get(2)
+                .get(if q_split { 3 } else { 2 })
                 .and_then(|b| b.shape.last().copied())
                 .or_else(|| {
                     fusion.outputs.first().and_then(|b| {
@@ -5789,6 +7299,15 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
                 })
                 .unwrap_or(meta.head_dim as i32)
                 .max(1) as u32;
+            let active_m = fusion
+                .outputs
+                .first()
+                .map(|b| {
+                    sdpa_decode::active_rows_for_shape(&b.shape, meta.num_attention_heads, v_dim)
+                        as u64
+                })
+                .unwrap_or_else(|| active_m_from_shape(None))
+                .max(1);
             if sdpa_decode::flash_decoding_enabled_for(
                 meta.num_attention_heads,
                 meta.num_key_value_heads,
@@ -5852,7 +7371,11 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
             // compute multiple adjacent output rows per simdgroup, reusing the
             // same activation vector load while keeping the weight layout
             // unchanged. Keep dispatch in lockstep with that shape policy.
-            let n_out = elems(&fusion.outputs[0].shape);
+            let out_shape = fusion.outputs[0].shape.as_slice();
+            let n_out = crate::target::current_chip()
+                .active_rows_before_last(out_shape)
+                .saturating_mul(out_shape.last().copied().unwrap_or(1).max(1) as u64)
+                .max(1);
             let dense_rows = 1;
             [
                 ceil_div(n_out, sgs_per_tg.saturating_mul(dense_rows).max(1)) * tg,
@@ -5865,14 +7388,17 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
             [ceil_div(n, tg) * tg, 1, 1]
         }
         FusionKind::RopeQDecode => {
+            let q_shape = fusion.inputs.first().map(|b| b.shape.as_slice());
             let active_m = active_m_from_shape(
                 fusion
                     .outputs
                     .first()
                     .map(|b| b.shape.as_slice())
-                    .or_else(|| fusion.inputs.first().map(|b| b.shape.as_slice())),
+                    .or(q_shape),
             );
-            let n = active_m * (meta.num_attention_heads as u64) * (meta.head_dim as u64);
+            let n_heads = penultimate_dim(q_shape, meta.num_attention_heads as u64);
+            let head_dim = last_dim(q_shape, meta.head_dim as u64);
+            let n = active_m * n_heads * head_dim;
             [ceil_div(n, tg) * tg, 1, 1]
         }
         FusionKind::RmsNormRopeQGateDecode => {
@@ -5890,31 +7416,60 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
             // The BF16 cache-store emitter uses a flat element range:
             // [0, n_kv * head_dim) writes K and
             // [n_kv * head_dim, 2 * n_kv * head_dim) writes V.
+            let k_shape = fusion.inputs.first().map(|b| b.shape.as_slice());
             let active_m = active_m_from_shape(
                 fusion
                     .outputs
                     .first()
                     .map(|b| b.shape.as_slice())
-                    .or_else(|| fusion.inputs.first().map(|b| b.shape.as_slice())),
+                    .or(k_shape),
             );
-            let n = active_m * 2 * (meta.num_key_value_heads as u64) * (meta.head_dim as u64);
+            let n_kv = penultimate_dim(k_shape, meta.num_key_value_heads as u64);
+            let head_dim = last_dim(k_shape, meta.head_dim as u64);
+            let n = active_m * 2 * n_kv * head_dim;
             [ceil_div(n, tg) * tg, 1, 1]
         }
         FusionKind::KvCacheStoreDecode => {
-            let k_dim = fusion
+            let kv_transpose_split = match &fusion.attrs {
+                FusionAttrs::KvCacheStoreDecode {
+                    kv_transpose_split, ..
+                } => *kv_transpose_split,
+                _ => None,
+            };
+            let raw_k_dim0 = fusion
                 .inputs
                 .first()
                 .and_then(|b| b.shape.last())
                 .copied()
                 .unwrap_or(meta.head_dim as i32)
                 .max(1) as u64;
+            let k_dim0 = kv_transpose_split
+                .map(|d| d.max(1) as u64)
+                .unwrap_or(raw_k_dim0);
+            let split_k = fusion.inputs.len() >= 3;
+            let k_dim1 = if split_k {
+                fusion
+                    .inputs
+                    .get(1)
+                    .and_then(|b| b.shape.last())
+                    .copied()
+                    .unwrap_or(0)
+                    .max(0) as u64
+            } else {
+                0
+            };
+            let k_dim = k_dim0 + k_dim1;
+            let v_slot = if split_k { 2 } else { 1 };
             let v_dim = fusion
                 .inputs
-                .get(1)
+                .get(v_slot)
                 .and_then(|b| b.shape.last())
                 .copied()
                 .unwrap_or(meta.head_dim as i32)
                 .max(1) as u64;
+            let v_dim = kv_transpose_split
+                .map(|d| raw_k_dim0.saturating_sub(d as u64).max(1))
+                .unwrap_or(v_dim);
             let (n_kv, trace_m) =
                 if let Some(shape) = fusion.inputs.first().map(|b| b.shape.as_slice()) {
                     if shape.len() >= 3 {
@@ -5948,14 +7503,15 @@ fn kernel_grid_threads_impl(fusion: &Fusion, meta: &ModelMeta, tg: u64) -> [u64;
             [ceil_div(active_m * n_kv * (k_dim + v_dim), tg) * tg, 1, 1]
         }
         FusionKind::RmsNormRopeKvCacheStoreDecode => {
+            let k_shape = fusion.inputs.first().map(|b| b.shape.as_slice());
             let active_m = active_m_from_shape(
                 fusion
                     .outputs
                     .first()
                     .map(|b| b.shape.as_slice())
-                    .or_else(|| fusion.inputs.first().map(|b| b.shape.as_slice())),
+                    .or(k_shape),
             );
-            let n_kv = meta.num_key_value_heads as u64;
+            let n_kv = penultimate_dim(k_shape, meta.num_key_value_heads as u64);
             [active_m * 2 * n_kv * tg, 1, 1]
         }
         FusionKind::EmbedLookupDecode => {

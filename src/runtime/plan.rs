@@ -88,12 +88,64 @@ pub struct JsonEvent {
     pub fires: Vec<u32>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+#[derive(Debug, Clone)]
 pub enum JsonScalar {
     Bool(bool),
     Int(i64),
     Float(f64),
+}
+
+impl<'de> Deserialize<'de> for JsonScalar {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let v = serde_json::Value::deserialize(deserializer)?;
+        let ty = v
+            .get("type")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| serde::de::Error::custom("scalar missing type"))?;
+        let value = v
+            .get("value")
+            .ok_or_else(|| serde::de::Error::custom("scalar missing value"))?;
+        match ty {
+            "bool" => value
+                .as_bool()
+                .map(JsonScalar::Bool)
+                .ok_or_else(|| serde::de::Error::custom("invalid bool scalar")),
+            "int" => value
+                .as_i64()
+                .map(JsonScalar::Int)
+                .ok_or_else(|| serde::de::Error::custom("invalid int scalar")),
+            "float" => {
+                let f = if let Some(x) = value.as_f64() {
+                    x
+                } else if let Some(s) = value.as_str() {
+                    match s {
+                        "inf" => f64::INFINITY,
+                        "-inf" => f64::NEG_INFINITY,
+                        "nan" => f64::NAN,
+                        _ => {
+                            return Err(serde::de::Error::custom(format!(
+                                "invalid non-finite float scalar {s:?}"
+                            )))
+                        }
+                    }
+                } else if value.is_null() {
+                    // Backward compatibility for artifacts emitted before
+                    // non-finite scalars were spelled explicitly. serde_json
+                    // writes NaN/Inf as null when asked to serialize raw f64.
+                    f64::NAN
+                } else {
+                    return Err(serde::de::Error::custom("invalid float scalar"));
+                };
+                Ok(JsonScalar::Float(f))
+            }
+            other => Err(serde::de::Error::custom(format!(
+                "unknown scalar type {other:?}"
+            ))),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -236,7 +288,7 @@ impl<'p> ResolvedPlan<'p> {
         // freeing one underneath us mid-execution.
         let mut residency: Vec<metal::Buffer> = Vec::new();
         let mut seen_ptrs: std::collections::HashSet<*const std::ffi::c_void> = Default::default();
-        let mut register =
+        let register =
             |buf: &metal::Buffer,
              residency: &mut Vec<metal::Buffer>,
              seen: &mut std::collections::HashSet<*const std::ffi::c_void>| {
@@ -553,8 +605,6 @@ pub fn resolve_externals<'p>(
     model: &pyo3::Bound<'_, pyo3::PyAny>,
     ctx: &MetalContext,
 ) -> Result<ResolvedPlan<'p>> {
-    use pyo3::prelude::*;
-
     let mut external_buffers: HashMap<ExternalKey, metal::Buffer> = HashMap::new();
     let mut unresolved: Vec<ExternalKey> = Vec::new();
 

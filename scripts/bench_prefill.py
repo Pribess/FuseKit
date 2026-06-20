@@ -19,14 +19,25 @@ from pathlib import Path
 from typing import Any
 
 
-OMLX_PY = "/Applications/oMLX.app/Contents/Python/cpython-3.11/bin/python3.11"
-OMLX_PYTHONPATH = (
-    "/Users/pribess/Documents/workspace/fusekit/python:"
-    "/Applications/oMLX.app/Contents/Resources:"
-    "/Applications/oMLX.app/Contents/Python/framework-mlx-framework/"
-    "lib/python3.11/site-packages"
+WORKSPACE = Path(__file__).resolve().parents[1]
+OMLX_APP = Path(os.environ.get("FUSEKIT_MLX_APP", "/Applications/oMLX.app")).expanduser()
+OMLX_PY = os.environ.get(
+    "FUSEKIT_PYTHON",
+    str(OMLX_APP / "Contents/Python/cpython-3.11/bin/python3.11"),
 )
-OMLX_MODEL_ROOT = Path("/Users/pribess/.omlx/models")
+OMLX_PYTHONPATH = os.pathsep.join(
+    [
+        str(WORKSPACE / "python"),
+        str(OMLX_APP / "Contents/Resources"),
+        str(
+            OMLX_APP
+            / "Contents/Python/framework-mlx-framework/lib/python3.11/site-packages"
+        ),
+    ]
+)
+OMLX_MODEL_ROOT = Path(
+    os.environ.get("FUSEKIT_OMLX_DIR", Path.home() / ".omlx/models")
+).expanduser()
 
 
 def model_path(name_or_path: str) -> Path:
@@ -39,10 +50,7 @@ def model_path(name_or_path: str) -> Path:
 def env_for(mode: str) -> dict[str, str]:
     env = os.environ.copy()
     env["PYTHONPATH"] = OMLX_PYTHONPATH
-    env.setdefault(
-        "PYTHONPYCACHEPREFIX",
-        "/Users/pribess/Documents/workspace/fusekit/.pycache-check",
-    )
+    env.setdefault("PYTHONPYCACHEPREFIX", str(WORKSPACE / ".pycache-check"))
     if mode == "raw":
         env["FUSEKIT_DISABLE_HOOK"] = "1"
         env["FUSEKIT_DISABLE_DISPATCH"] = "1"

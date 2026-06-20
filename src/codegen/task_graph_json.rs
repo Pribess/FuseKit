@@ -17,7 +17,7 @@
 //!   allocates one Metal buffer per scratch id at init time and
 //!   reuses it across decode iterations.
 
-use serde::Serialize;
+use serde::{Serialize, Serializer};
 
 use crate::codegen::kernels::{
     extra_bindings_for, kernel_function_name, kernel_grid_threads_for, kernel_threadgroup3_for,
@@ -101,12 +101,44 @@ pub struct JsonExtraBinding {
     pub role: String,
 }
 
-#[derive(Serialize)]
-#[serde(tag = "type", content = "value", rename_all = "snake_case")]
 pub enum JsonScalar {
     Bool(bool),
     Int(i64),
     Float(f64),
+}
+
+impl Serialize for JsonScalar {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        use serde::ser::SerializeMap;
+
+        let mut map = serializer.serialize_map(Some(2))?;
+        match self {
+            JsonScalar::Bool(v) => {
+                map.serialize_entry("type", "bool")?;
+                map.serialize_entry("value", v)?;
+            }
+            JsonScalar::Int(v) => {
+                map.serialize_entry("type", "int")?;
+                map.serialize_entry("value", v)?;
+            }
+            JsonScalar::Float(v) => {
+                map.serialize_entry("type", "float")?;
+                if v.is_finite() {
+                    map.serialize_entry("value", v)?;
+                } else if v.is_infinite() && v.is_sign_positive() {
+                    map.serialize_entry("value", "inf")?;
+                } else if v.is_infinite() {
+                    map.serialize_entry("value", "-inf")?;
+                } else {
+                    map.serialize_entry("value", "nan")?;
+                }
+            }
+        }
+        map.end()
+    }
 }
 
 #[derive(Serialize)]
@@ -272,11 +304,11 @@ pub fn build(
             .flat_map(|(i, f)| f.outputs.iter().map(move |b| (b.source, i)))
             .collect();
         // Tensors that came (transitively) from an SDPA fusekit output.
-        // Once a tensor is in this set, any single-input/single-output
-        // view-op consuming it can be aliased to its scratch — we know
-        // the SDPA piece's byte layout matches what the o_proj chain's
-        // flat `x[k]` indexing wants, regardless of the trace's strided
-        // intermediates.
+        // SDPA consumers often have metadata-only reshape/flatten bridge
+        // views in the captured graph. Those can be aliased, but a real
+        // transpose/ascontiguous still has to materialize into separate
+        // scratch; otherwise the generated kernel reads and writes the same
+        // buffer with permuted indices.
         let mut sdpa_descendant: std::collections::HashSet<TensorId> = Default::default();
         for f in &fg.fusions {
             if matches!(f.kind, FusionKind::SdpaDecode) {
@@ -306,19 +338,6 @@ pub fn build(
                     if matches!(name.as_str(), "Transpose" | "AsContiguous")
             )
         };
-        let is_sdpa_bridge_view = |op_name: &str| -> bool {
-            // Views that CAN permute bytes (Reshape, Transpose,
-            // Flatten, AsContiguous), but downstream of fusekit's
-            // SDPA piece are safe to alias because the SDPA output's
-            // actual layout matches what flat downstream readers
-            // (Heavy-first chain `x[k]`) expect — the trace's
-            // Transpose+Reshape only existed to undo mlx's strided
-            // SDPA output, which fusekit doesn't produce.
-            matches!(
-                op_name,
-                "Reshape" | "Flatten" | "Unflatten" | "AsContiguous" | "Transpose"
-            )
-        };
         loop {
             let mut changed = false;
             for fusion in &fg.fusions {
@@ -336,10 +355,20 @@ pub fn build(
                     true
                 } else if is_contiguous_reshape(op_name)
                     && same_elements
+                    && scratch_id_by_tensor.contains_key(&in_tid)
+                {
+                    true
+                } else if op_name == "Transpose"
+                    && same_elements
+                    && transpose_preserves_contiguous_order(fusion)
                     && producer_is_decode_value(in_tid)
                 {
                     true
-                } else if is_sdpa_bridge_view(op_name) && sdpa_descendant.contains(&in_tid) {
+                } else if sdpa_descendant.contains(&in_tid)
+                    && is_contiguous_reshape(op_name)
+                    && same_elements
+                    && producer_is_decode_value(in_tid)
+                {
                     true
                 } else {
                     false
@@ -589,6 +618,8 @@ pub fn build(
         }
     }
 
+    let augmented_deps = augmented_task_dependencies(tg, fg, &scratch_id_by_tensor);
+
     let mut tasks_json: Vec<JsonTask> = Vec::with_capacity(tg.tasks.len());
     for task in &tg.tasks {
         let fusion = &fg.fusions[task.fusion as usize];
@@ -660,18 +691,36 @@ pub fn build(
             outputs,
             extra_bindings: extra,
             layer_idx,
-            depends_on: task.deps.clone(),
+            depends_on: augmented_deps
+                .get(task.id as usize)
+                .cloned()
+                .unwrap_or_else(|| task.deps.clone()),
             trigger_event: task.trigger,
         });
     }
 
+    let mut event_fires: Vec<Vec<u32>> = vec![Vec::new(); tg.events.len()];
+    for task in &tg.tasks {
+        if let Some(deps) = augmented_deps.get(task.id as usize) {
+            for &dep_event in deps {
+                if dep_event == task.trigger {
+                    continue;
+                }
+                if let Some(fires) = event_fires.get_mut(dep_event as usize) {
+                    if !fires.contains(&task.id) {
+                        fires.push(task.id);
+                    }
+                }
+            }
+        }
+    }
     let events_json: Vec<JsonEvent> = tg
         .events
         .iter()
         .map(|e| JsonEvent {
             id: e.id,
             num_triggers: e.num_triggers,
-            fires: e.fires.clone(),
+            fires: event_fires.get(e.id as usize).cloned().unwrap_or_default(),
         })
         .collect();
 
@@ -702,6 +751,89 @@ pub fn build(
     }
 }
 
+fn augmented_task_dependencies(
+    tg: &TaskGraph,
+    fg: &FusionGraph,
+    scratch_id_by_tensor: &std::collections::HashMap<TensorId, u32>,
+) -> Vec<Vec<u32>> {
+    let mut producer_by_tensor: std::collections::HashMap<TensorId, u32> = Default::default();
+    let mut producer_by_scratch: std::collections::HashMap<u32, u32> = Default::default();
+    for task in &tg.tasks {
+        let Some(fusion) = fg.fusions.get(task.fusion as usize) else {
+            continue;
+        };
+        if is_aliased_noop_view_for_scratch(fusion, scratch_id_by_tensor) {
+            continue;
+        }
+        for output in &fusion.outputs {
+            producer_by_tensor.insert(output.source, task.trigger);
+            if let Some(&sid) = scratch_id_by_tensor.get(&output.source) {
+                producer_by_scratch.insert(sid, task.trigger);
+            }
+        }
+    }
+
+    tg.tasks
+        .iter()
+        .map(|task| {
+            let mut deps: std::collections::BTreeSet<u32> = task.deps.iter().copied().collect();
+            let Some(fusion) = fg.fusions.get(task.fusion as usize) else {
+                return deps.into_iter().collect();
+            };
+            let overridden_input_slots = extra_bound_input_slots(fusion, &fg.meta);
+            for (input_idx, input) in fusion.inputs.iter().enumerate() {
+                if overridden_input_slots.contains(&input_idx) {
+                    continue;
+                }
+                if let Some(dep) = producer_by_tensor.get(&input.source).copied() {
+                    if dep != task.trigger {
+                        deps.insert(dep);
+                    }
+                }
+                if let Some(dep) = scratch_id_by_tensor
+                    .get(&input.source)
+                    .and_then(|sid| producer_by_scratch.get(sid))
+                    .copied()
+                {
+                    if dep != task.trigger {
+                        deps.insert(dep);
+                    }
+                }
+            }
+            deps.into_iter().collect()
+        })
+        .collect()
+}
+
+fn is_aliased_noop_view_for_scratch(
+    fusion: &crate::fusion::ir::Fusion,
+    scratch_id_by_tensor: &std::collections::HashMap<TensorId, u32>,
+) -> bool {
+    use crate::fusion::ir::FusionKind;
+
+    let FusionKind::Single(name) = &fusion.kind else {
+        return false;
+    };
+    if !matches!(
+        name.as_str(),
+        "Reshape"
+            | "Flatten"
+            | "Unflatten"
+            | "Squeeze"
+            | "ExpandDims"
+            | "AsContiguous"
+            | "Transpose"
+    ) || fusion.inputs.len() != 1
+        || fusion.outputs.len() != 1
+    {
+        return false;
+    }
+    scratch_id_by_tensor
+        .get(&fusion.inputs[0].source)
+        .zip(scratch_id_by_tensor.get(&fusion.outputs[0].source))
+        .is_some_and(|(a, b)| a == b)
+}
+
 fn emitted_active_m(fg: &FusionGraph, target: &crate::target::Target) -> u32 {
     let trace_m = fg
         .fusions
@@ -717,6 +849,57 @@ fn emitted_active_m(fg: &FusionGraph, target: &crate::target::Target) -> u32 {
         .max()
         .unwrap_or(1);
     target.chip.active_m(trace_m)
+}
+
+fn transpose_preserves_contiguous_order(fusion: &crate::fusion::ir::Fusion) -> bool {
+    use crate::fusion::ir::{FusionAttrs, FusionKind};
+
+    let FusionKind::Single(op_name) = &fusion.kind else {
+        return false;
+    };
+    if op_name != "Transpose" || fusion.inputs.len() != 1 || fusion.outputs.len() != 1 {
+        return false;
+    }
+    let FusionAttrs::Single {
+        op_attrs: crate::graph::Attrs::Transpose { axes },
+        ..
+    } = &fusion.attrs
+    else {
+        return false;
+    };
+    let in_shape = &fusion.inputs[0].shape;
+    let out_shape = &fusion.outputs[0].shape;
+    if axes.len() != in_shape.len() || out_shape.len() != in_shape.len() {
+        return false;
+    }
+
+    let mut seen = vec![false; axes.len()];
+    let mut non_unit_input_axes = Vec::new();
+    for (axis, &dim) in in_shape.iter().enumerate() {
+        if dim.max(1) > 1 {
+            non_unit_input_axes.push(axis);
+        }
+    }
+
+    let mut non_unit_output_axes = Vec::new();
+    for (out_axis, &input_axis) in axes.iter().enumerate() {
+        if input_axis < 0 || input_axis as usize >= in_shape.len() {
+            return false;
+        }
+        let input_axis = input_axis as usize;
+        if seen[input_axis] || out_shape[out_axis] != in_shape[input_axis] {
+            return false;
+        }
+        seen[input_axis] = true;
+        if in_shape[input_axis].max(1) > 1 {
+            non_unit_output_axes.push(input_axis);
+        }
+    }
+
+    // Moving only size-1 axes is a metadata view under contiguous
+    // row-major indexing. The order of all real dimensions must be
+    // preserved; otherwise the op is a materialising permute.
+    non_unit_output_axes == non_unit_input_axes
 }
 
 fn analyze_decode_capabilities(
@@ -752,6 +935,7 @@ fn analyze_decode_capabilities(
                 | "Multiply"
                 | "Divide"
                 | "Power"
+                | "Tanh"
                 | "Maximum"
                 | "Minimum"
                 | "Sigmoid"
@@ -769,17 +953,24 @@ fn analyze_decode_capabilities(
                 | "AsContiguous"
                 | "Broadcast"
                 | "Transpose"
+                | "TransposeSplit"
                 | "Slice"
                 | "Matmul"
                 | "ScaledDotProductAttention"
                 | "Softmax"
+                | "SoftmaxTopKRoute"
                 | "ArgPartition"
                 | "Argpartition"
+                | "ArgTopKAsc"
+                | "ArgTopKDesc"
                 | "Arange"
                 | "Full"
                 | "Gather"
                 | "GatherAxis"
+                | "GatherAxisScaleExpand"
                 | "GatherQMM"
+                | "GatherQMMReduce"
+                | "ScaledSumReduce"
                 | "WeightedRouteReduce"
                 | "Concatenate"
                 | "Reduce"
@@ -805,9 +996,50 @@ fn analyze_decode_capabilities(
         }
         tally.into_iter().max_by_key(|(_, n)| *n).map(|(i, _)| i)
     };
+    let tensor_layer = |tid: crate::graph::TensorId| -> Option<i32> {
+        let mut cur = tid;
+        let mut seen = BTreeSet::new();
+        while seen.insert(cur) {
+            let tensor = graph.tensors.get(cur as usize)?;
+            let op_id = tensor.producer?;
+            let op = graph.ops.get(op_id as usize)?;
+            if let Some(LayerTag::Layer(i)) = op.layer_id {
+                return Some(i);
+            }
+            if !matches!(
+                op.name.as_str(),
+                "Reshape"
+                    | "Flatten"
+                    | "Unflatten"
+                    | "Squeeze"
+                    | "ExpandDims"
+                    | "Transpose"
+                    | "AsContiguous"
+                    | "RoPE"
+                    | "Slice"
+            ) || op.inputs.is_empty()
+            {
+                return None;
+            }
+            cur = op.inputs[0];
+        }
+        None
+    };
 
     let mut sdpa_layers: BTreeSet<i32> = BTreeSet::new();
     let mut kv_store_layers: BTreeSet<i32> = BTreeSet::new();
+    let mut sdpa_kv_source_layers: BTreeMap<i32, BTreeSet<i32>> = BTreeMap::new();
+    let layer_owns_current_kv = |layer: i32| -> bool {
+        if layer < 0 {
+            return true;
+        }
+        let n_layers = fg.meta.num_hidden_layers;
+        let shared_layers = fg.meta.num_kv_shared_layers;
+        if n_layers == 0 || shared_layers == 0 || shared_layers > n_layers {
+            return true;
+        }
+        (layer as u32) < n_layers.saturating_sub(shared_layers)
+    };
     for task_id in decode_pipeline {
         let task = &tg.tasks[*task_id as usize];
         let fusion = &fg.fusions[task.fusion as usize];
@@ -817,9 +1049,35 @@ fn analyze_decode_capabilities(
         match fusion.kind {
             FusionKind::SdpaDecode => {
                 sdpa_layers.insert(layer);
+                if fusion.inputs.len() >= 3 {
+                    if let (Some(k_layer), Some(v_layer)) = (
+                        tensor_layer(fusion.inputs[1].source),
+                        tensor_layer(fusion.inputs[2].source),
+                    ) {
+                        if k_layer == v_layer {
+                            sdpa_kv_source_layers
+                                .entry(layer)
+                                .or_default()
+                                .insert(k_layer);
+                        }
+                    }
+                }
             }
             FusionKind::Single(ref name) if name == "ScaledDotProductAttention" => {
                 sdpa_layers.insert(layer);
+                if fusion.inputs.len() >= 3 {
+                    if let (Some(k_layer), Some(v_layer)) = (
+                        tensor_layer(fusion.inputs[1].source),
+                        tensor_layer(fusion.inputs[2].source),
+                    ) {
+                        if k_layer == v_layer {
+                            sdpa_kv_source_layers
+                                .entry(layer)
+                                .or_default()
+                                .insert(k_layer);
+                        }
+                    }
+                }
             }
             FusionKind::RopeKvCacheStoreDecode => {
                 kv_store_layers.insert(layer);
@@ -846,6 +1104,17 @@ fn analyze_decode_capabilities(
     }
 
     for layer in sdpa_layers.difference(&kv_store_layers) {
+        if !layer_owns_current_kv(*layer) {
+            continue;
+        }
+        let has_shared_kv_source = sdpa_kv_source_layers.get(layer).is_some_and(|sources| {
+            sources
+                .iter()
+                .any(|source| source != layer && kv_store_layers.contains(source))
+        });
+        if has_shared_kv_source {
+            continue;
+        }
         reasons.push(JsonCapabilityReason {
             code: "missing_current_token_kv_store".to_string(),
             layer_idx: Some(*layer),
@@ -1067,7 +1336,9 @@ fn is_decode_safe_omitted_dependency(
         let Some(name) = view_name(fusion) else {
             return false;
         };
-        if matches!(name, "Transpose" | "AsContiguous") {
+        if name == "AsContiguous"
+            || (name == "Transpose" && !transpose_preserves_contiguous_order(fusion))
+        {
             requires_sdpa_bridge = true;
         }
         if task.deps.is_empty() {
@@ -1392,7 +1663,13 @@ fn build_decode_pipeline(
             FusionKind::Single(name)
                 if matches!(
                     name.as_str(),
-                    "RMSNorm" | "QuantizedMatmul" | "Sigmoid" | "Multiply" | "Add"
+                    "RMSNorm"
+                        | "QuantizedMatmul"
+                        | "Sigmoid"
+                        | "Tanh"
+                        | "Multiply"
+                        | "Add"
+                        | "Slice"
                 ) =>
             {
                 Some(99)
@@ -1711,9 +1988,10 @@ fn build_decode_pipeline(
                         (is_post && out_last.is_some_and(is_vocab_projection_dim))
                             || is_qwen3_next_attention_layer
                     }
-                    "Sigmoid" | "Multiply" => {
+                    "Sigmoid" | "Tanh" | "Multiply" => {
                         is_qwen3_next_attention_layer && out_last == Some(hidden)
                     }
+                    "Slice" => true,
                     "Add" => matches!(tag, LayerTag::Layer(_)) && out_last == Some(hidden),
                     _ => false,
                 }
@@ -1728,7 +2006,8 @@ fn build_decode_pipeline(
             } else {
                 match name.as_str() {
                     "RMSNorm" | "QuantizedMatmul" => 1,
-                    "Sigmoid" | "Multiply" => 4,
+                    "Sigmoid" | "Tanh" | "Multiply" => 4,
+                    "Slice" => 4,
                     "Add" => 5,
                     _ => order,
                 }
@@ -1865,6 +2144,51 @@ fn build_decode_pipeline(
         }
     }
 
+    // Always keep the producer of the graph's public root in the decode
+    // pipeline. Some models apply a vocab-shaped post-head transform
+    // (for example logit softcap) after the LM-head projection. Those
+    // transforms are ordinary graph ops, not model-specific patterns,
+    // and returning the pre-transform LM-head scratch is incorrect for
+    // sampling even if greedy argmax happens to match. Seeding the root
+    // producer here lets the dependency-order pass pull in the exact
+    // producer closure needed for the final logits tensor.
+    {
+        let mut present: std::collections::BTreeSet<u32> = entries.iter().map(|e| e.4).collect();
+        if let Some(root_task) = tg.tasks.iter().find(|task| {
+            fg.fusions
+                .get(task.fusion as usize)
+                .is_some_and(|fusion| fusion.outputs.iter().any(|bd| bd.source == graph.root))
+        }) {
+            if !present.contains(&root_task.id)
+                && !orphan_materialization_views.contains(&root_task.id)
+            {
+                if let Some(root_fusion) = fg.fusions.get(root_task.fusion as usize) {
+                    if !is_aliased_noop_view(root_fusion) {
+                        let tag = layer_index(root_fusion).unwrap_or(LayerTag::Post);
+                        let (rk0, rk1) = region_key(tag);
+                        let trace_order = root_fusion
+                            .op_ids
+                            .iter()
+                            .copied()
+                            .min()
+                            .unwrap_or(root_task.id);
+                        let order = if matches!(tag, LayerTag::Post) {
+                            8
+                        } else if matches!(root_fusion.kind, FusionKind::FusedChain) {
+                            fused_chain_order(root_fusion)
+                        } else {
+                            projection_order(root_fusion)
+                                .or_else(|| order_key(&root_fusion.kind))
+                                .unwrap_or(8)
+                        };
+                        entries.push((rk0, rk1, order, trace_order, root_task.id));
+                        present.insert(root_task.id);
+                    }
+                }
+            }
+        }
+    }
+
     // GatedDelta linear layers intentionally run the trace-local op
     // sequence instead of the standard attention-pattern subset. Pull
     // in any untagged producers those tasks depend on, such as scalar
@@ -1917,6 +2241,14 @@ fn build_decode_pipeline(
         let mut present: std::collections::BTreeSet<u32> = entries.iter().map(|e| e.4).collect();
         let mut prepared_seen: std::collections::BTreeSet<u32> = Default::default();
         let mut queue: std::collections::VecDeque<(i32, u32)> = Default::default();
+        let producer_by_tensor: std::collections::HashMap<TensorId, u32> = tg
+            .tasks
+            .iter()
+            .flat_map(|task| {
+                let fusion = &fg.fusions[task.fusion as usize];
+                fusion.outputs.iter().map(move |bd| (bd.source, task.id))
+            })
+            .collect();
         for task in &tg.tasks {
             let fusion = &fg.fusions[task.fusion as usize];
             let Some(LayerTag::Layer(layer_n)) = layer_index(fusion) else {
@@ -1925,17 +2257,60 @@ fn build_decode_pipeline(
             if !prepared_kv_layers.contains(&layer_n) {
                 continue;
             }
-            match fusion.kind {
+            match &fusion.kind {
                 FusionKind::SdpaDecode => {
-                    // K/V slots are overridden to semantic cache buffers at
-                    // runtime, but keeping the direct SDPA dependencies in the
-                    // prep band preserves topological ordering for trace tasks
-                    // that still reference those deps.
-                    for &dep in &task.deps {
-                        queue.push_back((layer_n, dep));
+                    // Only preserve producers for SDPA inputs the runtime
+                    // actually reads. Extra-bound K/V/Q slots point at
+                    // semantic cache/scratch buffers, so their trace
+                    // producers are dead unless another task (for example a
+                    // KV-cache store) also consumes them directly.
+                    let overridden = extra_bound_input_slots(fusion, &fg.meta);
+                    for (slot, input) in fusion.inputs.iter().enumerate() {
+                        if overridden.contains(&slot) {
+                            continue;
+                        }
+                        if let Some(&dep) = producer_by_tensor.get(&input.source) {
+                            queue.push_back((layer_n, dep));
+                        }
+                    }
+                }
+                FusionKind::Single(name) if name == "ScaledDotProductAttention" => {
+                    // Direct SDPA can still lower to the decode SDPA ABI.
+                    // For prepared-KV layers the K/V producers are kept by
+                    // the KvCacheStoreDecode task below, but Q may be a
+                    // trace-prepared q_norm/RoPE scratch instead of a
+                    // semantic RmsNormQkv/RopeQDecode scratch. Keep the Q
+                    // producer closure so layer_scratch.q_buf is actually
+                    // materialized before SDPA reads it.
+                    if let Some(input) = fusion.inputs.first() {
+                        if let Some(&dep) = producer_by_tensor.get(&input.source) {
+                            queue.push_back((layer_n, dep));
+                        }
                     }
                 }
                 FusionKind::KvCacheStoreDecode => {
+                    for (slot, input) in fusion.inputs.iter().enumerate() {
+                        if extra_bound_input_slots(fusion, &fg.meta).contains(&slot) {
+                            continue;
+                        }
+                        if let Some(&dep) = producer_by_tensor.get(&input.source) {
+                            queue.push_back((layer_n, dep));
+                        } else if let Some(dep) =
+                            scratch_id_by_tensor.get(&input.source).and_then(|sid| {
+                                tg.tasks.iter().find_map(|candidate| {
+                                    let pf = &fg.fusions[candidate.fusion as usize];
+                                    pf.outputs
+                                        .iter()
+                                        .any(|output| {
+                                            scratch_id_by_tensor.get(&output.source) == Some(sid)
+                                        })
+                                        .then_some(candidate.id)
+                                })
+                            })
+                        {
+                            queue.push_back((layer_n, dep));
+                        }
+                    }
                     for &dep in &task.deps {
                         queue.push_back((layer_n, dep));
                     }
@@ -1995,6 +2370,37 @@ fn build_decode_pipeline(
     {
         let mut present: std::collections::BTreeSet<u32> = entries.iter().map(|e| e.4).collect();
         let mut additions: Vec<(u8, i32, u32, u32, u32)> = Vec::new();
+        let producer_by_tensor: std::collections::HashMap<TensorId, u32> = tg
+            .tasks
+            .iter()
+            .filter(|task| {
+                fg.fusions
+                    .get(task.fusion as usize)
+                    .is_some_and(|fusion| !is_aliased_noop_view(fusion))
+            })
+            .flat_map(|task| {
+                let fusion = &fg.fusions[task.fusion as usize];
+                fusion.outputs.iter().map(move |bd| (bd.source, task.id))
+            })
+            .collect();
+        let producer_by_scratch: std::collections::HashMap<u32, u32> = tg
+            .tasks
+            .iter()
+            .filter(|task| {
+                fg.fusions
+                    .get(task.fusion as usize)
+                    .is_some_and(|fusion| !is_aliased_noop_view(fusion))
+            })
+            .flat_map(|task| {
+                let fusion = &fg.fusions[task.fusion as usize];
+                fusion.outputs.iter().filter_map(move |bd| {
+                    scratch_id_by_tensor
+                        .get(&bd.source)
+                        .copied()
+                        .map(|sid| (sid, task.id))
+                })
+            })
+            .collect();
         let is_decode_constant_producer =
             |fusion: &crate::fusion::ir::Fusion, task: &crate::task::ir::Task| -> bool {
                 if !task.deps.is_empty() {
@@ -2010,7 +2416,31 @@ fn build_decode_pipeline(
             let Some(task) = tg.tasks.get(task_id as usize) else {
                 continue;
             };
-            for &dep_task_id in &task.deps {
+            let Some(fusion) = fg.fusions.get(task.fusion as usize) else {
+                continue;
+            };
+            let mut dep_task_ids: std::collections::BTreeSet<u32> =
+                task.deps.iter().copied().collect();
+            let overridden_input_slots = extra_bound_input_slots(fusion, &fg.meta);
+            for (input_idx, input) in fusion.inputs.iter().enumerate() {
+                if overridden_input_slots.contains(&input_idx) {
+                    continue;
+                }
+                if let Some(dep) = producer_by_tensor.get(&input.source).copied() {
+                    dep_task_ids.insert(dep);
+                }
+                if let Some(dep) = scratch_id_by_tensor
+                    .get(&input.source)
+                    .and_then(|sid| producer_by_scratch.get(sid))
+                    .copied()
+                {
+                    dep_task_ids.insert(dep);
+                }
+            }
+            for dep_task_id in dep_task_ids {
+                if dep_task_id == task_id {
+                    continue;
+                }
                 if present.contains(&dep_task_id) {
                     continue;
                 }
@@ -2050,6 +2480,10 @@ fn build_decode_pipeline(
             .fusions
             .iter()
             .filter_map(|fusion| match (&fusion.kind, layer_index(fusion)) {
+                (
+                    FusionKind::RoutedQmvSwiglu | FusionKind::RoutedQmvReduce,
+                    Some(LayerTag::Layer(n)),
+                ) => Some(n),
                 (FusionKind::Single(name), Some(LayerTag::Layer(n)))
                     if matches!(name.as_str(), "GatherQMM" | "GatherAxis") =>
                 {
@@ -2062,6 +2496,37 @@ fn build_decode_pipeline(
         if !moe_layers.is_empty() {
             let mut present: std::collections::BTreeSet<u32> =
                 entries.iter().map(|e| e.4).collect();
+            let producer_by_tensor: std::collections::HashMap<TensorId, u32> = tg
+                .tasks
+                .iter()
+                .filter(|task| {
+                    fg.fusions
+                        .get(task.fusion as usize)
+                        .is_some_and(|fusion| !is_aliased_noop_view(fusion))
+                })
+                .flat_map(|task| {
+                    let fusion = &fg.fusions[task.fusion as usize];
+                    fusion.outputs.iter().map(move |bd| (bd.source, task.id))
+                })
+                .collect();
+            let producer_by_scratch: std::collections::HashMap<u32, u32> = tg
+                .tasks
+                .iter()
+                .filter(|task| {
+                    fg.fusions
+                        .get(task.fusion as usize)
+                        .is_some_and(|fusion| !is_aliased_noop_view(fusion))
+                })
+                .flat_map(|task| {
+                    let fusion = &fg.fusions[task.fusion as usize];
+                    fusion.outputs.iter().filter_map(move |bd| {
+                        scratch_id_by_tensor
+                            .get(&bd.source)
+                            .copied()
+                            .map(|sid| (sid, task.id))
+                    })
+                })
+                .collect();
             let mut queue: std::collections::VecDeque<(i32, u32, u32)> = entries
                 .iter()
                 .filter_map(|entry| {
@@ -2078,7 +2543,27 @@ fn build_decode_pipeline(
                 let Some(task) = tg.tasks.get(task_id as usize) else {
                     continue;
                 };
-                for &dep_task_id in &task.deps {
+                let Some(fusion) = fg.fusions.get(task.fusion as usize) else {
+                    continue;
+                };
+                let mut deps: std::collections::BTreeSet<u32> = task.deps.iter().copied().collect();
+                let overridden_input_slots = extra_bound_input_slots(fusion, &fg.meta);
+                for (input_idx, input) in fusion.inputs.iter().enumerate() {
+                    if overridden_input_slots.contains(&input_idx) {
+                        continue;
+                    }
+                    if let Some(dep) = producer_by_tensor.get(&input.source).copied() {
+                        deps.insert(dep);
+                    }
+                    if let Some(dep) = scratch_id_by_tensor
+                        .get(&input.source)
+                        .and_then(|sid| producer_by_scratch.get(sid))
+                        .copied()
+                    {
+                        deps.insert(dep);
+                    }
+                }
+                for dep_task_id in deps {
                     if present.contains(&dep_task_id) {
                         continue;
                     }
@@ -2116,6 +2601,8 @@ fn build_decode_pipeline(
                                     | "Argpartition"
                                     | "GatherAxis"
                                     | "GatherQMM"
+                                    | "GatherQMMReduce"
+                                    | "ScaledSumReduce"
                                     | "WeightedRouteReduce"
                                     | "Reduce"
                                     | "Multiply"
@@ -2142,11 +2629,10 @@ fn build_decode_pipeline(
         }
     }
 
-    // SDPA bridge views are represented by scratch aliasing above. If a
-    // producer-closure pulls them back into the decode set, drop them here:
-    // running a trace Transpose/Reshape over fusekit's flat decode SDPA output
-    // can corrupt the aliased buffer, while downstream o_proj already reads the
-    // SDPA scratch through the canonical alias.
+    // SDPA bridge views represented by scratch aliasing above are no-ops. If a
+    // producer closure pulls those aliases back into the decode set, drop them
+    // here. Real materializing views downstream of SDPA must stay in the
+    // pipeline; they carry layout changes that cannot be expressed by aliasing.
     {
         let mut bridge_views: std::collections::BTreeSet<u32> = Default::default();
         let sdpa_tasks: std::collections::BTreeSet<u32> = entries
@@ -2185,7 +2671,9 @@ fn build_decode_pipeline(
                 let Some(fusion) = fg.fusions.get(task.fusion as usize) else {
                     continue;
                 };
-                if !is_view_single(fusion) {
+                if !is_view_single(fusion)
+                    || !is_aliased_noop_view_for_scratch(fusion, scratch_id_by_tensor)
+                {
                     continue;
                 }
                 let is_sdpa_descendant = task
@@ -2282,7 +2770,6 @@ fn dependency_order_decode_pipeline(
     use crate::fusion::ir::FusionKind;
     use crate::graph::LayerTag;
 
-    let selected: std::collections::BTreeSet<u32> = ordered.iter().copied().collect();
     let layer_hint = |task_id: u32| -> Option<i32> {
         let task = tg.tasks.get(task_id as usize)?;
         let fusion = fg.fusions.get(task.fusion as usize)?;
@@ -2300,32 +2787,56 @@ fn dependency_order_decode_pipeline(
         }
         tally.into_iter().max_by_key(|(_, n)| *n).map(|(n, _)| n)
     };
-    let mut producer_by_tensor: std::collections::HashMap<TensorId, u32> = Default::default();
-    let mut producer_by_scratch: std::collections::HashMap<u32, u32> = Default::default();
-    for task_id in &selected {
-        let Some(task) = tg.tasks.get(*task_id as usize) else {
-            continue;
-        };
+    let task_is_aliased_view = |task_id: u32| -> bool {
+        tg.tasks
+            .get(task_id as usize)
+            .and_then(|task| fg.fusions.get(task.fusion as usize))
+            .is_some_and(|fusion| is_aliased_noop_view_for_scratch(fusion, scratch_id_by_tensor))
+    };
+    let extra_bound_inputs_still_need_producers = |fusion: &crate::fusion::ir::Fusion| -> bool {
+        matches!(
+            fusion.kind,
+            FusionKind::RopeQDecode | FusionKind::RopeKvCacheStoreDecode
+        )
+    };
+
+    let mut producer_by_tensor_all: std::collections::HashMap<TensorId, u32> = Default::default();
+    let mut producer_by_scratch_all: std::collections::HashMap<u32, u32> = Default::default();
+    for task in &tg.tasks {
         let Some(fusion) = fg.fusions.get(task.fusion as usize) else {
             continue;
         };
+        if task_is_aliased_view(task.id) {
+            continue;
+        }
         for output in &fusion.outputs {
-            producer_by_tensor.insert(output.source, *task_id);
+            producer_by_tensor_all.insert(output.source, task.id);
             if let Some(&sid) = scratch_id_by_tensor.get(&output.source) {
-                producer_by_scratch.insert(sid, *task_id);
+                producer_by_scratch_all.insert(sid, task.id);
             }
         }
     }
 
-    let data_deps = |task_id: u32| -> Vec<u32> {
+    let data_deps_from = |task_id: u32,
+                          producer_by_tensor: &std::collections::HashMap<TensorId, u32>,
+                          producer_by_scratch: &std::collections::HashMap<u32, u32>|
+     -> Vec<u32> {
         let Some(task) = tg.tasks.get(task_id as usize) else {
             return Vec::new();
         };
         let Some(fusion) = fg.fusions.get(task.fusion as usize) else {
             return Vec::new();
         };
+        let overridden_input_slots = if extra_bound_inputs_still_need_producers(fusion) {
+            std::collections::BTreeSet::new()
+        } else {
+            extra_bound_input_slots(fusion, &fg.meta)
+        };
         let mut deps = Vec::new();
-        for input in &fusion.inputs {
+        for (slot, input) in fusion.inputs.iter().enumerate() {
+            if overridden_input_slots.contains(&slot) {
+                continue;
+            }
             let mut dep = producer_by_tensor.get(&input.source).copied();
             if dep.is_none() {
                 dep = scratch_id_by_tensor
@@ -2336,7 +2847,7 @@ fn dependency_order_decode_pipeline(
             let Some(dep) = dep else {
                 continue;
             };
-            if dep == task_id || !selected.contains(&dep) || deps.contains(&dep) {
+            if dep == task_id || deps.contains(&dep) {
                 continue;
             }
             deps.push(dep);
@@ -2344,7 +2855,87 @@ fn dependency_order_decode_pipeline(
         deps
     };
 
-    let mut kv_store_by_layer: std::collections::BTreeMap<i32, Vec<u32>> = Default::default();
+    // Semantic decode tasks such as RopeQDecode/RopeKvCacheStoreDecode can
+    // consume trace-prepared tensors (post-projection RMSNorm, layout views,
+    // etc.). Pull their producer closure into the pipeline instead of only
+    // sorting the already-selected semantic boundary tasks. This keeps the
+    // optimization dataflow-driven: if Q/K/V are raw projections, no extra
+    // trace ops are selected; if the graph contains real semantic prep ops,
+    // they run before the cache/SDPA utilities.
+    let mut selected: std::collections::BTreeSet<u32> = ordered.iter().copied().collect();
+    let mut seen_walk: std::collections::BTreeSet<u32> = Default::default();
+    let mut stack = ordered.clone();
+    while let Some(task_id) = stack.pop() {
+        if !seen_walk.insert(task_id) {
+            continue;
+        }
+        let Some(task) = tg.tasks.get(task_id as usize) else {
+            continue;
+        };
+        let mut deps = task.deps.clone();
+        if let Some(fusion) = fg.fusions.get(task.fusion as usize) {
+            let overridden_input_slots = if extra_bound_inputs_still_need_producers(fusion) {
+                std::collections::BTreeSet::new()
+            } else {
+                extra_bound_input_slots(fusion, &fg.meta)
+            };
+            if !overridden_input_slots.is_empty() {
+                deps.retain(|dep_task_id| {
+                    let Some(dep_task) = tg.tasks.get(*dep_task_id as usize) else {
+                        return true;
+                    };
+                    let Some(dep_fusion) = fg.fusions.get(dep_task.fusion as usize) else {
+                        return true;
+                    };
+                    let mut seen_dep_input = false;
+                    for (slot, input) in fusion.inputs.iter().enumerate() {
+                        if !overridden_input_slots.contains(&slot) {
+                            continue;
+                        }
+                        if dep_fusion
+                            .outputs
+                            .iter()
+                            .any(|output| output.source == input.source)
+                        {
+                            seen_dep_input = true;
+                            break;
+                        }
+                        if let Some(&sid) = scratch_id_by_tensor.get(&input.source) {
+                            let dep_writes_same_scratch = dep_fusion.outputs.iter().any(|output| {
+                                scratch_id_by_tensor.get(&output.source).copied() == Some(sid)
+                            });
+                            if dep_writes_same_scratch {
+                                seen_dep_input = true;
+                                break;
+                            }
+                        }
+                    }
+                    !seen_dep_input
+                });
+            }
+        }
+        deps.extend(data_deps_from(
+            task_id,
+            &producer_by_tensor_all,
+            &producer_by_scratch_all,
+        ));
+        for dep in deps {
+            if dep == task_id {
+                continue;
+            }
+            if task_is_aliased_view(dep) {
+                stack.push(dep);
+                continue;
+            }
+            if selected.insert(dep) {
+                ordered.push(dep);
+                stack.push(dep);
+            }
+        }
+    }
+
+    let mut producer_by_tensor: std::collections::HashMap<TensorId, u32> = Default::default();
+    let mut producer_by_scratch: std::collections::HashMap<u32, u32> = Default::default();
     for task_id in &selected {
         let Some(task) = tg.tasks.get(*task_id as usize) else {
             continue;
@@ -2352,14 +2943,58 @@ fn dependency_order_decode_pipeline(
         let Some(fusion) = fg.fusions.get(task.fusion as usize) else {
             continue;
         };
+        if task_is_aliased_view(*task_id) {
+            continue;
+        }
+        for output in &fusion.outputs {
+            producer_by_tensor.insert(output.source, *task_id);
+            if let Some(&sid) = scratch_id_by_tensor.get(&output.source) {
+                producer_by_scratch.insert(sid, *task_id);
+            }
+        }
+    }
+
+    let data_deps = |task_id: u32| -> Vec<u32> {
+        data_deps_from(task_id, &producer_by_tensor, &producer_by_scratch)
+            .into_iter()
+            .filter(|dep| selected.contains(dep))
+            .collect()
+    };
+
+    let mut kv_store_by_layer: std::collections::BTreeMap<i32, Vec<u32>> = Default::default();
+    let mut q_prep_by_layer: std::collections::BTreeMap<i32, Vec<u32>> = Default::default();
+    for task_id in &selected {
+        let Some(task) = tg.tasks.get(*task_id as usize) else {
+            continue;
+        };
+        let Some(fusion) = fg.fusions.get(task.fusion as usize) else {
+            continue;
+        };
+        let rmsnorm_qkv_decode_sink = matches!(
+            &fusion.attrs,
+            crate::fusion::ir::FusionAttrs::RmsNormQkv {
+                decode_sinks: Some(_),
+                ..
+            }
+        );
         if matches!(
             fusion.kind,
             FusionKind::KvCacheStoreDecode
                 | FusionKind::RopeKvCacheStoreDecode
                 | FusionKind::RmsNormRopeKvCacheStoreDecode
-        ) {
+        ) || (matches!(fusion.kind, FusionKind::RmsNormQkv) && rmsnorm_qkv_decode_sink)
+        {
             if let Some(layer) = layer_hint(*task_id) {
                 kv_store_by_layer.entry(layer).or_default().push(*task_id);
+            }
+        }
+        if matches!(
+            fusion.kind,
+            FusionKind::RopeQDecode | FusionKind::RmsNormRopeQGateDecode
+        ) || (matches!(fusion.kind, FusionKind::RmsNormQkv) && rmsnorm_qkv_decode_sink)
+        {
+            if let Some(layer) = layer_hint(*task_id) {
+                q_prep_by_layer.entry(layer).or_default().push(*task_id);
             }
         }
     }
@@ -2386,17 +3021,25 @@ fn dependency_order_decode_pipeline(
             let Some(fusion) = fg.fusions.get(task.fusion as usize) else {
                 return true;
             };
-            if !matches!(fusion.kind, FusionKind::SdpaDecode) {
+            let is_sdpa_like = matches!(fusion.kind, FusionKind::SdpaDecode)
+                || matches!(&fusion.kind, FusionKind::Single(name) if name == "ScaledDotProductAttention");
+            if !is_sdpa_like {
                 return true;
             }
             let Some(layer) = layer_hint(*task_id) else {
                 return true;
             };
-            kv_store_by_layer.get(&layer).is_none_or(|stores| {
+            let q_ready = q_prep_by_layer.get(&layer).is_none_or(|preps| {
+                preps
+                    .iter()
+                    .all(|dep| !selected.contains(dep) || done.contains(dep))
+            });
+            let kv_ready = kv_store_by_layer.get(&layer).is_none_or(|stores| {
                 stores
                     .iter()
                     .all(|dep| !selected.contains(dep) || done.contains(dep))
-            })
+            });
+            q_ready && kv_ready
         }) else {
             // Should not happen for a DAG, but keep emission robust:
             // preserve the existing priority order for any cycle or
@@ -2541,8 +3184,10 @@ fn build_binding(
         let source_path = tensor
             .and_then(|t| t.param_path.clone())
             .unwrap_or_default();
-        let scalar = tensor
-            .and_then(|t| t.scalar_value.as_ref())
+        let scalar = bd
+            .scalar_value
+            .as_ref()
+            .or_else(|| tensor.and_then(|t| t.scalar_value.as_ref()))
             .map(|sv| match sv {
                 ScalarValue::Bool(b) => JsonScalar::Bool(*b),
                 ScalarValue::Int(i) => JsonScalar::Int(*i),
